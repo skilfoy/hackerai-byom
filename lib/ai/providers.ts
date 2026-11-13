@@ -23,6 +23,12 @@ import {
 } from "@/lib/ai/abliteration";
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import type { SelectedModel } from "@/types/chat";
+import { getActiveByomRoute } from "@/lib/ai/byom-context";
+import {
+  createByomLanguageModel,
+  createDefaultByomLanguageModels,
+} from "@/lib/ai/byom-provider";
+import { isByomBillingModel, selectedModelForByomKind } from "@/lib/ai/byom";
 import { openrouterAttributionHeaders } from "@/lib/ai/openrouter-attribution";
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -1391,13 +1397,15 @@ const buildProviderMap = (
 };
 
 const baseProviders: ReturnType<typeof buildProviderMap> &
-  Record<typeof INFERENCE_CYBER_MODEL_KEY, ReturnType<typeof inference>> = {
+  Record<typeof INFERENCE_CYBER_MODEL_KEY, ReturnType<typeof inference>> &
+  ReturnType<typeof createDefaultByomLanguageModels> = {
   [INFERENCE_CYBER_MODEL_KEY]: inference(INFERENCE_CYBER_MODEL_ID),
   ...buildProviderMap(openrouter),
   [ABLITERATION_MODEL_KEY]: abliteration(ABLITERATION_LARGE_FLASH_MODEL_ID),
   [ABLITERATION_LARGE_V2_MODEL_KEY]: abliteration(
     ABLITERATION_LARGE_FLASH_MODEL_ID,
   ),
+  ...createDefaultByomLanguageModels(),
 };
 
 export type ModelName = keyof typeof baseProviders;
@@ -1458,6 +1466,10 @@ export const modelDisplayNames: Record<ModelName, string> &
   "fallback-ask-model": "Auto, an intelligent model router built by HackerAI",
   "title-generator-model": "GLM 5.3 Flash",
   "auxiliary-vision-model": "Auxiliary vision model",
+  "byom-openai": "OpenAI-compatible endpoint",
+  "byom-ollama": "Ollama",
+  "byom-hermes": "Hermes",
+  "byom-unsloth": "Unsloth",
 };
 
 export const getModelDisplayName = (modelName: ModelName): string => {
@@ -1522,6 +1534,7 @@ export function supportsMultimodalToolResults(modelName?: string): boolean {
   const normalized = modelName.toLowerCase();
 
   return (
+    isByomBillingModel(normalized) ||
     normalized === DEEPSEEK_1017_MODEL_KEY ||
     normalized === DEEPSEEK_1017_SLUG ||
     normalized === DEEPSEEK_1017_CANONICAL_SLUG ||
@@ -1571,6 +1584,11 @@ export function resolveAgentTierToProviderKey(
       return DEEPSEEK_1017_MODEL_KEY;
     case "hackerai-max":
       return "model-grok-4.6";
+    case "byom-openai":
+    case "byom-ollama":
+    case "byom-hermes":
+    case "byom-unsloth":
+      return tier;
   }
 }
 
@@ -1578,4 +1596,13 @@ export const myProvider = customProvider({
   languageModels: baseProviders,
 });
 
-export const createTrackedProvider = () => myProvider;
+export const createTrackedProvider = () => {
+  const route = getActiveByomRoute();
+  if (!route) return myProvider;
+  const dynamic = createByomLanguageModel(route);
+  const selectedKey = selectedModelForByomKind(route.kind);
+  return {
+    languageModel: (modelName: ModelName) =>
+      modelName === selectedKey ? dynamic : myProvider.languageModel(modelName),
+  } as typeof myProvider;
+};

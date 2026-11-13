@@ -1,4 +1,4 @@
-import type { SelectedModel } from "@/types/chat";
+import type { ByomSelectedModel, SelectedModel } from "@/types/chat";
 
 export interface ModelOption {
   id: SelectedModel;
@@ -32,3 +32,35 @@ export const AGENT_MODEL_OPTIONS: ModelOption[] = [
     thinking: true,
   },
 ];
+
+export const BYOM_MODEL_OPTIONS: Array<
+  ModelOption & { id: ByomSelectedModel }
+> = [
+  {
+    id: "byom-openai",
+    label: "OpenAI-compatible",
+    description: "Any chat-completions endpoint",
+    poweredBy: "Your base URL and model id",
+  },
+  {
+    id: "byom-ollama",
+    label: "Ollama",
+    description: "Local Ollama on this computer or a reachable host",
+    poweredBy: "http://127.0.0.1:11434/v1",
+  },
+  {
+    id: "byom-hermes",
+    label: "Hermes",
+    description: "Nous Portal, including Hermes 4, called directly",
+    poweredBy: "inference-api.nousresearch.com",
+  },
+  {
+    id: "byom-unsloth",
+    label: "Unsloth",
+    description: "Unsloth Studio's OpenAI-compatible server",
+    poweredBy: "http://127.0.0.1:8888/v1",
+  },
+];
+
+export const byomOptionLabel = (id: ByomSelectedModel): string =>
+  BYOM_MODEL_OPTIONS.find((option) => option.id === id)?.label ?? "Custom";

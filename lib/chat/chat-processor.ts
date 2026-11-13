@@ -1,6 +1,7 @@
 import { getModerationResult } from "@/lib/moderation";
 import {
   normalizeMaxModelForSubscription,
+  isByomSelectedModel,
   type ChatMode,
   type SelectedModel,
   type SubscriptionTier,
@@ -60,6 +61,8 @@ export function selectModel(
   } = {},
 ): ModelName {
   assertChatModeAccess({ mode, subscription });
+  // BYOM is the caller's endpoint. Do not promote it onto a hosted tier.
+  if (isByomSelectedModel(selectedModel)) return selectedModel;
   const isAgent = isAgentMode(mode);
   const allowedSelectedModel = normalizeMaxModelForSubscription(
     selectedModel,

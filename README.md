@@ -8,6 +8,10 @@
 
 <h2 align="center">Your AI-Powered Penetration Testing Assistant</h2>
 
+<p align="center">
+  <strong>BYOM fork:</strong> hosted HackerAI tiers, plus any OpenAI-compatible endpoint, local Ollama, and direct Hermes and Unsloth routing.
+</p>
+
 <div align="center">
 
 [![License](https://img.shields.io/badge/License-Apache%202.0%20with%20Commercial%20Restrictions-red.svg)](LICENSE)
@@ -43,16 +47,33 @@ You'll need the following accounts:
 - [PostHog](https://posthog.com/) - Analytics
 - [Stripe](https://stripe.com/) - Payment processing
 
+### Bring your own model
+
+The model selector can send Ask, Agent, and delegated subagents to an endpoint you control. Hosted Auto, Standard, Pro, and Max stay on OpenRouter.
+
+| Route             | Default endpoint                            | What it calls                                                                                                            |
+| ----------------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| OpenAI-compatible | The base URL you enter                      | `POST {base}/chat/completions`                                                                                           |
+| Ollama            | `http://127.0.0.1:11434/v1`                 | Local Ollama's OpenAI shim                                                                                               |
+| Hermes            | `https://inference-api.nousresearch.com/v1` | Nous Portal directly. Defaults include Hermes 4.3 36B, Hermes 4 70B, and Hermes 4 405B. Other Portal model ids work too. |
+| Unsloth           | `http://127.0.0.1:8888/v1`                  | Unsloth Studio, not OpenRouter. `default` uses the model loaded in Studio.                                               |
+
+API keys typed in the selector stay in browser storage and are sent only with the chat request. Server env fallbacks are `BYOM_OPENAI_*`, `OLLAMA_*`, `HERMES_API_KEY` or `NOUS_API_KEY`, and `UNSLOTH_*`.
+
+`localhost` is the machine running the HackerAI server. It reaches Ollama or Unsloth during local dev, or through a tunnel. A cloud Agent worker cannot open your laptop's loopback address. Hermes is a public API, so it works from cloud runs when the key is set.
+
+BYOM token use is not billed at HackerAI hosted rates. You pay the endpoint you configured. Sandbox and other non-model costs still apply.
+
 ### Clone the repo
 
 ```bash
-git clone https://github.com/hackerai-tech/hackerai.git
+git clone https://github.com/skilfoy/hackerai-byom.git
 ```
 
 ### Navigate to the project directory
 
 ```bash
-cd hackerai
+cd hackerai-byom
 ```
 
 ### Install dependencies

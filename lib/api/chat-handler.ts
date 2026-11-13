@@ -54,11 +54,14 @@ import type {
 import {
   canUseExtraUsage,
   coerceSelectedModel,
+  isByomSelectedModel,
   isLimitRescueRequest,
   normalizeMaxModelForSubscription,
   normalizeSelectedModelOverrideForSubscription,
   withExtraUsageBillingForModel,
 } from "@/types";
+import { parseByomRequest, type ByomRoute } from "@/lib/ai/byom";
+import { bindByomRoute } from "@/lib/ai/byom-context";
 import { getBaseTodosForRequest } from "@/lib/utils/todo-utils";
 import {
   acquireFreeRunConcurrencyLock,
@@ -336,6 +339,7 @@ export const createChatHandler = () => {
         regenerate,
         sandboxPreference,
         selectedModel: rawSelectedModel,
+        byom: rawByom,
         isAutoContinue: rawIsAutoContinue,
         isAutomaticContinuation: rawIsAutomaticContinuation,
         useClientMessagesForRegenerate,
@@ -349,6 +353,7 @@ export const createChatHandler = () => {
         regenerate?: boolean;
         sandboxPreference?: SandboxPreference;
         selectedModel?: string;
+        byom?: unknown;
         isAutoContinue?: boolean;
         isAutomaticContinuation?: boolean;
         useClientMessagesForRegenerate?: boolean;
@@ -400,6 +405,14 @@ export const createChatHandler = () => {
           coerceSelectedModel(rawSelectedModel ?? null),
           subscription,
         );
+      let byomRoute: ByomRoute | undefined;
+      if (isByomSelectedModel(selectedModelOverride)) {
+        const parsed = parseByomRequest(rawByom, selectedModelOverride);
+        if (!parsed.ok) {
+          throw new ChatSDKError("bad_request:api", parsed.error);
+        }
+        byomRoute = parsed.route;
+      }
       await assertUserCanMakeCostIncurringRequest(userId, {
         retryNetworkFailure: true,
         signal: req.signal,
@@ -1219,6 +1232,7 @@ export const createChatHandler = () => {
                 )
               : Promise.resolve(undefined);
 
+            if (byomRoute) bindByomRoute(byomRoute);
             const trackedProvider = createTrackedProvider();
 
             let currentSystemPrompt = await systemPrompt(

@@ -73,6 +73,7 @@ import { cancelAgentTriggerRun } from "@/lib/api/agent-approval-session";
 import type { TriggerRunRegion } from "@/lib/api/trigger-region";
 import { phLogger } from "@/lib/posthog/server";
 import type { AgentAutoReviewAssignment } from "@/lib/experiments/agent-auto-review";
+import type { ByomRoute } from "@/lib/ai/byom";
 
 export type SubagentToolsRuntimeConfig = {
   organizationId?: string;
@@ -86,6 +87,7 @@ export type SubagentToolsRuntimeConfig = {
   autoReviewAssignment?: AgentAutoReviewAssignment;
   autoReviewAuthorizationContext?: AgentAutoReviewAuthorizationContext;
   autoReviewConversationContext?: AgentAutoReviewConversationContext;
+  byomRoute?: ByomRoute;
 };
 
 const writeLifecycle = (
@@ -255,6 +257,7 @@ export const createDelegateTaskTool = (
           expectedDurationMinutes: parsed.expected_duration_minutes,
           outputKind: parsed.output_kind,
           subscription: config.subscription,
+          parentModel: context.getCurrentModelName?.() ?? context.modelName,
         }),
         subscription: config.subscription,
         freeQuotaSubject: config.freeQuotaSubject,
@@ -341,6 +344,7 @@ export const createDelegateTaskTool = (
               convexUrl: getConvexUrl(),
               triggerRegion: config.triggerRegion,
               regionalFreeLimits: config.regionalFreeLimits,
+              ...(config.byomRoute ? { byom: config.byomRoute } : {}),
             },
             {
               idempotencyKey: key,
@@ -495,6 +499,7 @@ export const createContinueAgentTool = (
             convexUrl: getConvexUrl(),
             triggerRegion: config.triggerRegion,
             regionalFreeLimits: config.regionalFreeLimits,
+            ...(config.byomRoute ? { byom: config.byomRoute } : {}),
           },
           {
             idempotencyKey: key,

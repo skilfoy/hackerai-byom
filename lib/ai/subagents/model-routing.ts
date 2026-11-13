@@ -1,4 +1,5 @@
 import type { SubscriptionTier } from "@/types";
+import { isByomSelectedModel } from "@/types";
 
 export const SUBAGENT_FREE_TEXT_MODEL = "agent-model-free";
 export const SUBAGENT_PAID_TEXT_MODEL = "model-deepseek-v4-flash-vision-pro";
@@ -15,7 +16,9 @@ export const resolveInitialSubagentModel = (input: {
   expectedDurationMinutes: number;
   outputKind: string;
   subscription: SubscriptionTier;
+  parentModel?: string;
 }): string => {
+  if (isByomSelectedModel(input.parentModel)) return input.parentModel;
   const needsRichInspection =
     input.capabilities.includes("browser_qa") ||
     input.outputKind === "qa_report" ||
@@ -49,6 +52,7 @@ export const resolveSubagentModelForImageToolResults = (
   currentModel: string,
   hasImageToolResults: boolean,
 ): string => {
+  if (isByomSelectedModel(currentModel)) return currentModel;
   if (
     currentModel === SUBAGENT_VISION_MODEL ||
     currentModel === SUBAGENT_PAID_TEXT_MODEL

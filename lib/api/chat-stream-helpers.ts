@@ -9,6 +9,7 @@ import {
   ABLITERATION_MODEL_KEY,
   isAbliterationModel,
 } from "@/lib/ai/abliteration";
+import { isByomBillingModel } from "@/lib/ai/byom";
 /**
  * Chat Stream Helpers
  *
@@ -793,6 +794,7 @@ export function getRetryFallbackModel(
   selectedModelOverride?: SelectedModel,
   options: { hasImageInputs?: boolean } = {},
 ): ModelName {
+  if (isByomBillingModel(modelName)) return modelName;
   if (mode === "agent" && selectedModelOverride === "hackerai-max") {
     if (modelName === "model-grok-4.6" && !options.hasImageInputs)
       return "model-glm-5.3";
@@ -1023,6 +1025,7 @@ export function resolveServedModelForCostAccounting({
   mode?: ChatMode;
   options?: FallbackOptions;
 }): string {
+  if (isByomBillingModel(modelName)) return modelName;
   if (!responseModel) return modelName;
 
   const candidateKeys = [

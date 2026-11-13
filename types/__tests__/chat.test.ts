@@ -8,6 +8,18 @@ import {
 } from "../chat";
 
 describe("normalizeSelectedModelForSubscription", () => {
+  it("keeps bring-your-own routes available on the free plan", () => {
+    expect(normalizeSelectedModelForSubscription("byom-ollama", "free")).toBe(
+      "byom-ollama",
+    );
+    expect(
+      normalizeSelectedModelOverrideForSubscription("byom-hermes", "free"),
+    ).toBe("byom-hermes");
+    expect(normalizeSelectedModelForSubscription("byom-unsloth", "ultra")).toBe(
+      "byom-unsloth",
+    );
+  });
+
   it("forces free users to auto even when a paid model is stored", () => {
     expect(normalizeSelectedModelForSubscription("hackerai-pro", "free")).toBe(
       "auto",

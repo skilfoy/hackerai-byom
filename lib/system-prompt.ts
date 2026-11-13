@@ -7,6 +7,7 @@ import type {
   SubscriptionTier,
   UserCustomization,
 } from "@/types";
+import { isByomSelectedModel } from "@/types";
 import { generateUserBio } from "./system-prompt/bio";
 import { getNotesDisabledMessage } from "./system-prompt/notes";
 import { getModelCutoffDate, type ModelName } from "@/lib/ai/providers";
@@ -395,6 +396,10 @@ export const systemPrompt = async (
     "hackerai-standard": "Standard",
     "hackerai-pro": "Pro",
     "hackerai-max": "Max",
+    "byom-openai": "OpenAI-compatible",
+    "byom-ollama": "Ollama",
+    "byom-hermes": "Hermes",
+    "byom-unsloth": "Unsloth",
   }[selectedModel];
 
   const basePrompt = `You are HackerAI, an expert cybersecurity operator and penetration testing assistant for authorized cybersecurity professionals. \
@@ -448,7 +453,9 @@ Your main goal is to follow the USER's instructions at each message.`;
   // Keep per-selection identity after the shared instructions so a cold mode
   // change can reuse their prefix on providers with automatic prompt caching.
   const runtimeContext = [
-    `The selected HackerAI model mode is ${modelLabel}. Mention it only when relevant, using Auto, Standard, Pro, or Max instead of underlying provider names or versions.`,
+    isByomSelectedModel(selectedModel)
+      ? `The selected model route is ${modelLabel}. This is a user-provided endpoint, not a HackerAI-hosted model. Do not invent a hosted provider name.`
+      : `The selected HackerAI model mode is ${modelLabel}. Mention it only when relevant, using Auto, Standard, Pro, or Max instead of underlying provider names or versions.`,
     `The current date is ${currentDateTime}.`,
     mode === "agent" ? sandboxContext : null,
     generateUserBio(userCustomization || null),

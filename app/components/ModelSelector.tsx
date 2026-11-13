@@ -38,6 +38,7 @@ import { useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import {
   canUseMaxModel,
+  isByomSelectedModel,
   normalizeMaxModelForSubscription,
   normalizeSelectedModelForSubscription,
   type ChatMode,
@@ -51,10 +52,13 @@ import { redirectToPricing } from "@/app/hooks/usePricingDialog";
 import { openSettingsDialog } from "@/lib/utils/settings-dialog";
 
 import { CostIndicator } from "./ModelSelector/CostIndicator";
+import { ByomSection } from "./ModelSelector/ByomSection";
 import {
   AGENT_MODEL_OPTIONS,
+  byomOptionLabel,
   type ModelOption,
 } from "./ModelSelector/constants";
+import type { ByomSelectedModel } from "@/types/chat";
 
 // ── Shared sub-components ──────────────────────────────────────────
 
@@ -81,8 +85,11 @@ const isModelLockedForSubscription = (
   model: SelectedModel,
   extraUsageAvailable = false,
 ): boolean =>
-  subscription === "free" ||
-  (isMaxModel(model) && !canUseMaxModel(subscription, { extraUsageAvailable }));
+  isByomSelectedModel(model)
+    ? false
+    : subscription === "free" ||
+      (isMaxModel(model) &&
+        !canUseMaxModel(subscription, { extraUsageAvailable }));
 
 const getLockedModelCta = (
   model: SelectedModel,
@@ -285,6 +292,7 @@ const ModelOptionList = ({
   maxModelEntitlementLoading,
   onAutoSelect,
   onSelect,
+  onByomSelect,
   onClose,
   mobile = false,
 }: {
@@ -297,6 +305,7 @@ const ModelOptionList = ({
   maxModelEntitlementLoading: boolean;
   onAutoSelect: () => void;
   onSelect: (option: ModelOption) => void;
+  onByomSelect: (model: ByomSelectedModel) => void;
   onClose: () => void;
   mobile?: boolean;
 }) => (
@@ -427,6 +436,7 @@ const ModelOptionList = ({
         </Tooltip>
       );
     })}
+    <ByomSection value={value} onSelect={onByomSelect} onClose={onClose} />
   </div>
 );
 
@@ -470,18 +480,24 @@ export function ModelSelector({ value, onChange, mode }: ModelSelectorProps) {
     options.find((opt) => opt.id === effectiveValue) ?? options[0];
 
   const isFreeAgent = isFreeUser && isAgentMode(mode);
-  const triggerLabel = isFreeAgent
-    ? "Auto"
-    : isFreeUser
-      ? "Model"
-      : isAuto
-        ? "Auto"
-        : selected.label;
+  const triggerLabel = isByomSelectedModel(displayValue)
+    ? byomOptionLabel(displayValue)
+    : isFreeAgent
+      ? "Auto"
+      : isFreeUser
+        ? "Model"
+        : isAuto
+          ? "Auto"
+          : selected.label;
   const mobileTriggerLabel = triggerLabel.replace(/^HackerAI /, "");
 
   const handleAutoSelect = () => {
     onChange("auto");
     setOpen(false);
+  };
+
+  const handleByomSelect = (model: ByomSelectedModel) => {
+    onChange(model);
   };
 
   const applyModelChoice = (option: ModelOption) => {
@@ -607,6 +623,7 @@ export function ModelSelector({ value, onChange, mode }: ModelSelectorProps) {
               maxModelEntitlementLoading={maxModelEntitlementLoading}
               onAutoSelect={handleAutoSelect}
               onSelect={handleModelSelect}
+              onByomSelect={handleByomSelect}
               onClose={() => setOpen(false)}
               mobile
             />
@@ -623,7 +640,7 @@ export function ModelSelector({ value, onChange, mode }: ModelSelectorProps) {
         <PopoverTrigger asChild>{trigger}</PopoverTrigger>
         <PopoverContent
           data-chat-input-agent-menu
-          className="w-[270px] p-1.5 rounded-xl"
+          className="w-[320px] p-1.5 rounded-xl max-h-[70vh] overflow-y-auto"
           align="start"
         >
           <ModelOptionList
@@ -636,6 +653,7 @@ export function ModelSelector({ value, onChange, mode }: ModelSelectorProps) {
             maxModelEntitlementLoading={maxModelEntitlementLoading}
             onAutoSelect={handleAutoSelect}
             onSelect={handleModelSelect}
+            onByomSelect={handleByomSelect}
             onClose={() => setOpen(false)}
           />
         </PopoverContent>

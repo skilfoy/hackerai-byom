@@ -5,6 +5,7 @@ import {
   isPositiveFiniteNumber,
 } from "@/lib/provider-usage-cost";
 import { calculateRawModelUsageCostDollars } from "@/lib/rate-limit";
+import { isByomBillingModel } from "@/lib/ai/byom";
 import type { UsageDeductionFailureReason } from "@/lib/rate-limit";
 import type { ChatApiEndpoint } from "@/lib/api/agent-endpoints";
 import type { ChatMode, RateLimitInfo, SubscriptionTier } from "@/types";
@@ -481,6 +482,10 @@ export class UsageTracker {
     }
 
     return modelSteps.reduce((totalCost, stepCost) => {
+      const stepModel = stepCost.modelName ?? accountingModel ?? selectedModel;
+      // The caller's endpoint is not a HackerAI-priced model, even when the
+      // provider reports a dollar cost on the usage object.
+      if (isByomBillingModel(stepModel)) return totalCost;
       const authoritativeCost = stepCost.authoritativeCost ?? stepCost.rawCost;
       if (isPositiveFiniteNumber(authoritativeCost)) {
         return totalCost + authoritativeCost;
@@ -492,7 +497,7 @@ export class UsageTracker {
           outputTokens: stepCost.outputTokens,
           cacheReadTokens: stepCost.cacheReadTokens,
           cacheWriteTokens: stepCost.cacheWriteTokens,
-          modelName: stepCost.modelName ?? accountingModel ?? selectedModel,
+          modelName: stepModel,
         })
       );
     }, 0);

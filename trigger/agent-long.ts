@@ -85,6 +85,9 @@ import { createWaitForUserTool } from "@/lib/ai/tools/wait-for-user";
 import { ptySessionManager } from "@/lib/ai/tools/utils/pty-session-manager";
 import { generateTitleFromUserMessageWithWriter } from "@/lib/actions";
 import { createTrackedProvider } from "@/lib/ai/providers";
+import { bindByomRoute } from "@/lib/ai/byom-context";
+import { parseByomRequest, type ByomRoute } from "@/lib/ai/byom";
+import { isByomSelectedModel } from "@/types";
 import {
   AGENT_PROVIDER_IDLE_TIMEOUT_MS,
   AGENT_PROVIDER_TOTAL_TIMEOUT_MS,
@@ -1602,6 +1605,7 @@ export type AgentLongPayload = {
   approvalSessionId?: string;
   approvalProtocolVersion?: number;
   selectedModel?: SelectedModel;
+  byom?: unknown;
   autoReviewAssignment?: AgentAutoReviewAssignment;
   userLocation: Geo;
   /** Actual Trigger.dev execution and generated-file storage region. */
@@ -1780,6 +1784,7 @@ export const agentLongTask = task({
       approvalSessionId,
       approvalProtocolVersion,
       selectedModel: rawSelectedModelOverride,
+      byom: rawByom,
       autoReviewAssignment,
       userLocation,
       isAutoContinue,
@@ -1794,6 +1799,7 @@ export const agentLongTask = task({
     const subagentsEnabled = genericDelegationEnabled;
 
     let selectedModelOverride = rawSelectedModelOverride;
+    let byomRoute: ByomRoute | undefined;
     const endpoint = payloadEndpoint ?? LEGACY_AGENT_API_ENDPOINT;
     const freeUsageSubject = freeQuotaSubject ?? userId;
 
@@ -2239,6 +2245,13 @@ export const agentLongTask = task({
         normalizeMaxModelForSubscription(selectedModelOverride, subscription, {
           extraUsageAvailable,
         }) ?? undefined;
+      if (isByomSelectedModel(selectedModelOverride)) {
+        const parsed = parseByomRequest(rawByom, selectedModelOverride);
+        if (!parsed.ok) {
+          throw new ChatSDKError("bad_request:api", parsed.error);
+        }
+        byomRoute = parsed.route;
+      }
       const extraUsageConfig = withExtraUsageBillingForModel(
         baseExtraUsageConfig,
         selectedModelOverride,
@@ -3236,6 +3249,7 @@ export const agentLongTask = task({
                           triggerRegion,
                           approvalSessionId,
                           autoReviewAssignment,
+                          byomRoute,
                           autoReviewAuthorizationContext:
                             extractAgentAutoReviewAuthorizationContext(
                               messagesForProcessing,
@@ -3253,6 +3267,7 @@ export const agentLongTask = task({
                           freeQuotaSubject,
                           regionalFreeLimits: freeLimits,
                           triggerRegion,
+                          byomRoute,
                         }),
                         list_agents: createListAgentsTool(toolContext),
                         send_message_to_agent:
@@ -3457,6 +3472,7 @@ export const agentLongTask = task({
               subscription,
               shouldIncludeNotes: userCustomization?.include_notes ?? true,
             };
+            if (byomRoute) bindByomRoute(byomRoute);
             const trackedProvider = createTrackedProvider();
             const [baseSystemPrompt, messagesWithNotes] = await Promise.all([
               systemPrompt(

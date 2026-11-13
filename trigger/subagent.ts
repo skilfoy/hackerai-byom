@@ -34,6 +34,12 @@ import { agentUiStream } from "./streams";
 import { waitForAgentUiStream } from "@/lib/chat/consume-agent-ui-stream";
 import { createTools } from "@/lib/ai/tools";
 import { createTrackedProvider } from "@/lib/ai/providers";
+import { bindByomRoute } from "@/lib/ai/byom-context";
+import {
+  parseStoredByomRoute,
+  isByomBillingModel,
+  type ByomRoute,
+} from "@/lib/ai/byom";
 import { createOpenRouterCacheSessionId } from "@/lib/ai/openrouter-cache-session";
 import {
   buildPromptCacheOptions,
@@ -204,6 +210,7 @@ type SubagentTaskPayload = {
   subagentId: string;
   convexUrl?: string;
   triggerRegion?: TriggerRunRegion;
+  byom?: ByomRoute;
 };
 
 type CancellationCleanup = {
@@ -1251,6 +1258,17 @@ export const subagentTask = task({
             assertSubagentSandboxIdentity(sandbox, row.sandbox_identity);
             const tools = authorizedTools;
 
+            const byomRoute = payload.byom
+              ? parseStoredByomRoute(payload.byom)
+              : undefined;
+            if (payload.byom && !byomRoute?.ok) {
+              throw new Error(
+                byomRoute && !byomRoute.ok
+                  ? byomRoute.error
+                  : "Stored BYOM route is invalid.",
+              );
+            }
+            if (byomRoute?.ok) bindByomRoute(byomRoute.route);
             const provider = createTrackedProvider();
             const getCacheOptions = (modelName: string) => {
               const requestedModelSlug =
@@ -1695,11 +1713,11 @@ export const subagentTask = task({
                   stepCount += 1;
                   attemptResponseModel = response?.modelId ?? activeModelName;
                   responseModel = attemptResponseModel;
+                  const stepModelName = isByomBillingModel(activeModelName)
+                    ? activeModelName
+                    : (response?.modelId ?? activeModelName);
                   const index = usage
-                    ? usageTracker.accumulateStep(
-                        usage,
-                        response?.modelId ?? activeModelName,
-                      )
+                    ? usageTracker.accumulateStep(usage, stepModelName)
                     : undefined;
                   const openRouter = extractOpenRouterMetadata({
                     response,

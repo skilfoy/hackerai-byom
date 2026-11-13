@@ -30,6 +30,8 @@ export {
 import type { AbliterationGenerationStepLimit } from "./abliterated-model-steps";
 import type { UIMessage } from "ai";
 import type { ChatMode, SelectedModel, SubscriptionTier } from "@/types";
+import { isByomSelectedModel } from "@/types";
+import { isByomBillingModel } from "@/lib/ai/byom";
 import type { ModelName } from "@/lib/ai/providers";
 import type { ExperimentAnalyticsContext } from "@/lib/analytics/experiment-context";
 import {
@@ -166,6 +168,13 @@ export async function evaluateAbliteratedModel({
       return false;
     }
   };
+  if (
+    isByomBillingModel(selectedModel) ||
+    isByomSelectedModel(selectedModelOverride)
+  ) {
+    reportDecision("byom_route");
+    return undefined;
+  }
   // The shipped Free policy is independent of experiment/analytics availability.
   // Keep the selected Free baseline for generations after the first three.
   if (subscription === "free") {

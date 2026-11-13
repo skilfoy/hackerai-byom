@@ -52,6 +52,8 @@ import {
   normalizeSelectedModelOverrideForSubscription,
 } from "@/types";
 import { ChatSDKError } from "@/lib/errors";
+import { parseByomRequest, type ByomRoute } from "@/lib/ai/byom";
+import { isByomSelectedModel } from "@/types";
 import {
   requireOptionalIdentifier,
   requireRetiredTemporaryFieldAbsent,
@@ -228,6 +230,7 @@ type AgentTriggerRequestBody = {
   sandboxPreference?: SandboxPreference;
   agentPermissionMode?: AgentPermissionMode;
   selectedModel?: string;
+  byom?: unknown;
   isAutoContinue?: boolean;
   isAutomaticContinuation?: boolean;
   limitRescue?: LimitRescueRequest;
@@ -344,6 +347,7 @@ const parseAgentTriggerRequestBody = async (
       ),
       selectedModel:
         typeof body.selectedModel === "string" ? body.selectedModel : undefined,
+      byom: body.byom,
       isAutoContinue: body.isAutoContinue === true,
       isAutomaticContinuation:
         body.isAutoContinue === true && body.isAutomaticContinuation === true,
@@ -718,6 +722,7 @@ export const createAgentTriggerPost = ({
         sandboxPreference,
         agentPermissionMode = "full_access",
         selectedModel: rawSelectedModel,
+        byom: rawByom,
         isAutoContinue,
         isAutomaticContinuation,
         limitRescue,
@@ -742,6 +747,14 @@ export const createAgentTriggerPost = ({
           coerceSelectedModel(rawSelectedModel ?? null),
           subscription,
         );
+      let byomRoute: ByomRoute | undefined;
+      if (isByomSelectedModel(selectedModelOverride)) {
+        const parsed = parseByomRequest(rawByom, selectedModelOverride);
+        if (!parsed.ok) {
+          throw new ChatSDKError("bad_request:api", parsed.error);
+        }
+        byomRoute = parsed.route;
+      }
       stage = "access_gates";
       guardBoundary = "account_access_gate";
       await assertUserCanMakeCostIncurringRequest(userId, {
@@ -1153,6 +1166,7 @@ export const createAgentTriggerPost = ({
         approvalSessionId,
         approvalProtocolVersion: AGENT_APPROVAL_PROTOCOL_VERSION,
         selectedModel: selectedModelOverride,
+        ...(byomRoute ? { byom: byomRoute } : {}),
         autoReviewAssignment,
         userLocation,
         triggerRegion,

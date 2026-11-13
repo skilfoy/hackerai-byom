@@ -36,6 +36,7 @@ import { AgentGoalPanel } from "./AgentGoalPanel";
 import { ComposerOverlay } from "./ComposerOverlay";
 import { ScrollToBottomButton } from "./ScrollToBottomButton";
 import { BrowserHandoffEntry } from "./BrowserHandoffEntry";
+import { byomRequestForSelectedModel } from "@/lib/ai/byom-client";
 import type { RateLimitWarningData } from "./RateLimitWarning";
 import ChatHeader from "./ChatHeader";
 import Footer from "./Footer";
@@ -1294,6 +1295,11 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
         };
 
         const messagesWithoutUrls = stripUrlsFromMessages(lastMessage);
+        const requestBody =
+          body && typeof body === "object"
+            ? (body as { selectedModel?: unknown })
+            : undefined;
+        const byom = byomRequestForSelectedModel(requestBody?.selectedModel);
 
         return {
           headers: getPostHogRequestHeaders(),
@@ -1301,6 +1307,7 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
             chatId: id,
             messages: messagesWithoutUrls,
             ...body,
+            ...(byom ? { byom } : {}),
             ...(activeProjectIdRef.current
               ? { projectId: activeProjectIdRef.current }
               : {}),

@@ -102,6 +102,12 @@ describe("subagent model routing", () => {
     ).toBe(SUBAGENT_FREE_TEXT_MODEL);
   });
 
+  it("does not promote a BYOM parent onto a hosted vision model", () => {
+    expect(resolveSubagentModelForImageToolResults("byom-unsloth", true)).toBe(
+      "byom-unsloth",
+    );
+  });
+
   it("promotes to DeepSeek V4 Flash Vision when an image tool result appears", () => {
     expect(
       resolveSubagentModelForImageToolResults(SUBAGENT_FREE_TEXT_MODEL, true),

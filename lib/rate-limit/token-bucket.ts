@@ -18,6 +18,7 @@ import {
   ABLITERATION_LARGE_FLASH_MODEL_ID,
   ABLITERATION_LARGE_FLASH_PRICING,
 } from "@/lib/ai/abliteration";
+import { isByomBillingModel } from "@/lib/ai/byom";
 import { randomUUID } from "node:crypto";
 import { limitPaidBucket } from "./paid-bucket";
 import { ChatSDKError } from "@/lib/errors";
@@ -542,6 +543,7 @@ export const calculateTokenCost = (
   modelName?: string,
   promptTokens?: number,
 ): number => {
+  if (isByomBillingModel(modelName)) return 0;
   if (tokens <= 0) return 0;
   const pricing = getModelPricing(
     modelName,
@@ -563,6 +565,7 @@ export const calculateRawTokenCost = (
   type: "input" | "output",
   modelName?: string,
 ): number => {
+  if (isByomBillingModel(modelName)) return 0;
   if (tokens <= 0) return 0;
   const pricing = getModelPricing(
     modelName,
@@ -592,6 +595,7 @@ export const calculateRawModelUsageCostDollars = ({
   cacheWriteTokens?: number;
   modelName?: string;
 }): number => {
+  if (isByomBillingModel(modelName)) return 0;
   const normalizedInput = normalizeTokenCount(inputTokens);
   const normalizedOutput = normalizeTokenCount(outputTokens);
   const normalizedCacheRead = Math.min(

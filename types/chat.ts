@@ -35,13 +35,32 @@ export function coerceAgentPermissionMode(value: unknown): AgentPermissionMode {
 }
 
 export type SelectedModel =
-  "auto" | "hackerai-standard" | "hackerai-pro" | "hackerai-max";
+  | "auto"
+  | "hackerai-standard"
+  | "hackerai-pro"
+  | "hackerai-max"
+  | ByomSelectedModel;
+
+export const BYOM_SELECTED_MODELS = [
+  "byom-openai",
+  "byom-ollama",
+  "byom-hermes",
+  "byom-unsloth",
+] as const;
+
+export type ByomSelectedModel = (typeof BYOM_SELECTED_MODELS)[number];
+
+export const isByomSelectedModel = (
+  value: string | null | undefined,
+): value is ByomSelectedModel =>
+  !!value && (BYOM_SELECTED_MODELS as readonly string[]).includes(value);
 
 export const SELECTABLE_MODELS: readonly SelectedModel[] = [
   "auto",
   "hackerai-standard",
   "hackerai-pro",
   "hackerai-max",
+  ...BYOM_SELECTED_MODELS,
 ];
 
 /**
@@ -217,6 +236,7 @@ export function normalizeSelectedModelForSubscription(
   model: SelectedModel | null | undefined,
   subscription: SubscriptionTier,
 ): SelectedModel {
+  if (isByomSelectedModel(model)) return model;
   if (subscription === "free") return "auto";
   return model ?? "auto";
 }
@@ -225,6 +245,7 @@ export function normalizeSelectedModelOverrideForSubscription(
   model: SelectedModel | null | undefined,
   subscription: SubscriptionTier,
 ): SelectedModel | undefined {
+  if (isByomSelectedModel(model)) return model;
   if (subscription === "free") return "auto";
   return model ?? undefined;
 }
