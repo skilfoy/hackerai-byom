@@ -313,7 +313,7 @@ describe("paid daily free allowance", () => {
     ).resolves.toMatchObject({ available: true });
   });
 
-  it("is offered only when the user is on the Auto model", async () => {
+  it("is offered on Auto and BYOM connections, not hosted premium tiers", async () => {
     const { getPaidDailyFreeAllowanceStatus } = getIsolatedModule();
 
     for (const ctx of [askContext, agentContext]) {
@@ -322,6 +322,18 @@ describe("paid daily free allowance", () => {
       ).resolves.toMatchObject({ available: true });
       await expect(
         getPaidDailyFreeAllowanceStatus({ ...ctx, selectedModel: null }),
+      ).resolves.toMatchObject({ available: true });
+      await expect(
+        getPaidDailyFreeAllowanceStatus({
+          ...ctx,
+          selectedModel: "byom-openrouter",
+        }),
+      ).resolves.toMatchObject({ available: true });
+      await expect(
+        getPaidDailyFreeAllowanceStatus({
+          ...ctx,
+          selectedModel: "byom-vllm",
+        }),
       ).resolves.toMatchObject({ available: true });
       await expect(
         getPaidDailyFreeAllowanceStatus({

@@ -42,8 +42,10 @@ export type SelectedModel =
   | ByomSelectedModel;
 
 export const BYOM_SELECTED_MODELS = [
+  "byom-openrouter",
   "byom-openai",
   "byom-ollama",
+  "byom-vllm",
   "byom-hermes",
   "byom-unsloth",
 ] as const;

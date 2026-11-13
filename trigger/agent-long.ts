@@ -86,8 +86,11 @@ import { ptySessionManager } from "@/lib/ai/tools/utils/pty-session-manager";
 import { generateTitleFromUserMessageWithWriter } from "@/lib/actions";
 import { createTrackedProvider } from "@/lib/ai/providers";
 import { bindByomRoute } from "@/lib/ai/byom-context";
-import { parseByomRequest, type ByomRoute } from "@/lib/ai/byom";
-import { isByomSelectedModel } from "@/types";
+import {
+  parseByomRequest,
+  toConnectionModel,
+  type ByomRoute,
+} from "@/lib/ai/byom";
 import {
   AGENT_PROVIDER_IDLE_TIMEOUT_MS,
   AGENT_PROVIDER_TOTAL_TIMEOUT_MS,
@@ -2241,17 +2244,19 @@ export const agentLongTask = task({
           }),
       ]);
       const extraUsageAvailable = canUseExtraUsage(baseExtraUsageConfig);
-      selectedModelOverride =
+      const connectionModel = toConnectionModel(
         normalizeMaxModelForSubscription(selectedModelOverride, subscription, {
           extraUsageAvailable,
-        }) ?? undefined;
-      if (isByomSelectedModel(selectedModelOverride)) {
-        const parsed = parseByomRequest(rawByom, selectedModelOverride);
+        }) ?? undefined,
+      );
+      {
+        const parsed = parseByomRequest(rawByom, connectionModel);
         if (!parsed.ok) {
           throw new ChatSDKError("bad_request:api", parsed.error);
         }
         byomRoute = parsed.route;
       }
+      selectedModelOverride = connectionModel as SelectedModel;
       const extraUsageConfig = withExtraUsageBillingForModel(
         baseExtraUsageConfig,
         selectedModelOverride,

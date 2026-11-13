@@ -14,6 +14,7 @@ import {
   normalizeOpenAIBaseURL,
   parseByomRequest,
   parseStoredByomRoute,
+  toConnectionModel,
 } from "@/lib/ai/byom";
 
 describe("BYOM routing", () => {
@@ -82,7 +83,8 @@ describe("BYOM routing", () => {
       parseByomRequest({ modelId: "Hermes-4-70B" }, "byom-hermes"),
     ).toEqual({
       ok: false,
-      error: "Hermes routing needs an API key (request or HERMES_API_KEY).",
+      error:
+        "Hermes routing needs an API key (request or HERMES_API_KEY or NOUS_API_KEY).",
     });
     expect(
       parseByomRequest(
@@ -148,6 +150,31 @@ describe("BYOM routing", () => {
     );
     tracker.nonModelCost += 0.25;
     expect(tracker.computeCostDollars("byom-openai")).toBe(0.25);
+  });
+
+  it("routes OpenRouter and vLLM without using a hosted HackerAI tier", () => {
+    const openrouter = parseByomRequest(
+      { apiKey: "or-test" },
+      "byom-openrouter",
+    );
+    expect(openrouter).toEqual({
+      ok: true,
+      route: {
+        kind: "openrouter",
+        modelId: "openrouter/auto",
+        baseURL: "https://openrouter.ai/api/v1",
+        apiKey: "or-test",
+      },
+    });
+    expect(parseByomRequest(undefined, "byom-openrouter").ok).toBe(false);
+    const vllm = parseByomRequest({ modelId: "org/model" }, "byom-vllm");
+    expect(vllm.ok).toBe(true);
+    if (vllm.ok) {
+      expect(vllm.route.baseURL).toBe("http://127.0.0.1:8000/v1");
+      expect(vllm.route.modelId).toBe("org/model");
+    }
+    expect(toConnectionModel("hackerai-max")).toBe("byom-openrouter");
+    expect(toConnectionModel("byom-vllm")).toBe("byom-vllm");
   });
 
   it("keeps delegated agent calls on the parent BYOM route", () => {

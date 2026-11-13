@@ -9,7 +9,7 @@
 <h2 align="center">Your AI-Powered Penetration Testing Assistant</h2>
 
 <p align="center">
-  <strong>BYOM fork:</strong> hosted HackerAI tiers, plus any OpenAI-compatible endpoint, local Ollama, and direct Hermes and Unsloth routing.
+  <strong>BYOM fork:</strong> OpenRouter, any OpenAI-compatible endpoint, local Ollama, vLLM, and direct Hermes and Unsloth routing. Hosted Auto, Standard, Pro, and Max are not offered.
 </p>
 
 <div align="center">
@@ -49,20 +49,49 @@ You'll need the following accounts:
 
 ### Bring your own model
 
-The model selector can send Ask, Agent, and delegated subagents to an endpoint you control. Hosted Auto, Standard, Pro, and Max stay on OpenRouter.
+The model selector sends Ask, Agent, and delegated subagents to a connection you configure. Saved Auto, Standard, Pro, and Max choices migrate to the OpenRouter connection. They are not selectable.
 
 | Route             | Default endpoint                            | What it calls                                                                                                            |
 | ----------------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| OpenRouter        | `https://openrouter.ai/api/v1`              | Your OpenRouter key. Default model `openrouter/auto`. This replaces hosted Auto.                                         |
 | OpenAI-compatible | The base URL you enter                      | `POST {base}/chat/completions`                                                                                           |
 | Ollama            | `http://127.0.0.1:11434/v1`                 | Local Ollama's OpenAI shim                                                                                               |
+| vLLM              | `http://127.0.0.1:8000/v1`                  | A vLLM OpenAI server. The model id is the weights vLLM loaded.                                                           |
 | Hermes            | `https://inference-api.nousresearch.com/v1` | Nous Portal directly. Defaults include Hermes 4.3 36B, Hermes 4 70B, and Hermes 4 405B. Other Portal model ids work too. |
 | Unsloth           | `http://127.0.0.1:8888/v1`                  | Unsloth Studio, not OpenRouter. `default` uses the model loaded in Studio.                                               |
 
-API keys typed in the selector stay in browser storage and are sent only with the chat request. Server env fallbacks are `BYOM_OPENAI_*`, `OLLAMA_*`, `HERMES_API_KEY` or `NOUS_API_KEY`, and `UNSLOTH_*`.
+API keys typed in the selector stay in browser storage and are sent only with the chat request. Server env fallbacks are `OPENROUTER_*`, `BYOM_OPENAI_*`, `OLLAMA_*`, `VLLM_*`, `HERMES_API_KEY` or `NOUS_API_KEY`, and `UNSLOTH_*`.
 
-`localhost` is the machine running the HackerAI server. It reaches Ollama or Unsloth during local dev, or through a tunnel. A cloud Agent worker cannot open your laptop's loopback address. Hermes is a public API, so it works from cloud runs when the key is set.
+`localhost` is the machine running the HackerAI server. It reaches Ollama, vLLM, or Unsloth during local dev, or through a tunnel. A cloud Agent worker cannot open your laptop's loopback address. OpenRouter and Hermes are public APIs, so they work from cloud runs when the key is set.
 
 BYOM token use is not billed at HackerAI hosted rates. You pay the endpoint you configured. Sandbox and other non-model costs still apply.
+
+#### vLLM
+
+Serve an OpenAI-compatible endpoint and point the vLLM connection at it:
+
+```bash
+vllm serve Qwen/Qwen3-8B --host 0.0.0.0 --port 8000 --enable-prefix-caching
+```
+
+The same `/v1` API is what these deployments expose:
+
+- Docker image `vllm/vllm-openai`, publishing port 8000
+- Kubernetes, or Ray Serve in front of the same server
+- Runpod: expose port 8000 and use `https://{POD_ID}-8000.proxy.runpod.net/v1`
+- Modal: a web endpoint that wraps `vllm serve` and returns the public `/v1` URL
+
+Quantization is a server flag (`--quantization fp8`, `awq`, `gptq`, or `bitsandbytes`), not a chat setting. Prefix caching belongs on this connection. The model id in the selector must match the name vLLM loaded.
+
+#### Unsloth inference
+
+Unsloth Studio serves the loaded model as `default` on port 8888 through llama.cpp. Do not send a quant id as the Studio model id. Pick the weights when you load or export:
+
+- Dynamic GGUF: `UD-Q4_K_XL` (fast), `UD-Q5_K_XL` (balance), `UD-Q8_K_XL` (higher quality)
+- GPU: NVFP4 or FP8 builds when the card supports them
+- Export: `save_pretrained_gguf(..., quantization_method="q4_k_m" | "q5_k_m" | "q8_0" | "f16")`
+
+Use the vLLM connection, not Studio, when you want GPU prefix caching on those weights.
 
 ### Clone the repo
 

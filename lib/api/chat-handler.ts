@@ -54,13 +54,16 @@ import type {
 import {
   canUseExtraUsage,
   coerceSelectedModel,
-  isByomSelectedModel,
   isLimitRescueRequest,
   normalizeMaxModelForSubscription,
   normalizeSelectedModelOverrideForSubscription,
   withExtraUsageBillingForModel,
 } from "@/types";
-import { parseByomRequest, type ByomRoute } from "@/lib/ai/byom";
+import {
+  parseByomRequest,
+  toConnectionModel,
+  type ByomRoute,
+} from "@/lib/ai/byom";
 import { bindByomRoute } from "@/lib/ai/byom-context";
 import { getBaseTodosForRequest } from "@/lib/utils/todo-utils";
 import {
@@ -400,13 +403,14 @@ export const createChatHandler = () => {
       const freeQuotaSubject = freeUsageQuotaSubject ?? legacyQuotaSubject;
       paidDailyFreeAllowanceUserId = userId;
       const freeUsageSubject = freeQuotaSubject ?? userId;
-      let selectedModelOverride: SelectedModel | undefined =
+      let selectedModelOverride: SelectedModel | undefined = toConnectionModel(
         normalizeSelectedModelOverrideForSubscription(
           coerceSelectedModel(rawSelectedModel ?? null),
           subscription,
-        );
+        ),
+      );
       let byomRoute: ByomRoute | undefined;
-      if (isByomSelectedModel(selectedModelOverride)) {
+      {
         const parsed = parseByomRequest(rawByom, selectedModelOverride);
         if (!parsed.ok) {
           throw new ChatSDKError("bad_request:api", parsed.error);

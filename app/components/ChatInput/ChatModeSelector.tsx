@@ -23,8 +23,6 @@ export function ChatModeSelector({ className }: ChatModeSelectorProps) {
     defaultLocalSandboxPreference,
     sandboxPreference,
     setSandboxPreference,
-    selectedModel,
-    setSelectedModel,
   } = useGlobalState();
   const { user } = useAuth();
   const { isTauri } = useTauri();
@@ -37,9 +35,6 @@ export function ChatModeSelector({ className }: ChatModeSelectorProps) {
       defaultLocalSandboxPreference
     ) {
       setSandboxPreference(defaultLocalSandboxPreference);
-    }
-    if (selectedModel !== "auto") {
-      setSelectedModel("auto");
     }
     setAgentUpgradeDialogOpen(false);
   };

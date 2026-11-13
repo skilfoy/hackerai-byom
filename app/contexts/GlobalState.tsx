@@ -22,7 +22,6 @@ import {
   type SandboxPreference,
   isChatMode,
   isSidebarTerminal,
-  normalizeSelectedModelForSubscription,
 } from "@/types/chat";
 import type { Todo } from "@/types";
 import {
@@ -63,6 +62,7 @@ import {
   normalizeAgentFirstSandboxType,
 } from "@/lib/activation/agent-first-default";
 import { resolveFreeDesktopSandboxPreference } from "@/lib/activation/free-desktop-sandbox";
+import { toConnectionModel } from "@/lib/ai/byom";
 import { useAutoSelectNewRemoteConnection } from "@/app/hooks/useAutoSelectNewRemoteConnection";
 import { environmentPreference } from "@/lib/sandbox/environment";
 import {
@@ -615,7 +615,7 @@ const GlobalStateProviderInner: React.FC<GlobalStateProviderProps> = ({
   // Paid Agent tier ids are resolved to providers server-side.
   const [selectedModel, setSelectedModelRaw] = useState<SelectedModel>(() => {
     const saved = readSelectedModel();
-    return saved ?? "auto";
+    return toConnectionModel(saved);
   });
 
   // Persist model preference to localStorage (single key, shared across modes).
@@ -626,10 +626,7 @@ const GlobalStateProviderInner: React.FC<GlobalStateProviderProps> = ({
   useEffect(() => {
     if (!subscriptionResolved) return;
     if (subscription === "free" && !freeSubscriptionResolved) return;
-    const normalizedModel = normalizeSelectedModelForSubscription(
-      selectedModel,
-      subscription,
-    );
+    const normalizedModel = toConnectionModel(selectedModel);
     if (normalizedModel !== selectedModel) {
       setSelectedModelRaw(normalizedModel);
     }
@@ -701,9 +698,6 @@ const GlobalStateProviderInner: React.FC<GlobalStateProviderProps> = ({
     if (localSandboxPreference) {
       setSandboxPreference(localSandboxPreference, { remember: false });
     }
-    if (selectedModel !== "auto") {
-      setSelectedModelRaw("auto");
-    }
 
     const now = new Date().toISOString();
     const agentFirstProperties = {
@@ -747,7 +741,6 @@ const GlobalStateProviderInner: React.FC<GlobalStateProviderProps> = ({
     isMobile,
     paidAgentSubscription,
     sandboxPreference,
-    selectedModel,
     setSandboxPreference,
     subscriptionResolved,
     user,
@@ -818,15 +811,10 @@ const GlobalStateProviderInner: React.FC<GlobalStateProviderProps> = ({
     ) {
       setSandboxPreference(freeDesktopSandboxPreference, { remember: false });
     }
-    if (freeDesktopAgentOnlyActive && selectedModel !== "auto") {
-      setSelectedModelRaw("auto");
-    }
   }, [
     agentOnlyActive,
     freeDesktopSandboxPreference,
-    freeDesktopAgentOnlyActive,
     sandboxPreference,
-    selectedModel,
     setSandboxPreference,
   ]);
 

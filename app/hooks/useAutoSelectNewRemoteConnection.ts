@@ -115,12 +115,8 @@ export function useAutoSelectNewRemoteConnection({
   hasExplicitSandboxPreference,
   chatMode,
   setChatMode,
-  subscription,
-  freeSubscriptionResolved,
   sandboxPreference,
   setSandboxPreference,
-  selectedModel,
-  setSelectedModel,
 }: UseAutoSelectNewRemoteConnectionArgs) {
   const pendingReconnectRef = useRef<RemoteConnectionSelectionRequest | null>(
     null,
@@ -195,14 +191,6 @@ export function useAutoSelectNewRemoteConnection({
         });
       }
 
-      if (
-        freeSubscriptionResolved &&
-        subscription === "free" &&
-        selectedModel !== "auto"
-      ) {
-        setSelectedModel("auto");
-      }
-
       if (chatMode !== "agent") {
         setChatMode("agent");
         toast.success(
@@ -218,12 +206,8 @@ export function useAutoSelectNewRemoteConnection({
       isNewChat,
       hasExplicitSandboxPreference,
       sandboxPreference,
-      selectedModel,
       setChatMode,
       setSandboxPreference,
-      setSelectedModel,
-      subscription,
-      freeSubscriptionResolved,
     ],
   );
 

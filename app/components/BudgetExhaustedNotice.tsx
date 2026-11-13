@@ -169,7 +169,7 @@ const UsageBudgetExhaustedNotice = ({
         </span>
         {canUseDailyAllowance && (
           <p className="text-sm">
-            Continue on Auto with today&apos;s free allowance
+            Continue on OpenRouter with today&apos;s free allowance
             {typeof dailyAllowance?.costRemainingDollars === "number"
               ? ` ($${dailyAllowance.costRemainingDollars.toFixed(2)} remaining)`
               : ""}
@@ -183,7 +183,9 @@ const UsageBudgetExhaustedNotice = ({
               size="sm"
               disabled={pending}
               onClick={() =>
-                void onContinue("auto", { type: "paid_daily_free_allowance" })
+                void onContinue("byom-openrouter", {
+                  type: "paid_daily_free_allowance",
+                })
               }
             >
               {pending ? "Resuming…" : "Continue with daily allowance"}

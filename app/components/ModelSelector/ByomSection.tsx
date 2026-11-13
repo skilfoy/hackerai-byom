@@ -5,7 +5,9 @@ import { Check } from "lucide-react";
 
 import {
   BYOM_PROVIDER_DEFAULTS,
+  BYOM_PROVIDER_KINDS,
   HERMES_DIRECT_MODELS,
+  OPENROUTER_DIRECT_MODELS,
   byomKindForSelectedModel,
   type ByomProviderKind,
 } from "@/lib/ai/byom";
@@ -32,12 +34,10 @@ export function ByomSection({
 }) {
   const active = isByomSelectedModel(value) ? value : null;
   const [drafts, setDrafts] = useState<Record<ByomProviderKind, ByomDraft>>(
-    () => ({
-      "openai-compatible": readByomDraft("openai-compatible"),
-      ollama: readByomDraft("ollama"),
-      hermes: readByomDraft("hermes"),
-      unsloth: readByomDraft("unsloth"),
-    }),
+    () =>
+      Object.fromEntries(
+        BYOM_PROVIDER_KINDS.map((kind) => [kind, readByomDraft(kind)]),
+      ) as Record<ByomProviderKind, ByomDraft>,
   );
 
   const update = (kind: ByomProviderKind, patch: Partial<ByomDraft>) => {
@@ -49,9 +49,9 @@ export function ByomSection({
   };
 
   return (
-    <div className="mt-1 border-t border-border/50 pt-1.5">
+    <div className="pt-0.5">
       <p className="px-2.5 pb-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-        Bring your own model
+        Connections
       </p>
       {BYOM_MODEL_OPTIONS.map((option) => {
         const kind = byomKindForSelectedModel(option.id);
@@ -98,7 +98,11 @@ export function ByomSection({
                     className={`${fieldClass} mt-0.5`}
                     value={draft.modelId}
                     list={
-                      kind === "hermes" ? "hermes-direct-models" : undefined
+                      kind === "hermes"
+                        ? "hermes-direct-models"
+                        : kind === "openrouter"
+                          ? "openrouter-direct-models"
+                          : undefined
                     }
                     placeholder={defaults.modelId || "provider/model"}
                     spellCheck={false}
@@ -116,6 +120,15 @@ export function ByomSection({
                     ))}
                   </datalist>
                 ) : null}
+                {kind === "openrouter" ? (
+                  <datalist id="openrouter-direct-models">
+                    {OPENROUTER_DIRECT_MODELS.map((model) => (
+                      <option key={model.id} value={model.id}>
+                        {model.label}
+                      </option>
+                    ))}
+                  </datalist>
+                ) : null}
                 <label className="block text-[11px] text-muted-foreground">
                   API key
                   <input
@@ -125,7 +138,7 @@ export function ByomSection({
                     value={draft.apiKey}
                     placeholder={
                       defaults.apiKeyRequired
-                        ? "Required, or set HERMES_API_KEY"
+                        ? `Required, or set ${defaults.envApiKey}`
                         : "Optional"
                     }
                     onChange={(event) =>
@@ -138,6 +151,37 @@ export function ByomSection({
                   request. Localhost works when HackerAI is running on this
                   computer. Cloud runs need a URL the server can reach.
                 </p>
+                {kind === "vllm" ? (
+                  <p className="text-[11px] leading-snug text-muted-foreground">
+                    Serve with{" "}
+                    <span className="font-mono">
+                      vllm serve {"<model>"} --host 0.0.0.0 --port 8000
+                      --enable-prefix-caching
+                    </span>
+                    . The model id is the name vLLM loaded. Docker image{" "}
+                    <span className="font-mono">vllm/vllm-openai</span>,
+                    Kubernetes, Ray Serve, Runpod port 8000, and Modal all
+                    expose the same <span className="font-mono">/v1</span> API.
+                    Quantization (FP8, AWQ, GPTQ, bitsandbytes) is a server
+                    flag, not a chat setting.
+                  </p>
+                ) : null}
+                {kind === "unsloth" ? (
+                  <p className="text-[11px] leading-snug text-muted-foreground">
+                    Studio serves the loaded model as{" "}
+                    <span className="font-mono">default</span> through
+                    llama.cpp. For speed and quality, load an Unsloth Dynamic
+                    GGUF (UD-Q4_K_XL, UD-Q5_K_XL, UD-Q8_K_XL) or an NVFP4/FP8
+                    build. Export with{" "}
+                    <span className="font-mono">
+                      {
+                        'save_pretrained_gguf(..., quantization_method="q4_k_m" | "q5_k_m" | "q8_0" | "f16")'
+                      }
+                    </span>
+                    . Use the vLLM connection when you want GPU prefix caching
+                    on those weights.
+                  </p>
+                ) : null}
                 <button
                   type="button"
                   className="text-xs font-medium text-foreground underline underline-offset-2 cursor-pointer"

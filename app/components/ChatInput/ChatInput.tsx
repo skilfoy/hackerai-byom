@@ -343,8 +343,6 @@ const ChatInputContent = ({
     setQueueBehavior,
     sandboxPreference,
     setSandboxPreference,
-    selectedModel,
-    setSelectedModel,
     subscription,
     isCheckingProPlan,
     hasLocalSandbox,
@@ -931,9 +929,6 @@ const ChatInputContent = ({
       defaultLocalSandboxPreference
     ) {
       setSandboxPreference(defaultLocalSandboxPreference, { remember: false });
-    }
-    if (selectedModel !== "auto") {
-      setSelectedModel("auto");
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isFreeAgent]);

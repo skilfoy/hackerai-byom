@@ -192,14 +192,14 @@ const MessageErrorContent = ({
     isRateLimitError &&
     paidDailyFreeAllowance?.type === "paid_daily_free_allowance" &&
     paidDailyFreeAllowance.available === true;
-  // The allowance exists but the user picked a specific model; switching to
-  // Auto is all it takes, so say so instead of showing a dead end.
+  // The allowance exists but the user picked a hosted tier. This fork has no
+  // Auto/Standard/Pro/Max selector, so continue on the OpenRouter connection.
   const allowanceNeedsAutoModel =
     isRateLimitError &&
     paidDailyFreeAllowance?.type === "paid_daily_free_allowance" &&
     paidDailyFreeAllowance.available === false &&
     paidDailyFreeAllowance.unavailableReason === "unsupported_model";
-  const switchToAutoCtaText = "Switch to Auto and continue";
+  const switchToAutoCtaText = "Switch to OpenRouter and continue";
   const paidDailyFreeAllowanceCtaText = getPaidDailyFreeAllowanceCtaText(mode);
   const allowanceCostRemaining =
     typeof paidDailyFreeAllowance?.costRemainingDollars === "number"
@@ -450,8 +450,8 @@ const MessageErrorContent = ({
         {allowanceNeedsAutoModel && (
           <p className="text-xs text-muted-foreground mt-2">
             Your paid-plan limit is used up, but you still get some free usage
-            today on Auto. Switch to Auto to continue this request with our
-            low-cost model. The daily allowance resets at midnight UTC.
+            today on OpenRouter. Switch to OpenRouter to continue this request
+            with your own endpoint. The daily allowance resets at midnight UTC.
           </p>
         )}
       </div>
@@ -542,10 +542,10 @@ const MessageErrorContent = ({
                     allowance_unavailable_reason:
                       paidDailyFreeAllowance?.unavailableReason,
                   });
-                  setSelectedModel("auto");
+                  setSelectedModel("byom-openrouter");
                   onRetry({
                     limitRescue: { type: "paid_daily_free_allowance" },
-                    selectedModel: "auto",
+                    selectedModel: "byom-openrouter",
                   });
                 }}
               >

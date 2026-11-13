@@ -10,36 +10,21 @@ export interface ModelOption {
   thinking?: boolean;
 }
 
-export const AGENT_MODEL_OPTIONS: ModelOption[] = [
-  {
-    id: "hackerai-standard",
-    label: "HackerAI Standard",
-    description: "Reliable agent for everyday automation",
-    poweredBy: "DeepSeek V4.1 Flash 1017 · High reasoning",
-    thinking: true,
-  },
-  {
-    id: "hackerai-pro",
-    label: "HackerAI Pro",
-    description: "Superior performance for most assignments",
-    poweredBy: "DeepSeek V4.1 Flash 1017 · Max reasoning",
-    thinking: true,
-  },
-  {
-    id: "hackerai-max",
-    label: "HackerAI Max",
-    description: "Maximum intelligence for complex work",
-    thinking: true,
-  },
-];
+export const AGENT_MODEL_OPTIONS: ModelOption[] = [];
 
 export const BYOM_MODEL_OPTIONS: Array<
   ModelOption & { id: ByomSelectedModel }
 > = [
   {
+    id: "byom-openrouter",
+    label: "OpenRouter",
+    description: "Any OpenRouter model, including Auto",
+    poweredBy: "https://openrouter.ai/api/v1",
+  },
+  {
     id: "byom-openai",
     label: "OpenAI-compatible",
-    description: "Any chat-completions endpoint",
+    description: "Any other chat-completions endpoint",
     poweredBy: "Your base URL and model id",
   },
   {
@@ -47,6 +32,13 @@ export const BYOM_MODEL_OPTIONS: Array<
     label: "Ollama",
     description: "Local Ollama on this computer or a reachable host",
     poweredBy: "http://127.0.0.1:11434/v1",
+  },
+  {
+    id: "byom-vllm",
+    label: "vLLM",
+    description:
+      "OpenAI server from vLLM, Docker, Kubernetes, Runpod, or Modal",
+    poweredBy: "http://127.0.0.1:8000/v1",
   },
   {
     id: "byom-hermes",
@@ -57,7 +49,7 @@ export const BYOM_MODEL_OPTIONS: Array<
   {
     id: "byom-unsloth",
     label: "Unsloth",
-    description: "Unsloth Studio's OpenAI-compatible server",
+    description: "Studio inference. Load a Dynamic GGUF or NVFP4/FP8 build",
     poweredBy: "http://127.0.0.1:8888/v1",
   },
 ];

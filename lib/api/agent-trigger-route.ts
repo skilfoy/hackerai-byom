@@ -52,8 +52,11 @@ import {
   normalizeSelectedModelOverrideForSubscription,
 } from "@/types";
 import { ChatSDKError } from "@/lib/errors";
-import { parseByomRequest, type ByomRoute } from "@/lib/ai/byom";
-import { isByomSelectedModel } from "@/types";
+import {
+  parseByomRequest,
+  toConnectionModel,
+  type ByomRoute,
+} from "@/lib/ai/byom";
 import {
   requireOptionalIdentifier,
   requireRetiredTemporaryFieldAbsent,
@@ -742,13 +745,14 @@ export const createAgentTriggerPost = ({
       } = await getUserIDAndPro(req);
       const freeQuotaSubject = freeUsageQuotaSubject ?? legacyQuotaSubject;
       diagnosticContext.userId = userId.slice(0, 128);
-      let selectedModelOverride: SelectedModel | undefined =
+      let selectedModelOverride: SelectedModel | undefined = toConnectionModel(
         normalizeSelectedModelOverrideForSubscription(
           coerceSelectedModel(rawSelectedModel ?? null),
           subscription,
-        );
+        ),
+      );
       let byomRoute: ByomRoute | undefined;
-      if (isByomSelectedModel(selectedModelOverride)) {
+      {
         const parsed = parseByomRequest(rawByom, selectedModelOverride);
         if (!parsed.ok) {
           throw new ChatSDKError("bad_request:api", parsed.error);

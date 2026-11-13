@@ -1466,8 +1466,10 @@ export const modelDisplayNames: Record<ModelName, string> &
   "fallback-ask-model": "Auto, an intelligent model router built by HackerAI",
   "title-generator-model": "GLM 5.3 Flash",
   "auxiliary-vision-model": "Auxiliary vision model",
+  "byom-openrouter": "OpenRouter",
   "byom-openai": "OpenAI-compatible endpoint",
   "byom-ollama": "Ollama",
+  "byom-vllm": "vLLM",
   "byom-hermes": "Hermes",
   "byom-unsloth": "Unsloth",
 };
@@ -1584,8 +1586,10 @@ export function resolveAgentTierToProviderKey(
       return DEEPSEEK_1017_MODEL_KEY;
     case "hackerai-max":
       return "model-grok-4.6";
+    case "byom-openrouter":
     case "byom-openai":
     case "byom-ollama":
+    case "byom-vllm":
     case "byom-hermes":
     case "byom-unsloth":
       return tier;

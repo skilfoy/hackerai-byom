@@ -1,17 +1,9 @@
 import "@testing-library/jest-dom";
 import { fireEvent, render, screen } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
 import { describe, it, expect, jest, beforeEach } from "@jest/globals";
-import type { SubscriptionTier } from "@/types/chat";
 
-let mockSubscription: SubscriptionTier;
-let mockMaxEntitlement: unknown;
-let mockIsMobile: boolean;
-const mockUseQuery = jest.fn((_query: unknown, args: unknown) =>
-  args === "skip" ? undefined : mockMaxEntitlement,
-);
-const mockRedirectToPricing = jest.fn();
-const mockOpenSettingsDialog = jest.fn();
+let mockIsMobile = false;
+const mockUseQuery = jest.fn();
 
 Object.defineProperty(globalThis, "ResizeObserver", {
   configurable: true,
@@ -30,22 +22,8 @@ Object.defineProperty(globalThis, "ResizeObserver", {
   },
 });
 
-jest.mock("@/app/contexts/GlobalState", () => ({
-  useGlobalState: () => ({
-    subscription: mockSubscription,
-  }),
-}));
-
 jest.mock("@/hooks/use-mobile", () => ({
   useIsMobile: () => mockIsMobile,
-}));
-
-jest.mock("@/app/hooks/usePricingDialog", () => ({
-  redirectToPricing: (...args: unknown[]) => mockRedirectToPricing(...args),
-}));
-
-jest.mock("@/lib/utils/settings-dialog", () => ({
-  openSettingsDialog: (...args: unknown[]) => mockOpenSettingsDialog(...args),
 }));
 
 jest.mock("convex/react", () => ({
@@ -58,369 +36,88 @@ const { ModelSelector } = jest.requireActual<
 
 describe("ModelSelector", () => {
   beforeEach(() => {
-    mockSubscription = "pro-plus";
-    mockMaxEntitlement = undefined;
     mockIsMobile = false;
     mockUseQuery.mockClear();
-    mockRedirectToPricing.mockClear();
-    mockOpenSettingsDialog.mockClear();
+    window.localStorage.clear();
   });
 
-  it("skips the Max entitlement query until a paid user opens the selector", () => {
-    render(<ModelSelector value="auto" onChange={jest.fn()} mode="agent" />);
-
-    expect(mockUseQuery).toHaveBeenLastCalledWith(expect.anything(), "skip");
-
-    fireEvent.click(screen.getByRole("button", { name: /^Auto$/i }));
-
-    expect(mockUseQuery).toHaveBeenLastCalledWith(expect.anything(), {});
-  });
-
-  it("shows model choices immediately while Auto is selected", () => {
-    render(<ModelSelector value="auto" onChange={jest.fn()} mode="agent" />);
-
-    fireEvent.click(screen.getByRole("button", { name: /^Auto$/i }));
-
-    expect(
-      screen.getByText(
-        "Balanced quality and speed, recommended for most tasks",
-      ),
-    ).toBeVisible();
-    expect(screen.getByText("HackerAI Standard")).toBeVisible();
-    expect(screen.getByText("HackerAI Pro")).toBeVisible();
-    expect(screen.getByText("HackerAI Max")).toBeVisible();
-
-    expect(
-      screen.getByRole("button", { name: /HackerAI Standard/i }),
-    ).toHaveAttribute("aria-pressed", "false");
-  });
-
-  it.each(["ask", "agent"] as const)(
-    "shows model names alongside capability descriptions on hover in %s mode",
-    async (mode) => {
-      mockMaxEntitlement = {
-        extraUsageAvailable: false,
-        reason: "disabled",
-        hasBalance: false,
-        autoReloadEnabled: false,
-      };
-      const user = userEvent.setup();
-      render(<ModelSelector value="auto" onChange={jest.fn()} mode={mode} />);
-      fireEvent.click(screen.getByRole("button", { name: /^Auto$/i }));
-
-      await user.hover(
-        screen.getByRole("button", { name: /HackerAI Standard/i }),
-      );
-      expect(
-        await screen.findAllByText(
-          "Powered by DeepSeek V4.1 Flash 1017 · High reasoning",
-        ),
-      ).not.toHaveLength(0);
-      await user.unhover(
-        screen.getByRole("button", { name: /HackerAI Standard/i }),
-      );
-
-      await user.hover(screen.getByRole("button", { name: /HackerAI Pro/i }));
-      expect(
-        await screen.findAllByText("Superior performance for most assignments"),
-      ).not.toHaveLength(0);
-      expect(
-        await screen.findAllByText(
-          "Powered by DeepSeek V4.1 Flash 1017 · Max reasoning",
-        ),
-      ).not.toHaveLength(0);
-
-      await user.unhover(screen.getByRole("button", { name: /HackerAI Pro/i }));
-      await user.hover(screen.getByRole("button", { name: /HackerAI Max/i }));
-      expect(
-        await screen.findAllByText("Maximum intelligence for complex work"),
-      ).not.toHaveLength(0);
-    },
-  );
-
-  it("keeps Agent tiers locked as upgrades in Free Ask", () => {
-    mockSubscription = "free";
-    const onChange = jest.fn();
-    render(<ModelSelector value="auto" onChange={onChange} mode="ask" />);
-
-    fireEvent.click(screen.getByRole("button", { name: /^Model$/i }));
-    fireEvent.click(screen.getByRole("button", { name: /HackerAI Pro/i }));
-    expect(onChange).not.toHaveBeenCalled();
-    expect(mockRedirectToPricing).toHaveBeenCalled();
-  });
-
-  it("selects Auto as a first-class option", () => {
-    const onChange = jest.fn();
-    render(
-      <ModelSelector value="hackerai-pro" onChange={onChange} mode="agent" />,
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: /HackerAI Pro/i }));
-    fireEvent.click(
-      screen.getByRole("button", {
-        name: /Auto Balanced quality and speed/i,
-      }),
-    );
-
-    expect(onChange).toHaveBeenCalledWith("auto");
-  });
-
-  it("selects HackerAI Pro in agent mode without a high-cost warning", () => {
-    const onChange = jest.fn();
-    render(<ModelSelector value="auto" onChange={onChange} mode="agent" />);
-
-    fireEvent.click(screen.getByRole("button", { name: /^Auto$/i }));
-    fireEvent.click(screen.getByRole("button", { name: /HackerAI Pro/i }));
-
-    expect(
-      screen.queryByTestId("high-cost-model-warning"),
-    ).not.toBeInTheDocument();
-    expect(onChange).toHaveBeenCalledWith("hackerai-pro");
-  });
-
-  it("opens the Max access dialog when a Pro Plus user clicks the locked desktop row", () => {
-    mockMaxEntitlement = {
-      extraUsageAvailable: false,
-      reason: "disabled",
-      hasBalance: false,
-      autoReloadEnabled: false,
-    };
-    const onChange = jest.fn();
-    render(<ModelSelector value="auto" onChange={onChange} mode="agent" />);
-
-    fireEvent.click(screen.getByRole("button", { name: /^Auto$/i }));
-    const maxButton = screen.getByRole("button", { name: /HackerAI Max/i });
-
-    expect(maxButton).toHaveAccessibleName(
-      "HackerAI Max. Use Extra Usage or upgrade to Ultra for Max mode.",
-    );
-
-    fireEvent.click(maxButton);
-
-    expect(onChange).not.toHaveBeenCalled();
-    expect(
-      screen.getByRole("dialog", { name: "Unlock HackerAI Max" }),
-    ).toBeVisible();
-    expect(
-      screen.getByText(/pay for Max as you go, or upgrade to Ultra/i),
-    ).toBeVisible();
-    expect(mockOpenSettingsDialog).not.toHaveBeenCalled();
-    expect(mockRedirectToPricing).not.toHaveBeenCalled();
-
-    fireEvent.click(screen.getByRole("button", { name: "Use Extra Usage" }));
-
-    expect(mockOpenSettingsDialog).toHaveBeenCalledWith("Extra Usage");
-  });
-
-  it("does not reveal inline Max access actions on desktop hover", async () => {
-    mockMaxEntitlement = {
-      extraUsageAvailable: false,
-      reason: "disabled",
-      hasBalance: false,
-      autoReloadEnabled: false,
-    };
-    const user = userEvent.setup();
-    render(<ModelSelector value="auto" onChange={jest.fn()} mode="agent" />);
-
-    fireEvent.click(screen.getByRole("button", { name: /^Auto$/i }));
-    await user.hover(screen.getByRole("button", { name: /HackerAI Max/i }));
-
-    expect(
-      screen.queryByRole("group", {
-        name: "Choose how to access HackerAI Max",
-      }),
-    ).not.toBeInTheDocument();
-  });
-
-  it("can upgrade to Ultra from the locked Max desktop dialog", () => {
-    mockMaxEntitlement = {
-      extraUsageAvailable: false,
-      reason: "disabled",
-      hasBalance: false,
-      autoReloadEnabled: false,
-    };
-    render(<ModelSelector value="auto" onChange={jest.fn()} mode="agent" />);
-
-    fireEvent.click(screen.getByRole("button", { name: /^Auto$/i }));
-    fireEvent.click(screen.getByRole("button", { name: /HackerAI Max/i }));
-    fireEvent.click(screen.getByRole("button", { name: "Upgrade to Ultra" }));
-
-    expect(mockRedirectToPricing).toHaveBeenCalledWith({
-      surface: "model_selector",
-      source: "max_model_gate",
-      from_tier: "pro-plus",
-      cta_text: "Upgrade to Ultra",
-    });
-    expect(mockOpenSettingsDialog).not.toHaveBeenCalled();
-  });
-
-  it("shows both Max access choices after a locked mobile selection", () => {
-    mockIsMobile = true;
-    mockMaxEntitlement = {
-      extraUsageAvailable: false,
-      reason: "disabled",
-      hasBalance: false,
-      autoReloadEnabled: false,
-    };
-    const onChange = jest.fn();
-    render(<ModelSelector value="auto" onChange={onChange} mode="agent" />);
-
-    fireEvent.click(screen.getByRole("button", { name: /^Auto$/i }));
-    fireEvent.click(screen.getByRole("button", { name: /HackerAI Max/i }));
-
-    expect(
-      screen.getByRole("dialog", { name: "Unlock HackerAI Max" }),
-    ).toBeVisible();
-    expect(
-      screen.getByText(/pay for Max as you go, or upgrade to Ultra/i),
-    ).toBeVisible();
-    expect(onChange).not.toHaveBeenCalled();
-    expect(mockOpenSettingsDialog).not.toHaveBeenCalled();
-    expect(mockRedirectToPricing).not.toHaveBeenCalled();
-
-    fireEvent.click(screen.getByRole("button", { name: "Use Extra Usage" }));
-
-    expect(mockOpenSettingsDialog).toHaveBeenCalledWith("Extra Usage");
-    expect(mockRedirectToPricing).not.toHaveBeenCalled();
-  });
-
-  it("can upgrade to Ultra from the locked Max mobile dialog", () => {
-    mockIsMobile = true;
-    mockMaxEntitlement = {
-      extraUsageAvailable: false,
-      reason: "empty",
-      hasBalance: false,
-      autoReloadEnabled: false,
-    };
-    render(<ModelSelector value="auto" onChange={jest.fn()} mode="agent" />);
-
-    fireEvent.click(screen.getByRole("button", { name: /^Auto$/i }));
-    fireEvent.click(screen.getByRole("button", { name: /HackerAI Max/i }));
-    fireEvent.click(screen.getByRole("button", { name: "Upgrade to Ultra" }));
-
-    expect(mockRedirectToPricing).toHaveBeenCalledWith({
-      surface: "model_selector_mobile",
-      source: "max_model_gate",
-      from_tier: "pro-plus",
-      cta_text: "Upgrade to Ultra",
-    });
-    expect(mockOpenSettingsDialog).not.toHaveBeenCalled();
-  });
-
-  it("shows a checking state while lazy Max entitlement is loading", () => {
-    const onChange = jest.fn();
-    render(<ModelSelector value="auto" onChange={onChange} mode="agent" />);
-
-    fireEvent.click(screen.getByRole("button", { name: /^Auto$/i }));
-
-    const maxButton = screen.getByRole("button", { name: /HackerAI Max/i });
-    expect(maxButton).toHaveAccessibleName(
-      "HackerAI Max. Checking Extra Usage for Max mode.",
-    );
-    expect(maxButton).toBeDisabled();
-
-    fireEvent.click(maxButton);
-
-    expect(onChange).not.toHaveBeenCalled();
-    expect(mockOpenSettingsDialog).not.toHaveBeenCalled();
-  });
-
-  it("selects HackerAI Max on Pro Plus when extra usage is available", () => {
-    mockMaxEntitlement = {
-      extraUsageAvailable: true,
-      reason: "available",
-      hasBalance: true,
-      autoReloadEnabled: false,
-    };
-    const onChange = jest.fn();
-    render(<ModelSelector value="auto" onChange={onChange} mode="agent" />);
-
-    fireEvent.click(screen.getByRole("button", { name: /^Auto$/i }));
-    fireEvent.click(screen.getByRole("button", { name: /HackerAI Max/i }));
-
-    expect(onChange).toHaveBeenCalledWith("hackerai-max");
-    expect(mockRedirectToPricing).not.toHaveBeenCalled();
-  });
-
-  it("selects HackerAI Max for Ultra users", () => {
-    mockSubscription = "ultra";
-    const onChange = jest.fn();
-    render(<ModelSelector value="auto" onChange={onChange} mode="agent" />);
-
-    fireEvent.click(screen.getByRole("button", { name: /^Auto$/i }));
-    fireEvent.click(screen.getByRole("button", { name: /HackerAI Max/i }));
-
-    expect(onChange).toHaveBeenCalledWith("hackerai-max");
-  });
-
-  it("locks HackerAI Max for team users", () => {
-    mockSubscription = "team";
-    const onChange = jest.fn();
-    render(<ModelSelector value="auto" onChange={onChange} mode="agent" />);
-
-    fireEvent.click(screen.getByRole("button", { name: /^Auto$/i }));
-    fireEvent.click(screen.getByRole("button", { name: /HackerAI Max/i }));
-
-    expect(onChange).not.toHaveBeenCalled();
-    expect(mockOpenSettingsDialog).toHaveBeenCalledWith("Extra Usage");
-    expect(mockRedirectToPricing).not.toHaveBeenCalled();
-  });
-
-  it("does not display a stale paid model as selected for free users", () => {
-    mockSubscription = "free";
-
+  it("shows OpenRouter for a saved hosted tier", () => {
     render(
       <ModelSelector value="hackerai-pro" onChange={jest.fn()} mode="agent" />,
     );
 
-    expect(screen.getByRole("button", { name: /^Auto$/i })).toBeVisible();
+    expect(screen.getByRole("button", { name: "OpenRouter" })).toBeVisible();
   });
 
-  it("does not display stale Max as selected outside Ultra", () => {
-    mockSubscription = "pro";
-    mockMaxEntitlement = {
-      extraUsageAvailable: false,
-      reason: "empty",
-      hasBalance: false,
-      autoReloadEnabled: false,
-    };
+  it("offers connections and not hosted Auto, Standard, Pro, or Max", () => {
+    render(<ModelSelector value="auto" onChange={jest.fn()} mode="ask" />);
 
-    render(
-      <ModelSelector value="hackerai-max" onChange={jest.fn()} mode="agent" />,
-    );
+    fireEvent.click(screen.getByRole("button", { name: "OpenRouter" }));
 
-    fireEvent.click(screen.getByRole("button", { name: /HackerAI Pro/i }));
-
-    const proButton = screen
-      .getAllByRole("button", { name: /HackerAI Pro/i })
-      .find((button) => button.hasAttribute("aria-pressed"));
-    const maxButton = screen.getByRole("button", { name: /HackerAI Max/i });
-
-    expect(proButton).toBeDefined();
-    expect(proButton).toHaveAttribute("aria-pressed", "true");
-    expect(maxButton).toHaveAttribute("aria-pressed", "false");
+    expect(screen.queryByRole("button", { name: /^Auto$/i })).toBeNull();
+    expect(screen.queryByText("HackerAI Standard")).toBeNull();
+    expect(screen.queryByText("HackerAI Pro")).toBeNull();
+    expect(screen.queryByText("HackerAI Max")).toBeNull();
+    expect(screen.queryByText(/Get access to paid models/i)).toBeNull();
+    expect(
+      screen.getByText("Any OpenRouter model, including Auto"),
+    ).toBeVisible();
+    expect(screen.getByText("OpenAI-compatible")).toBeVisible();
+    expect(screen.getByText("Ollama")).toBeVisible();
+    expect(screen.getByText("vLLM")).toBeVisible();
+    expect(screen.getByText("Hermes")).toBeVisible();
+    expect(screen.getByText("Unsloth")).toBeVisible();
+    expect(screen.queryByText(/Runpod port 8000/i)).not.toBeInTheDocument();
   });
 
-  it("displays stale Max as selected for Pro users with extra usage available", () => {
-    mockSubscription = "pro";
-    mockMaxEntitlement = {
-      extraUsageAvailable: true,
-      reason: "available",
-      hasBalance: false,
-      autoReloadEnabled: true,
-    };
-
-    render(
-      <ModelSelector value="hackerai-max" onChange={jest.fn()} mode="agent" />,
+  it("selects vLLM and shows how to serve it", () => {
+    const onChange = jest.fn();
+    const { rerender } = render(
+      <ModelSelector
+        value="byom-openrouter"
+        onChange={onChange}
+        mode="agent"
+      />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /HackerAI Max/i }));
+    fireEvent.click(screen.getByRole("button", { name: "OpenRouter" }));
+    fireEvent.click(screen.getByRole("button", { name: /vLLM/i }));
 
-    const maxButton = screen
-      .getAllByRole("button", { name: /HackerAI Max/i })
-      .find((button) => button.hasAttribute("aria-pressed"));
+    expect(onChange).toHaveBeenCalledWith("byom-vllm");
 
-    expect(maxButton).toBeDefined();
-    expect(maxButton).toHaveAttribute("aria-pressed", "true");
+    rerender(
+      <ModelSelector value="byom-vllm" onChange={onChange} mode="agent" />,
+    );
+
+    expect(screen.getByText(/vllm serve/i)).toBeVisible();
+    expect(screen.getByText(/Runpod port 8000/i)).toBeVisible();
+  });
+
+  it("shows Unsloth Dynamic GGUF guidance when that connection is selected", () => {
+    render(
+      <ModelSelector value="byom-unsloth" onChange={jest.fn()} mode="agent" />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Unsloth" }));
+
+    expect(screen.getByText(/UD-Q4_K_XL/)).toBeVisible();
+    expect(screen.getByText(/save_pretrained_gguf/)).toBeVisible();
+  });
+
+  it("does not query a hosted Max entitlement", () => {
+    render(<ModelSelector value="auto" onChange={jest.fn()} mode="agent" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "OpenRouter" }));
+
+    expect(mockUseQuery).not.toHaveBeenCalled();
+  });
+
+  it("names the mobile sheet after the chat mode", () => {
+    mockIsMobile = true;
+    render(<ModelSelector value="auto" onChange={jest.fn()} mode="agent" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "OpenRouter" }));
+
+    expect(screen.getByText("Agent connection")).toBeVisible();
   });
 });

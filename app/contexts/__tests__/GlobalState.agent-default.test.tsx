@@ -291,7 +291,7 @@ describe("GlobalStateProvider agent defaults", () => {
       "false",
     );
     expect(screen.getByTestId("selected-model")).toHaveTextContent(
-      "hackerai-pro",
+      "byom-openrouter",
     );
     expect(screen.getByTestId("chat-mode")).toHaveTextContent("ask");
   });
@@ -623,7 +623,7 @@ describe("GlobalStateProvider agent defaults", () => {
     });
   });
 
-  it("defaults first-time Ultra users to Agent with the auto model and cloud sandbox", async () => {
+  it("defaults first-time Ultra users to Agent with OpenRouter and the cloud sandbox", async () => {
     window.localStorage.setItem("selected_model", "hackerai-max");
     mockAuthUser(["ultra-plan"]);
 
@@ -637,11 +637,13 @@ describe("GlobalStateProvider agent defaults", () => {
       expect(screen.getByTestId("chat-mode")).toHaveTextContent("agent");
     });
 
-    expect(screen.getByTestId("selected-model")).toHaveTextContent("auto");
+    expect(screen.getByTestId("selected-model")).toHaveTextContent(
+      "byom-openrouter",
+    );
     expect(screen.getByTestId("sandbox-preference")).toHaveTextContent("e2b");
   });
 
-  it("defaults first-time Pro Plus users to Agent with the auto model and cloud sandbox", async () => {
+  it("defaults first-time Pro Plus users to Agent with OpenRouter and the cloud sandbox", async () => {
     window.localStorage.setItem("selected_model", "hackerai-max");
     mockAuthUser(["pro-plus-plan"]);
 
@@ -656,7 +658,9 @@ describe("GlobalStateProvider agent defaults", () => {
     });
 
     expect(screen.getByTestId("subscription")).toHaveTextContent("pro-plus");
-    expect(screen.getByTestId("selected-model")).toHaveTextContent("auto");
+    expect(screen.getByTestId("selected-model")).toHaveTextContent(
+      "byom-openrouter",
+    );
     expect(screen.getByTestId("sandbox-preference")).toHaveTextContent("e2b");
   });
 

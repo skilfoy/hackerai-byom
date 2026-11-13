@@ -567,7 +567,7 @@ describe("MessageErrorState", () => {
     ).toBeNull();
   });
 
-  it("tells the user to switch to Auto when a specific model blocks the allowance, without an amount", async () => {
+  it("tells the user to switch to OpenRouter when a hosted model blocks the allowance", async () => {
     const user = userEvent.setup();
     const onRetry = jest.fn();
     const error = new ChatSDKError(
@@ -590,7 +590,9 @@ describe("MessageErrorState", () => {
       </TestWrapper>,
     );
 
-    const hint = screen.getByText(/still get some free usage today on Auto/i);
+    const hint = screen.getByText(
+      /still get some free usage today on OpenRouter/i,
+    );
     expect(hint).toBeVisible();
     expect(screen.queryByRole("button", { name: "Try Again" })).toBeNull();
     expect(screen.queryByRole("button", { name: "View Usage" })).toBeNull();
@@ -606,22 +608,24 @@ describe("MessageErrorState", () => {
     ).toBeNull();
     expect(capturePaidDailyFreeAllowanceImpression).toHaveBeenCalledWith(
       expect.objectContaining({
-        cta_text: "Switch to Auto and continue",
+        cta_text: "Switch to OpenRouter and continue",
         allowance_unavailable_reason: "unsupported_model",
       }),
     );
 
     await user.click(
-      screen.getByRole("button", { name: "Switch to Auto and continue" }),
+      screen.getByRole("button", { name: "Switch to OpenRouter and continue" }),
     );
 
-    expect(mockSetSelectedModel).toHaveBeenCalledWith("auto");
+    expect(mockSetSelectedModel).toHaveBeenCalledWith("byom-openrouter");
     expect(capturePaidDailyFreeAllowanceClick).toHaveBeenCalledWith(
-      expect.objectContaining({ cta_text: "Switch to Auto and continue" }),
+      expect.objectContaining({
+        cta_text: "Switch to OpenRouter and continue",
+      }),
     );
     expect(onRetry).toHaveBeenCalledWith({
       limitRescue: { type: "paid_daily_free_allowance" },
-      selectedModel: "auto",
+      selectedModel: "byom-openrouter",
     });
   });
 });

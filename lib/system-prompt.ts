@@ -396,8 +396,10 @@ export const systemPrompt = async (
     "hackerai-standard": "Standard",
     "hackerai-pro": "Pro",
     "hackerai-max": "Max",
+    "byom-openrouter": "OpenRouter",
     "byom-openai": "OpenAI-compatible",
     "byom-ollama": "Ollama",
+    "byom-vllm": "vLLM",
     "byom-hermes": "Hermes",
     "byom-unsloth": "Unsloth",
   }[selectedModel];

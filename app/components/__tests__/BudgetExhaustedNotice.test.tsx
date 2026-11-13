@@ -326,15 +326,16 @@ describe("stopped Agent daily allowance", () => {
     mockIncludedUsageError = false;
     mockUseQuery.mockReturnValue(emptyEntitlement);
   });
-  it("resumes saved progress with explicit Auto and rescue consent", () => {
+  it("resumes saved progress on OpenRouter with rescue consent", () => {
     mockDailyAllowance = { available: true, costRemainingDollars: 0.12 };
     const onContinue = jest.fn();
     render(<BudgetExhaustedNotice mode="agent" onContinue={onContinue} />);
+    expect(screen.getByText(/Continue on OpenRouter/)).toBeVisible();
     expect(screen.getByText(/0.12 remaining/)).toBeVisible();
     fireEvent.click(
       screen.getByRole("button", { name: "Continue with daily allowance" }),
     );
-    expect(onContinue).toHaveBeenCalledWith("auto", {
+    expect(onContinue).toHaveBeenCalledWith("byom-openrouter", {
       type: "paid_daily_free_allowance",
     });
   });

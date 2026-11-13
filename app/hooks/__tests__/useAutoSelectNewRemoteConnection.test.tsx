@@ -70,7 +70,7 @@ describe("useAutoSelectNewRemoteConnection", () => {
     expect(props.setSandboxPreference).toHaveBeenCalledWith("remote-1", {
       remember: false,
     });
-    expect(props.setSelectedModel).toHaveBeenCalledWith("auto");
+    expect(props.setSelectedModel).not.toHaveBeenCalled();
     expect(props.setChatMode).toHaveBeenCalledWith("agent");
     expect(toast.success).toHaveBeenCalledWith(
       "Local machine connected and selected. Switched to Agent mode.",

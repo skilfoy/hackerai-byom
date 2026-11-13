@@ -4,20 +4,24 @@ import { isByomSelectedModel } from "@/types/chat";
 /**
  * Bring-your-own-model routing.
  *
- * HackerAI's hosted tiers stay on OpenRouter. These routes skip that and call
- * an OpenAI-compatible chat-completions endpoint directly:
- *   - openai-compatible: any base URL the operator supplies
+ * This fork does not offer HackerAI Auto, Standard, Pro, or Max. Every chat
+ * calls an OpenAI-compatible endpoint the operator chooses:
+ *   - openrouter: OpenRouter's catalog, including openrouter/auto
+ *   - openai-compatible: any other base URL
  *   - ollama: local Ollama's OpenAI shim
+ *   - vllm: a vLLM OpenAI server (local, Docker, Kubernetes, Runpod, Modal)
  *   - hermes: Nous Research inference (Hermes and the Portal catalog)
- *   - unsloth: Unsloth Studio / Unsloth's OpenAI-compatible server
+ *   - unsloth: Unsloth Studio / llama.cpp, with Dynamic GGUF or NVFP4/FP8 weights
  *
- * The server makes the HTTP call. localhost reaches Ollama or Unsloth only
- * when this process is on the same machine. Cloud runs need a reachable URL.
+ * The server makes the HTTP call. localhost reaches Ollama, vLLM, or Unsloth
+ * only when this process is on the same machine. Cloud runs need a reachable URL.
  */
 
 export const BYOM_PROVIDER_KINDS = [
+  "openrouter",
   "openai-compatible",
   "ollama",
+  "vllm",
   "hermes",
   "unsloth",
 ] as const;
@@ -37,16 +41,33 @@ export const HERMES_DIRECT_MODELS = [
   { id: "Hermes-4-405B", label: "Hermes 4 405B" },
 ] as const;
 
+export const OPENROUTER_DIRECT_MODELS = [
+  { id: "openrouter/auto", label: "OpenRouter Auto" },
+] as const;
+
+/** Saved Auto / Standard / Pro / Max selections now use the OpenRouter connection. */
+export const DEFAULT_CONNECTION_MODEL =
+  "byom-openrouter" as const satisfies ByomSelectedModel;
+
+export const toConnectionModel = (
+  model: ByomSelectedModel | string | null | undefined,
+): ByomSelectedModel =>
+  isByomSelectedModel(model) ? model : DEFAULT_CONNECTION_MODEL;
+
 const SELECTED_MODEL_BY_KIND = {
+  openrouter: "byom-openrouter",
   "openai-compatible": "byom-openai",
   ollama: "byom-ollama",
+  vllm: "byom-vllm",
   hermes: "byom-hermes",
   unsloth: "byom-unsloth",
 } as const satisfies Record<ByomProviderKind, ByomSelectedModel>;
 
 const KIND_BY_SELECTED_MODEL: Record<ByomSelectedModel, ByomProviderKind> = {
+  "byom-openrouter": "openrouter",
   "byom-openai": "openai-compatible",
   "byom-ollama": "ollama",
+  "byom-vllm": "vllm",
   "byom-hermes": "hermes",
   "byom-unsloth": "unsloth",
 };
@@ -65,6 +86,15 @@ type ProviderDefault = {
 
 export const BYOM_PROVIDER_DEFAULTS: Record<ByomProviderKind, ProviderDefault> =
   {
+    openrouter: {
+      baseURL: "https://openrouter.ai/api/v1",
+      modelId: "openrouter/auto",
+      envBaseURL: "OPENROUTER_BASE_URL",
+      envModel: "OPENROUTER_MODEL",
+      envApiKey: "OPENROUTER_API_KEY",
+      placeholderApiKey: "",
+      apiKeyRequired: true,
+    },
     "openai-compatible": {
       baseURL: "",
       modelId: "",
@@ -81,6 +111,15 @@ export const BYOM_PROVIDER_DEFAULTS: Record<ByomProviderKind, ProviderDefault> =
       envModel: "OLLAMA_MODEL",
       envApiKey: "OLLAMA_API_KEY",
       placeholderApiKey: "ollama",
+      apiKeyRequired: false,
+    },
+    vllm: {
+      baseURL: "http://127.0.0.1:8000/v1",
+      modelId: "Qwen/Qwen3-8B",
+      envBaseURL: "VLLM_BASE_URL",
+      envModel: "VLLM_MODEL",
+      envApiKey: "VLLM_API_KEY",
+      placeholderApiKey: "vllm",
       apiKeyRequired: false,
     },
     hermes: {
@@ -214,9 +253,18 @@ const finishRoute = (
   }
   const resolvedKey = apiKey || defaults.placeholderApiKey;
   if (defaults.apiKeyRequired && !resolvedKey) {
+    const keyName = defaults.altEnvApiKey
+      ? `${defaults.envApiKey} or ${defaults.altEnvApiKey}`
+      : defaults.envApiKey;
+    const label =
+      kind === "openrouter"
+        ? "OpenRouter"
+        : kind === "hermes"
+          ? "Hermes"
+          : kind;
     return {
       ok: false,
-      error: "Hermes routing needs an API key (request or HERMES_API_KEY).",
+      error: `${label} routing needs an API key (request or ${keyName}).`,
     };
   }
   return {

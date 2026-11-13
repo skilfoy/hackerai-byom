@@ -6,6 +6,7 @@ import type {
   SelectedModel,
   SubscriptionTier,
 } from "@/types";
+import { isByomSelectedModel } from "@/types/chat";
 import { POINTS_PER_DOLLAR } from "./token-bucket";
 import { createRedisClient } from "./redis";
 import type { LimitCapReason } from "@/lib/limit-pressure";
@@ -301,10 +302,13 @@ function getStaticUnavailableReason(
   if (ctx.mode === "ask" && ctx.hasAttachments) {
     return "attachments_not_supported";
   }
-  // The rescue is a low-cost-model fallback. A user who explicitly picked a
-  // premium model is asked to add credits instead of being silently
-  // downgraded.
-  if (ctx.selectedModel != null && ctx.selectedModel !== "auto") {
+  // Hosted Standard, Pro, and Max are premium picks. This fork's connections
+  // are the user's own endpoint, so they stay eligible for the daily rescue.
+  if (
+    ctx.selectedModel != null &&
+    ctx.selectedModel !== "auto" &&
+    !isByomSelectedModel(ctx.selectedModel)
+  ) {
     return "unsupported_model";
   }
   return null;
