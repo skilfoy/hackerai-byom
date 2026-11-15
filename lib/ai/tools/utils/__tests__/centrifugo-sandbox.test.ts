@@ -62,6 +62,10 @@ import {
 } from "@/lib/utils/sandbox-file-utils";
 import { getLocalCopyFailureContext } from "../local-copy-failure-context";
 import { generateCentrifugoToken } from "@/lib/centrifugo/jwt";
+import {
+  DesktopFileBridgeError,
+  desktopFileUnavailableMessage,
+} from "@/lib/centrifugo/desktop-file-errors";
 
 jest.mock("server-only", () => ({}), { virtual: true });
 jest.mock("@/lib/centrifugo/traffic", () => ({
@@ -372,37 +376,88 @@ describe("CentrifugoSandbox", () => {
       expect(control.publish).toHaveBeenCalledTimes(1);
       expect(reply.unsubscribe).toHaveBeenCalledTimes(1);
       expect(jest.getTimerCount()).toBe(0);
+      const records = receiverRecords();
+      if (!isDesktop) {
+        expect(records).toEqual([]);
+        return;
+      }
+      const uncertain = {
+        dispatch_uncertain_version: 1,
+        dispatch_uncertain_reason:
+          failure === "publish reply lost"
+            ? "publish_timeout"
+            : "operation_ready_timeout",
+      };
+      const index = records.findIndex(
+        (record) => record.phase === "dispatch_uncertain",
+      );
+      expect(index).toBeGreaterThan(0);
+      for (const record of records.slice(0, index)) {
+        expect(record).not.toHaveProperty("dispatch_uncertain_version");
+        expect(record).not.toHaveProperty("dispatch_uncertain_reason");
+      }
+      expect([records[index], records.at(-1)]).toEqual([
+        expect.objectContaining(uncertain),
+        expect.objectContaining({ phase: "cleanup", ...uncertain }),
+      ]);
     },
   );
 
-  it("keeps uncertain Desktop dispatch bounded and non-retryable when no output arrives", async () => {
-    const sandbox = new CentrifugoSandbox(
-      "user-1",
-      {
-        ...defaultConnection,
-        isDesktop: true,
-        capabilities: { commands: true, operationChannels: true },
-      },
-      defaultConfig,
-    );
-    const result = sandbox.commands
-      .run("once", { timeoutMs: 10_000 })
-      .catch((error) => error);
-    await jest.advanceTimersByTimeAsync(0);
-    const reply = mockSubscriptions[0];
-    reply.emit("subscribed");
-    await jest.advanceTimersByTimeAsync(6000);
-    expect(reply.unsubscribe).not.toHaveBeenCalled();
-    await jest.advanceTimersByTimeAsync(39_000);
-    await expect(result).resolves.toMatchObject({
-      dispatched: true,
-      retryable: false,
-    });
-    expect((await result).message).toContain("Command timeout after 45000ms");
-    expect(mockSubscriptions[1].publish).toHaveBeenCalledTimes(1);
-    expect(reply.unsubscribe).toHaveBeenCalledTimes(1);
-    expect(jest.getTimerCount()).toBe(0);
-  });
+  it.each([
+    ["readiness reply lost", "operation_ready_timeout"],
+    ["publish reply lost", "publish_timeout"],
+  ])(
+    "keeps uncertain Desktop dispatch bounded and non-retryable when no output arrives after %s",
+    async (failure, reason) => {
+      const sandbox = new CentrifugoSandbox(
+        "user-1",
+        {
+          ...defaultConnection,
+          isDesktop: true,
+          capabilities: { commands: true, operationChannels: true },
+        },
+        defaultConfig,
+      );
+      const result = sandbox.commands
+        .run("PRIVATE_COMMAND", { timeoutMs: 10_000 })
+        .catch((error) => error);
+      await jest.advanceTimersByTimeAsync(0);
+      const reply = mockSubscriptions[0];
+      const control = new MockSubscription();
+      if (failure === "publish reply lost")
+        control.publish.mockRejectedValueOnce({ code: 1, message: "timeout" });
+      mockClients[0].newSubscription.mockReturnValueOnce(control);
+      reply.emit("subscribed");
+      await jest.advanceTimersByTimeAsync(6000);
+      expect(reply.unsubscribe).not.toHaveBeenCalled();
+      await jest.advanceTimersByTimeAsync(39_000);
+      await expect(result).resolves.toMatchObject({
+        dispatched: true,
+        retryable: false,
+      });
+      expect((await result).message).toContain("Command timeout after 45000ms");
+      expect(control.publish).toHaveBeenCalledTimes(1);
+      expect(reply.unsubscribe).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(0);
+      const uncertain = {
+        dispatch_uncertain_version: 1,
+        dispatch_uncertain_reason: reason,
+      };
+      const records = receiverRecords();
+      expect(
+        records.filter((record) => "dispatch_uncertain_reason" in record),
+      ).toEqual([
+        expect.objectContaining({ phase: "dispatch_uncertain", ...uncertain }),
+        expect.objectContaining({
+          phase: "command_wait",
+          dispatch_phase: "uncertain",
+          ...uncertain,
+        }),
+        expect.objectContaining({ phase: "cleanup", ...uncertain }),
+      ]);
+      expect(JSON.stringify(records)).not.toContain("PRIVATE_COMMAND");
+    },
+  );
 
   it("cancels the original Desktop command after its readiness reply is lost", async () => {
     const sandbox = new CentrifugoSandbox(
@@ -1624,6 +1679,331 @@ describe("CentrifugoSandbox", () => {
         }
       },
     );
+
+    const probeRecords = () =>
+      receiverLog.mock.calls
+        .map(([value]) => {
+          try {
+            return JSON.parse(value);
+          } catch {
+            return {};
+          }
+        })
+        .filter((record) => record.event === "desktop_file_capability_probe");
+    const probeRecord = {
+      event: "desktop_file_capability_probe",
+      service: "chat-handler",
+      connection_id: "conn-1",
+    };
+
+    it.each([
+      ["Invalid Desktop operation authorization", "authorization_invalid"],
+      ["Desktop origin is unavailable", "origin_unavailable_or_denied"],
+      [
+        "Desktop origin is not allowed for native authorization",
+        "origin_unavailable_or_denied",
+      ],
+      [
+        "Desktop authorization client unavailable",
+        "authorization_client_unavailable",
+      ],
+      [
+        "Desktop operation authorization unavailable",
+        "authorization_send_unavailable",
+      ],
+      ["Desktop operation was not authorized", "authorization_denied"],
+      [
+        "Invalid Desktop authorization response",
+        "authorization_response_invalid",
+      ],
+      ["Desktop operation was not authorized: PRIVATE_PATH", "other"],
+      ["desktop operation was not authorized", "other"],
+      [" Invalid Desktop authorization response", "other"],
+      ["Invalid Desktop operation", "other"],
+      ["PRIVATE_PATH_AND_CONTENT", "other"],
+    ])(
+      "records only a closed native receiver error class for %j: %s",
+      async (message, receiverErrorClass) => {
+        const sandbox = unavailableDesktop();
+        const { pending, reply, control } = await dispatchProbe(sandbox);
+        // Another request's reply must not settle or classify this probe.
+        reply.emit("publication", {
+          data: {
+            type: "file_error",
+            requestId: "other-request",
+            message: "Desktop operation was not authorized",
+          },
+        });
+        reply.emit("publication", {
+          data: { type: "file_error", requestId: FIXED_UUID, message },
+        });
+        const error = await pending;
+
+        expect(error).toBeInstanceOf(DesktopFileBridgeError);
+        expect(error).toMatchObject({
+          fileFailure: "unknown",
+          message: desktopFileUnavailableMessage("unknown"),
+        });
+        expect(probeRecords()).toEqual([
+          {
+            ...probeRecord,
+            outcome: "unavailable",
+            failure: "native_error",
+            file_failure: "unknown",
+            receiver_error_class: receiverErrorClass,
+          },
+        ]);
+        expect(JSON.stringify(receiverLog.mock.calls)).not.toContain("PRIVATE");
+        expect(control.publish).toHaveBeenCalledTimes(1);
+        await expect(sandbox.confirmNativeFileRelay()).rejects.toBe(error);
+        expect(probeRecords()).toHaveLength(1);
+        expect(mockClients).toHaveLength(1);
+        expect(jest.getTimerCount()).toBe(0);
+      },
+    );
+
+    it.each([
+      { path: "success", record: { outcome: "recovered" } },
+      {
+        path: "timeout",
+        record: { outcome: "unavailable", failure: "timeout" },
+      },
+      {
+        path: "subscription_error",
+        record: { outcome: "unavailable", failure: "subscription_error" },
+      },
+      {
+        path: "native_ipc_denied",
+        record: {
+          outcome: "unavailable",
+          failure: "native_error",
+          file_failure: "native_ipc_denied",
+        },
+      },
+      {
+        path: "filesystem",
+        record: {
+          outcome: "unavailable",
+          failure: "native_error",
+          file_failure: "filesystem",
+        },
+      },
+    ] as const)(
+      "omits the native receiver error class after $path",
+      async ({ path, record }) => {
+        const sandbox = unavailableDesktop();
+        const { pending, reply } = await dispatchProbe(sandbox);
+        const authorizationMessage = "Desktop operation was not authorized";
+        if (path === "success")
+          reply.emit("publication", {
+            data: {
+              type: "file_stat_result",
+              requestId: FIXED_UUID,
+              kind: "not_file",
+              path: "/project",
+            },
+          });
+        else if (path === "timeout") await jest.advanceTimersByTimeAsync(3000);
+        else if (path === "subscription_error")
+          reply.emit("error", {
+            type: "subscribe",
+            error: { code: 105, message: authorizationMessage },
+          });
+        else
+          reply.emit("publication", {
+            data: {
+              type: "file_error",
+              requestId: FIXED_UUID,
+              ...(path === "native_ipc_denied"
+                ? { message: authorizationMessage, fileFailure: path }
+                : { message: `Metadata error: ${authorizationMessage}` }),
+            },
+          });
+        await pending;
+
+        expect(probeRecords()).toEqual([{ ...probeRecord, ...record }]);
+      },
+    );
+
+    // The exact shape a current Desktop bridge publishes for a failed stat.
+    const receiverDiagnostic = {
+      version: 1,
+      stage: "native_invoke",
+      adapter: "published_legacy_native",
+    };
+
+    it("records the matched receiver stage without changing the probe outcome", async () => {
+      const sandbox = unavailableDesktop();
+      const { pending, reply, control } = await dispatchProbe(sandbox);
+      // Another request's diagnostic must not attach to this probe.
+      reply.emit("publication", {
+        data: {
+          type: "file_error",
+          requestId: "other-request",
+          message: "PRIVATE_OTHER",
+          receiverDiagnostic: { ...receiverDiagnostic, stage: "module_load" },
+        },
+      });
+      reply.emit("publication", {
+        data: {
+          type: "file_error",
+          requestId: FIXED_UUID,
+          message: "PRIVATE_NATIVE_FAILURE C:\\Users\\private",
+          receiverDiagnostic,
+        },
+      });
+      const error = await pending;
+
+      expect(error).toBeInstanceOf(DesktopFileBridgeError);
+      expect(error).toMatchObject({
+        fileFailure: "unknown",
+        message: desktopFileUnavailableMessage("unknown"),
+      });
+      expect(probeRecords()).toEqual([
+        {
+          ...probeRecord,
+          outcome: "unavailable",
+          failure: "native_error",
+          file_failure: "unknown",
+          receiver_error_class: "other",
+          receiver_stage_version: 1,
+          receiver_stage: "native_invoke",
+          receiver_adapter: "published_legacy_native",
+        },
+      ]);
+      expect(JSON.stringify(receiverLog.mock.calls)).not.toContain("PRIVATE");
+      expect(sandbox.supportsNativeFileRelay()).toBe(false);
+      expect(control.publish).toHaveBeenCalledTimes(1);
+      await expect(sandbox.confirmNativeFileRelay()).rejects.toBe(error);
+      expect(probeRecords()).toHaveLength(1);
+    });
+
+    it.each([
+      ["timeout", "timeout"],
+      ["resolved_published_legacy", "resolved_published_legacy"],
+      // A raw version or unknown value is dropped; the stage group survives.
+      ["a raw native version", "0.0.72"],
+      ["an arbitrary value", "PRIVATE_C:\\Users\\private"],
+    ])(
+      "records the matched receiver version lookup from %s only when closed",
+      async (_name, nativeVersionLookup) => {
+        const sandbox = unavailableDesktop();
+        const { pending, reply } = await dispatchProbe(sandbox);
+        reply.emit("publication", {
+          data: {
+            type: "file_error",
+            requestId: "other-request",
+            message: "PRIVATE_OTHER",
+            receiverDiagnostic: {
+              ...receiverDiagnostic,
+              nativeVersionLookup: "rejected",
+            },
+          },
+        });
+        reply.emit("publication", {
+          data: {
+            type: "file_error",
+            requestId: FIXED_UUID,
+            message: "PRIVATE_NATIVE_FAILURE",
+            receiverDiagnostic: { ...receiverDiagnostic, nativeVersionLookup },
+          },
+        });
+        expect(await pending).toMatchObject({
+          fileFailure: "unknown",
+          message: desktopFileUnavailableMessage("unknown"),
+        });
+
+        const closed = !/\d|PRIVATE/.test(nativeVersionLookup);
+        expect(probeRecords()).toEqual([
+          {
+            ...probeRecord,
+            outcome: "unavailable",
+            failure: "native_error",
+            file_failure: "unknown",
+            receiver_error_class: "other",
+            receiver_stage_version: 1,
+            receiver_stage: "native_invoke",
+            receiver_adapter: "published_legacy_native",
+            ...(closed && {
+              receiver_native_version_lookup: nativeVersionLookup,
+            }),
+          },
+        ]);
+        const logs = JSON.stringify(receiverLog.mock.calls);
+        expect(logs).not.toContain("PRIVATE");
+        expect(logs).not.toContain("0.0.72");
+      },
+    );
+
+    it.each([
+      ["an old producer", undefined],
+      ["an unknown version", { ...receiverDiagnostic, version: 2 }],
+      [
+        "an inconsistent group",
+        { ...receiverDiagnostic, stage: "loopback_request" },
+      ],
+      [
+        "an arbitrary stage",
+        { ...receiverDiagnostic, stage: "PRIVATE_C:\\Users\\private" },
+      ],
+      ["a string", "PRIVATE_native_invoke"],
+      ["an array", ["native_invoke", "published_legacy_native"]],
+    ])(
+      "keeps the original native failure and omits stage fields from %s",
+      async (_name, value) => {
+        const sandbox = unavailableDesktop();
+        const { pending, reply } = await dispatchProbe(sandbox);
+        reply.emit("publication", {
+          data: {
+            type: "file_error",
+            requestId: FIXED_UUID,
+            message: "Desktop operation was not authorized",
+            fileFailure: "native_ipc_denied",
+            ...(value === undefined ? {} : { receiverDiagnostic: value }),
+          },
+        });
+        expect(await pending).toMatchObject({
+          fileFailure: "native_ipc_denied",
+          message: desktopFileUnavailableMessage("native_ipc_denied"),
+        });
+        expect(probeRecords()).toEqual([
+          {
+            ...probeRecord,
+            outcome: "unavailable",
+            failure: "native_error",
+            file_failure: "native_ipc_denied",
+          },
+        ]);
+        expect(JSON.stringify(receiverLog.mock.calls)).not.toContain("PRIVATE");
+      },
+    );
+
+    it("omits a matched receiver stage when the probe deadline won", async () => {
+      const sandbox = unavailableDesktop();
+      const { pending, reply } = await dispatchProbe(sandbox);
+      // The ACK never settles, so the reply is finalized after the deadline.
+      reply.publish.mockReturnValueOnce(new Promise(() => {}));
+      await jest.advanceTimersByTimeAsync(2500);
+      reply.emit("publication", {
+        data: {
+          type: "file_error",
+          requestId: FIXED_UUID,
+          message: "PRIVATE_NATIVE_FAILURE",
+          receiverDiagnostic,
+        },
+      });
+      await jest.advanceTimersByTimeAsync(1000);
+      await pending;
+
+      expect(probeRecords()).toEqual([
+        {
+          ...probeRecord,
+          outcome: "unavailable",
+          failure: "timeout",
+          file_failure: "unknown",
+        },
+      ]);
+    });
 
     it.each([
       { isDesktop: false, files: false, operationChannels: true },

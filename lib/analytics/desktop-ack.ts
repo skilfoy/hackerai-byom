@@ -12,9 +12,25 @@ import {
   type DesktopAckStopSource,
 } from "./desktop-ack-privacy";
 import {
+  readNativeAuthorizationCause,
+  readNativeAuthorizationConnector,
   readNativeAuthorizationDiagnostic,
+  readNativeAuthorizationIo,
+  readNativeAuthorizationMitigation,
+  readNativeAuthorizationResponse,
+  readNativeAuthorizationTransport,
+  type NativeAuthorizationCauseDiagnostic,
+  type NativeAuthorizationConnectorDiagnostic,
   type NativeAuthorizationDiagnostic,
+  type NativeAuthorizationIoDiagnostic,
+  type NativeAuthorizationMitigationDiagnostic,
+  type NativeAuthorizationResponseDiagnostic,
+  type NativeAuthorizationTransportDiagnostic,
 } from "./native-authorization-diagnostics";
+import {
+  readDesktopTerminalErrorDiagnostic,
+  type DesktopTerminalErrorDiagnostic,
+} from "./desktop-terminal-error-diagnostics";
 
 interface DesktopAckContext {
   connectionId: string | null;
@@ -27,6 +43,22 @@ type DesktopAckSettlement = Readonly<AcknowledgedCommandSettlement> & {
   terminalExitCode?: number | null;
   /** Same-invocation native send receipt; only for a terminal error. */
   nativeAuthorization?: NativeAuthorizationDiagnostic;
+  /** Same-invocation closed IO cause; only joined to a valid send receipt. */
+  nativeAuthorizationCause?: NativeAuthorizationCauseDiagnostic;
+  /** Same-invocation transport detail; only joined to a valid send receipt. */
+  nativeAuthorizationTransport?: NativeAuthorizationTransportDiagnostic;
+  /** Same first IO error's supplement; only joined to valid send, cause and
+   * unmapped transport groups that describe it. */
+  nativeAuthorizationIo?: NativeAuthorizationIoDiagnostic;
+  /** Same send failure's connector snapshot; only joined to a valid send
+   * receipt. */
+  nativeAuthorizationConnector?: NativeAuthorizationConnectorDiagnostic;
+  /** Same-invocation approval rejection; independent of the send groups. */
+  nativeAuthorizationResponse?: NativeAuthorizationResponseDiagnostic;
+  /** Same response's mitigation marker; only joined to a valid response. */
+  nativeAuthorizationMitigation?: NativeAuthorizationMitigationDiagnostic;
+  /** Same invocation's first terminal error source; only for a terminal error. */
+  terminalError?: DesktopTerminalErrorDiagnostic;
 };
 
 const emptyCounts = () => ({
@@ -257,6 +289,36 @@ export class DesktopAckTelemetry {
         result.terminalType === "error"
           ? readNativeAuthorizationDiagnostic(result.nativeAuthorization)
           : null;
+      const nativeAuthorizationCause = nativeAuthorization
+        ? readNativeAuthorizationCause(result.nativeAuthorizationCause)
+        : null;
+      const nativeAuthorizationTransport = nativeAuthorization
+        ? readNativeAuthorizationTransport(result.nativeAuthorizationTransport)
+        : null;
+      const nativeAuthorizationIo = readNativeAuthorizationIo(
+        result.nativeAuthorizationIo,
+        {
+          diagnostic: nativeAuthorization,
+          cause: nativeAuthorizationCause,
+          transport: nativeAuthorizationTransport,
+        },
+      );
+      const nativeAuthorizationConnector = nativeAuthorization
+        ? readNativeAuthorizationConnector(result.nativeAuthorizationConnector)
+        : null;
+      const nativeAuthorizationResponse =
+        result.terminalType === "error"
+          ? readNativeAuthorizationResponse(result.nativeAuthorizationResponse)
+          : null;
+      const nativeAuthorizationMitigation = nativeAuthorizationResponse
+        ? readNativeAuthorizationMitigation(
+            result.nativeAuthorizationMitigation,
+          )
+        : null;
+      const terminalError =
+        result.terminalType === "error"
+          ? readDesktopTerminalErrorDiagnostic(result.terminalError)
+          : null;
       this.capture(
         "desktop_ack_command_settled",
         {
@@ -291,6 +353,13 @@ export class DesktopAckTelemetry {
             publishInFlightAgeMs: result.publishInFlightAgeMs,
           }),
           ...nativeAuthorization,
+          ...nativeAuthorizationCause,
+          ...nativeAuthorizationTransport,
+          ...nativeAuthorizationIo,
+          ...nativeAuthorizationConnector,
+          ...nativeAuthorizationResponse,
+          ...nativeAuthorizationMitigation,
+          ...terminalError,
         },
         dedupeKey,
       );

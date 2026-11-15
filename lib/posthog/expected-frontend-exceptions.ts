@@ -1,6 +1,12 @@
 import { shouldDropExpectedConvexException } from "@/lib/posthog/expected-convex-errors";
 import { getComposerChangeDiagnostics } from "./composer-change-diagnostics";
+import { getRecentMessageNavigatorDiagnostics } from "./message-navigator-diagnostics";
 import { getRecentMessageTimestampDiagnostics } from "./message-time-diagnostics";
+import {
+  getReactBoundaryDiagnostics,
+  NULL_REMOVE_CHILD_MESSAGE,
+} from "./react-boundary-diagnostics";
+import { getTeamHistoryWriteDiagnostics } from "./team-history-write-diagnostics";
 import {
   getUnhandledRejectionDiagnostics,
   getNearbyDispatchDiagnostics,
@@ -425,8 +431,8 @@ function nearbyDispatchGroup(
       exception.value.length <= 128 &&
       /^[A-Za-z_$][\w$]{0,63} is not defined$/.test(exception.value) &&
       Array.isArray(frames) &&
-      frames.length === 2 &&
-      [frames[0], frames[1]].every(
+      (frames.length === 1 || frames.length === 2) &&
+      (frames.length === 1 ? [frames[0]] : [frames[0], frames[1]]).every(
         (frame) => frame?.filename === "<anonymous>" && frame?.in_app === false,
       )
     )
@@ -623,6 +629,43 @@ function nearbyDispatchGroup(
   }
 }
 
+/** The browser's History rate limit; it does not identify which writer spent the budget. */
+function isHistoryReplaceStateRateLimit(properties: Record<string, unknown>) {
+  try {
+    const list = properties.$exception_list;
+    if (!Array.isArray(list) || list.length !== 1) return false;
+    const exception = list[0];
+    const value = exception?.value;
+    return (
+      exception?.type === "DOMException" &&
+      typeof value === "string" &&
+      value.length <= 256 &&
+      value.startsWith("SecurityError: ") &&
+      /\bhistory\.replaceState\b/i.test(value) &&
+      /\bmore than 100(?!\d)/.test(value)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** The single retained React DOM null-removeChild TypeError, compared exactly. */
+function isNullRemoveChildTypeError(properties: Record<string, unknown>) {
+  try {
+    const list = properties.$exception_list;
+    if (!Array.isArray(list) || list.length !== 1) return false;
+    const exception = list[0];
+    const value = exception?.value;
+    return (
+      exception?.type === "TypeError" &&
+      (value === NULL_REMOVE_CHILD_MESSAGE ||
+        value === `TypeError: ${NULL_REMOVE_CHILD_MESSAGE}`)
+    );
+  } catch {
+    return false;
+  }
+}
+
 const getExceptionListShape = (list: unknown): string => {
   if (list === undefined) return "missing";
   if (list === null) return "null";
@@ -669,9 +712,21 @@ const getExceptionCaptureStructure = (
     hasBrowserFetchTransportMessage(strings),
 });
 
-/** Enrich retained exceptions with bounded build and recent-context diagnostics. */
+/**
+ * Enrich retained exceptions with bounded build and recent-context diagnostics.
+ * `navigatorDiagnosticOwner` and `reactBoundaryDiagnosticOwner` are the
+ * caller's current committed analytics owner; without one, the matching
+ * failure context is not attached.
+ */
 export function enrichFrontendExceptionEvent<T extends PostHogEventLike>(
   event: T,
+  {
+    navigatorDiagnosticOwner = null,
+    reactBoundaryDiagnosticOwner = null,
+  }: {
+    navigatorDiagnosticOwner?: string | null;
+    reactBoundaryDiagnosticOwner?: string | null;
+  } = {},
 ): T {
   if (event.event !== "$exception") return event;
 
@@ -681,7 +736,10 @@ export function enrichFrontendExceptionEvent<T extends PostHogEventLike>(
     if (
       key.startsWith("hackerai_recent_rejection_") ||
       key.startsWith("hackerai_recent_formatter_") ||
+      key.startsWith("hackerai_recent_navigator_") ||
       key.startsWith("hackerai_nearby_dispatch_") ||
+      key.startsWith("hackerai_team_history_write_") ||
+      key.startsWith("hackerai_react_boundary_") ||
       key.startsWith("hackerai_exception_capture_")
     )
       delete properties[key];
@@ -701,6 +759,9 @@ export function enrichFrontendExceptionEvent<T extends PostHogEventLike>(
     ...(category === "stack_overflow"
       ? getRecentMessageTimestampDiagnostics()
       : {}),
+    ...(category === "stack_overflow"
+      ? getRecentMessageNavigatorDiagnostics(navigatorDiagnosticOwner)
+      : {}),
     ...(category === "react_max_update_depth"
       ? getComposerChangeDiagnostics()
       : {}),
@@ -708,6 +769,12 @@ export function enrichFrontendExceptionEvent<T extends PostHogEventLike>(
       ? getUnhandledRejectionDiagnostics()
       : {}),
     ...(dispatchGroup ? getNearbyDispatchDiagnostics(dispatchGroup) : {}),
+    ...(isHistoryReplaceStateRateLimit(properties)
+      ? getTeamHistoryWriteDiagnostics()
+      : {}),
+    ...(isNullRemoveChildTypeError(properties)
+      ? getReactBoundaryDiagnostics(reactBoundaryDiagnosticOwner)
+      : {}),
     ...(buildCommit && /^[a-f0-9]{40}$/i.test(buildCommit)
       ? { hackerai_exception_build_commit: buildCommit.toLowerCase() }
       : {}),

@@ -3,6 +3,7 @@ import { captureGoalLifecycle } from "@/lib/goals/analytics";
 import { api as goalApi } from "@/convex/_generated/api";
 import { getConvexClient as goalConvex } from "@/lib/db/convex-client";
 import { goalServiceKey, reconcileGoal } from "@/lib/goals/server";
+import type { GoalReconciliationStep } from "@/lib/goals/reconciliation-diagnostics";
 import type { GoalContract } from "@/lib/goals/contracts";
 import { validGoalRequest } from "@/lib/goals/contracts";
 import { resolveCloudWorkspaceRegion } from "@/lib/ai/tools/utils/cloud-workspace-routing";
@@ -95,6 +96,10 @@ import {
 } from "@/lib/api/agent-approval-session";
 import { createAgentRunCorrelationToken } from "@/lib/api/agent-run-correlation";
 import {
+  AGENT_START_REJECTION_HEADER,
+  AGENT_START_TRIGGER_PAYLOAD_TOO_LARGE,
+} from "@/lib/agent-start-response";
+import {
   DEFAULT_AGENT_AUTO_REVIEW_ASSIGNMENT,
   type AgentAutoReviewAssignment,
 } from "@/lib/experiments/agent-auto-review";
@@ -167,7 +172,12 @@ export const createAgentTriggerPayloadTooLargeResponse = () =>
       cause:
         "This Agent request is too large to start. Remove some attachments or start a new chat and try again.",
     },
-    { status: 413 },
+    {
+      status: 413,
+      headers: {
+        [AGENT_START_REJECTION_HEADER]: AGENT_START_TRIGGER_PAYLOAD_TOO_LARGE,
+      },
+    },
   );
 
 const getAgentTriggerPriority = (subscription: SubscriptionTier) =>
@@ -658,6 +668,7 @@ export const createAgentTriggerPost = ({
       | undefined;
     // Observational only: names the existing guard callsite still in progress.
     let guardBoundary: AgentStartGuardBoundary | undefined;
+    let goalReconciliationStep: GoalReconciliationStep | undefined;
     const diagnosticContext: {
       requestId?: string;
       userId?: string;
@@ -872,8 +883,12 @@ export const createAgentTriggerPost = ({
       }
       stage = "reconcile_goal";
       const existingGoal = existingChat
-        ? await reconcileGoal(chatId, userId)
+        ? await reconcileGoal(chatId, userId, (step) => {
+            goalReconciliationStep = step;
+          })
         : null;
+      // Later local guards did not fail inside a reconciliation step.
+      goalReconciliationStep = undefined;
       if (
         !goalRequest &&
         existingGoal &&
@@ -1385,6 +1400,7 @@ export const createAgentTriggerPost = ({
           stage,
           initialPersistenceStep,
           guardBoundary,
+          goalReconciliationStep,
         },
       });
     } finally {

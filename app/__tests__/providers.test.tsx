@@ -14,6 +14,7 @@ import {
   createPostHogIdentitySignature,
   POSTHOG_IDENTITY_SIGNATURE_STORAGE_KEY,
 } from "@/lib/analytics/identity";
+import type { ChatMessage } from "@/types";
 
 jest.mock("next/navigation", () => ({
   usePathname: () => window.location.pathname,
@@ -29,13 +30,17 @@ jest.mock("../contexts/GlobalState", () => ({
   })),
 }));
 
+jest.mock("sonner", () => ({ toast: { error: jest.fn() } }));
+
 jest.mock("@/lib/analytics/client", () => ({
+  captureAuthenticatedEvent: jest.fn(() => true),
   confirmAuthenticatedAnalyticsUserId: jest.fn(),
   getPostHogClient: jest.fn(() => null),
   getIdentifiedAnalyticsUserId: jest.fn(() => null),
   getPermittedAnalyticsUserId: jest.fn(() => null),
   loadPostHogClient: jest.fn(),
   setAuthenticatedAnalyticsUserId: jest.fn(),
+  subscribeAuthenticatedAnalytics: jest.fn(() => () => {}),
 }));
 
 const mockNativeInvoke = jest.fn<(command: string) => Promise<unknown>>();
@@ -66,6 +71,46 @@ const { PostHogProvider } =
   require("../providers") as typeof import("../providers");
 const { getUnhandledRejectionDiagnostics } =
   require("@/lib/posthog/unhandled-rejection-diagnostics") as typeof import("@/lib/posthog/unhandled-rejection-diagnostics");
+const { deriveMessageNavigatorItems } =
+  require("../components/message-navigator") as typeof import("../components/message-navigator");
+const { deriveChatTimelineRows } =
+  require("../components/message-timeline-rows") as typeof import("../components/message-timeline-rows");
+const { ConvexErrorBoundary } =
+  require("../components/ConvexErrorBoundary") as typeof import("../components/ConvexErrorBoundary");
+const { getReactBoundaryDiagnostics } =
+  require("@/lib/posthog/react-boundary-diagnostics") as typeof import("@/lib/posthog/react-boundary-diagnostics");
+
+const NULL_REMOVE_CHILD =
+  "Cannot read properties of null (reading 'removeChild')";
+const reactBoundaryFields = (properties: Record<string, unknown> | undefined) =>
+  Object.fromEntries(
+    Object.entries(properties ?? {}).filter(([key]) =>
+      key.startsWith("hackerai_react_boundary_"),
+    ),
+  );
+/** The retained React DOM exception as the SDK captures it, plus a forged field. */
+const nullRemoveChildException = () => ({
+  event: "$exception",
+  properties: {
+    $current_url: "https://hackerai.co/c/chat?token=PRIVATE_URL_TOKEN",
+    $exception_list: [
+      {
+        type: "TypeError",
+        value: NULL_REMOVE_CHILD,
+        mechanism: { handled: false, synthetic: false, type: "generic" },
+      },
+    ],
+    hackerai_react_boundary_recent_catch_state: "PRIVATE_FORGED",
+  },
+});
+/** Let the actual boundary catch the exact family, outside any React render. */
+const catchNullRemoveChild = (scope: "chat_content" | "chat_layout") =>
+  new ConvexErrorBoundary({
+    children: null,
+    diagnosticScope: scope,
+  }).componentDidCatch(new TypeError(NULL_REMOVE_CHILD), {
+    componentStack: "",
+  });
 
 const mockUseAuth = useAuth as jest.Mock;
 const mockUseGlobalState = useGlobalState as jest.Mock;
@@ -530,6 +575,371 @@ describe("PostHogProvider", () => {
     }
   });
 
+  it("exports only the committed owner's strict file action diagnostic", async () => {
+    const posthog = {
+      __loaded: false,
+      init: jest.fn(),
+      set_config: jest.fn(),
+      opt_in_capturing: jest.fn(),
+      has_opted_out_capturing: jest.fn(() => false),
+      identify: jest.fn(),
+      sessionRecordingStarted: jest.fn(() => false),
+      startSessionRecording: jest.fn(),
+      stopSessionRecording: jest.fn(),
+      reset: jest.fn(),
+      opt_out_capturing: jest.fn(),
+    };
+    jest.mocked(getPermittedAnalyticsUserId).mockReturnValue("user-123");
+    jest.mocked(getIdentifiedAnalyticsUserId).mockReturnValue("user-123");
+    mockLoadPostHogClient.mockResolvedValue(posthog);
+    const view = render(
+      <PostHogProvider analyticsAllowed>child</PostHogProvider>,
+    );
+    await waitFor(() => expect(posthog.init).toHaveBeenCalledTimes(1));
+    const { before_send: beforeSend } = posthog.init.mock.calls[0][1] as {
+      before_send: (event: unknown) => Record<string, unknown> | null;
+    };
+
+    const eventUuid = "0193a5b2-7c41-7a10-8f00-1234567890ab";
+    const retained = {
+      token: "phc_test",
+      distinct_id: "user-123",
+      $session_id: "0193a5b2-7c41-7a10-8f00-aaaaaaaaaaaa",
+      $lib: "web",
+      $is_identified: true,
+      file_action_auth_diagnostic_version: 1,
+      caller: "computer_sidebar",
+      operation: "getFileUrlAction",
+      failure_class: "redacted_server_error",
+      convex_request_id: "0123456789abcdef",
+      request_convex_auth_state: "loading",
+      convex_auth_state: "loading",
+      request_provider_state: "token_recovery",
+      provider_state: "ready",
+      request_token_mode: "ordinary",
+      request_token_outcome: "cached_fallback",
+      request_token_result: "null",
+      request_token_age: "lt_10s",
+      request_token_context: "same",
+      token_mode: "recovery",
+      token_outcome: "token",
+      token_result: "no_result",
+      token_age: "lt_1s",
+      token_context: "same",
+      token_attempt: "changed",
+      input_relation: "same",
+      observer_scope_id: "0193a5b2-7c41-7a10-8f00-bbbbbbbbbbbb",
+      hackerai_frontend_build_commit: "a".repeat(40),
+    };
+    const accessor = jest.fn(() => "private");
+    const enriched = (properties: Record<string, unknown>) => ({
+      uuid: eventUuid,
+      event: "file_action_auth_diagnostic",
+      properties: Object.defineProperties(
+        {
+          ...properties,
+          $current_url: "https://hackerai.co/c/private?code=private",
+          $pathname: "/c/private",
+          fileId: "private",
+          url: "https://bucket.test/private?X-Amz-Signature=private",
+          error_message: "private",
+          $set: { email: "private" },
+        },
+        { registered_content: { get: accessor, enumerable: true } },
+      ),
+      timestamp: new Date(1_794_094_000_000),
+      $set_once: { $initial_referrer: "private" },
+    });
+
+    const sanitized = beforeSend(enriched(retained));
+    expect(sanitized).toEqual({
+      uuid: eventUuid,
+      event: "file_action_auth_diagnostic",
+      properties: retained,
+      timestamp: new Date(1_794_094_000_000),
+    });
+    expect(JSON.stringify(sanitized)).not.toContain("private");
+    expect(accessor).not.toHaveBeenCalled();
+    // Queued under another owner, or malformed.
+    expect(
+      beforeSend(enriched({ ...retained, distinct_id: "user-other" })),
+    ).toBeNull();
+    expect(
+      beforeSend(
+        enriched({ ...retained, operation: "generateS3UploadUrlAction" }),
+      ),
+    ).toBeNull();
+    const unrelated = {
+      event: "ordinary_event",
+      properties: { retained: "value" },
+    };
+    expect(beforeSend(unrelated)).toEqual({
+      event: "ordinary_event",
+      properties: { retained: "value" },
+    });
+
+    // The private-page gate still runs before the event-specific projection.
+    try {
+      expect(
+        beforeSend({
+          ...enriched(retained),
+          properties: {
+            ...retained,
+            $current_url: "https://hackerai.co/abuse/report",
+          },
+        }),
+      ).toBeNull();
+    } finally {
+      window.sessionStorage.clear();
+    }
+
+    // A retained callback after the committed owner switches, before the
+    // global analytics identity resets.
+    mockUseAuth.mockReturnValue({ user: { id: "user-b" } });
+    view.rerender(<PostHogProvider analyticsAllowed>child</PostHogProvider>);
+    expect(beforeSend(enriched(retained))).toBeNull();
+    expect(beforeSend(unrelated)).toEqual({
+      event: "ordinary_event",
+      properties: { retained: "value" },
+    });
+    view.unmount();
+  });
+
+  it("exports only the committed owner's strict Agent start 413 diagnostic after SDK enrichment", async () => {
+    const posthog = {
+      __loaded: false,
+      init: jest.fn(),
+      set_config: jest.fn(),
+      opt_in_capturing: jest.fn(),
+      has_opted_out_capturing: jest.fn(() => false),
+      identify: jest.fn(),
+      sessionRecordingStarted: jest.fn(() => false),
+      startSessionRecording: jest.fn(),
+      stopSessionRecording: jest.fn(),
+      reset: jest.fn(),
+      opt_out_capturing: jest.fn(),
+    };
+    jest.mocked(getPermittedAnalyticsUserId).mockReturnValue("user-123");
+    jest.mocked(getIdentifiedAnalyticsUserId).mockReturnValue("user-123");
+    mockLoadPostHogClient.mockResolvedValue(posthog);
+    const view = render(
+      <PostHogProvider analyticsAllowed>child</PostHogProvider>,
+    );
+    await waitFor(() => expect(posthog.init).toHaveBeenCalledTimes(1));
+    const { before_send: beforeSend } = posthog.init.mock.calls[0][1] as {
+      before_send: (event: unknown) => Record<string, unknown> | null;
+    };
+
+    const eventUuid = "0193a5b2-7c41-7a10-8f00-1234567890ab";
+    const retained = {
+      token: "phc_test",
+      distinct_id: "user-123",
+      $session_id: "0193a5b2-7c41-7a10-8f00-aaaaaaaaaaaa",
+      $window_id: "0193a5b2-7c41-7a10-8f00-cccccccccccc",
+      $lib: "web",
+      $lib_version: "1.447.5",
+      $is_identified: true,
+      agent_start_http413_diagnostic_version: 1,
+      http_status: 413,
+      request_body_state: "measured",
+      request_body_utf8_bytes: 4_718_592,
+      app_rejection_marker_state: "absent",
+      vercel_error_state: "known",
+      platform_request_id_state: "valid",
+      platform_request_id: "iad1::8x2kq-1794094000000-0123456789ab",
+      build_state: "measured",
+      hackerai_frontend_build_commit: "a".repeat(40),
+      attempt_denominator_kind: "unmeasured",
+    };
+    const accessor = jest.fn(() => "private");
+    const enriched = (properties: Record<string, unknown>) => ({
+      uuid: eventUuid,
+      event: "agent_start_http413_diagnostic",
+      properties: Object.defineProperties(
+        {
+          ...properties,
+          $current_url: "https://hackerai.co/c/private?code=private",
+          $pathname: "/c/private",
+          $referrer: "https://private.example/",
+          $set: { email: "private" },
+          subscription: "private",
+          body: '{"messages":[{"text":"private prompt"}]}',
+          error: "private",
+          response_url: "https://private.vercel.app/api/agent",
+          // Forged caller identity; a browser has no native runtime.
+          native_app_version: "0.0.99",
+          native_platform: "windows",
+        },
+        { registered_content: { get: accessor, enumerable: true } },
+      ),
+      timestamp: new Date(1_794_094_000_000),
+      $set_once: { $initial_referrer: "private" },
+    });
+
+    const sanitized = beforeSend(enriched(retained));
+    expect(sanitized).toEqual({
+      uuid: eventUuid,
+      event: "agent_start_http413_diagnostic",
+      properties: retained,
+      timestamp: new Date(1_794_094_000_000),
+    });
+    expect(JSON.stringify(sanitized)).not.toMatch(/private|native_/);
+    expect(accessor).not.toHaveBeenCalled();
+    // Queued under another owner, or failing the closed schema.
+    expect(
+      beforeSend(enriched({ ...retained, distinct_id: "user-other" })),
+    ).toBeNull();
+    expect(beforeSend(enriched({ ...retained, http_status: 403 }))).toBeNull();
+
+    // The private-page gate still runs before the event-specific projection.
+    try {
+      expect(
+        beforeSend({
+          ...enriched(retained),
+          properties: {
+            ...retained,
+            $current_url: "https://hackerai.co/abuse/report",
+          },
+        }),
+      ).toBeNull();
+    } finally {
+      window.sessionStorage.clear();
+    }
+
+    // Retained callbacks after consent withdrawal or an owner switch, before
+    // the global analytics identity resets.
+    view.rerender(
+      <PostHogProvider analyticsAllowed={false}>child</PostHogProvider>,
+    );
+    expect(beforeSend(enriched(retained))).toBeNull();
+    view.rerender(<PostHogProvider analyticsAllowed>child</PostHogProvider>);
+    mockUseAuth.mockReturnValue({ user: { id: "user-b" } });
+    view.rerender(<PostHogProvider analyticsAllowed>child</PostHogProvider>);
+    expect(beforeSend(enriched(retained))).toBeNull();
+    view.unmount();
+  });
+
+  it("exports only the committed owner's strict Desktop operation readiness failure after SDK enrichment", async () => {
+    const posthog = {
+      __loaded: false,
+      init: jest.fn(),
+      set_config: jest.fn(),
+      opt_in_capturing: jest.fn(),
+      has_opted_out_capturing: jest.fn(() => false),
+      identify: jest.fn(),
+      sessionRecordingStarted: jest.fn(() => false),
+      startSessionRecording: jest.fn(),
+      stopSessionRecording: jest.fn(),
+      reset: jest.fn(),
+      opt_out_capturing: jest.fn(),
+    };
+    jest.mocked(getPermittedAnalyticsUserId).mockReturnValue("user-123");
+    jest.mocked(getIdentifiedAnalyticsUserId).mockReturnValue("user-123");
+    mockLoadPostHogClient.mockResolvedValue(posthog);
+    const view = render(
+      <PostHogProvider analyticsAllowed>child</PostHogProvider>,
+    );
+    await waitFor(() => expect(posthog.init).toHaveBeenCalledTimes(1));
+    const { before_send: beforeSend } = posthog.init.mock.calls[0][1] as {
+      before_send: (event: unknown) => Record<string, unknown> | null;
+    };
+
+    const retained = {
+      token: "phc_test",
+      distinct_id: "user-123",
+      $session_id: "0193a5b2-7c41-7a10-8f00-aaaaaaaaaaaa",
+      $lib: "web",
+      $lib_version: "1.447.5",
+      $is_identified: true,
+      state: "error",
+      clientSurface: "desktop_bridge",
+      source: "operation_channel",
+      errorType: "operation_readiness",
+      connectionId: "0193a5b2-7c41-7a10-8f00-111111111111",
+      operation_readiness_version: 1,
+      operation_readiness_phase: "subscription_ready",
+      operation_readiness_kind: "command",
+      operation_readiness_operation_id: "0193a5b2-7c41-7a10-8f00-222222222222",
+      build_state: "measured",
+      hackerai_frontend_build_commit: "a".repeat(40),
+    };
+    const accessor = jest.fn(() => "private");
+    const enriched = (properties: Record<string, unknown>) => ({
+      uuid: "0193a5b2-7c41-7a10-8f00-333333333333",
+      event: "desktop_bridge_relay_error",
+      properties: Object.defineProperties(
+        {
+          ...properties,
+          $current_url: "https://hackerai.co/c/private?code=private",
+          $pathname: "/c/private",
+          $set: { email: "private" },
+          error: "private relay reason",
+          command: "cat /home/private",
+          // Forged caller identity; a browser has no native runtime.
+          native_app_version: "0.0.99",
+          native_platform: "windows",
+        },
+        { stack: { get: accessor, enumerable: true } },
+      ),
+      timestamp: new Date(1_794_094_000_000),
+    });
+
+    const sanitized = beforeSend(enriched(retained));
+    expect(sanitized).toEqual({
+      uuid: "0193a5b2-7c41-7a10-8f00-333333333333",
+      event: "desktop_bridge_relay_error",
+      properties: retained,
+      timestamp: new Date(1_794_094_000_000),
+    });
+    expect(JSON.stringify(sanitized)).not.toMatch(/private|native_/);
+    expect(accessor).not.toHaveBeenCalled();
+    // A forged tuple or one queued under another owner is dropped.
+    expect(
+      beforeSend(enriched({ ...retained, operation_readiness_kind: "shell" })),
+    ).toBeNull();
+    expect(
+      beforeSend(enriched({ ...retained, distinct_id: "user-other" })),
+    ).toBeNull();
+    // Other relay errors keep their existing shape.
+    const relayError = {
+      event: "desktop_bridge_relay_error",
+      properties: {
+        distinct_id: "user-123",
+        state: "error",
+        errorType: "heartbeat",
+        error: "kept",
+      },
+    };
+    expect(beforeSend(relayError)).toEqual(relayError);
+
+    // The private-page gate still runs before the event-specific projection.
+    try {
+      expect(
+        beforeSend({
+          ...enriched(retained),
+          properties: {
+            ...retained,
+            $current_url: "https://hackerai.co/abuse/report",
+          },
+        }),
+      ).toBeNull();
+    } finally {
+      window.sessionStorage.clear();
+    }
+
+    // Retained callbacks after consent withdrawal or an owner switch, before
+    // the global analytics identity resets.
+    view.rerender(
+      <PostHogProvider analyticsAllowed={false}>child</PostHogProvider>,
+    );
+    expect(beforeSend(enriched(retained))).toBeNull();
+    view.rerender(<PostHogProvider analyticsAllowed>child</PostHogProvider>);
+    mockUseAuth.mockReturnValue({ user: { id: "user-b" } });
+    view.rerender(<PostHogProvider analyticsAllowed>child</PostHogProvider>);
+    expect(beforeSend(enriched(retained))).toBeNull();
+    view.unmount();
+  });
+
   it.each([
     ["withdraws consent", false, { id: "user-123" }],
     ["switches account", true, { id: "user-b" }],
@@ -569,8 +979,24 @@ describe("PostHogProvider", () => {
           attempt_denominator_kind: "unmeasured",
         },
       });
+      const agentStartEvent = () => ({
+        event: "agent_start_http413_diagnostic",
+        properties: {
+          token: "phc_test",
+          distinct_id: "user-123",
+          agent_start_http413_diagnostic_version: 1,
+          http_status: 413,
+          request_body_state: "absent",
+          app_rejection_marker_state: "absent",
+          vercel_error_state: "absent",
+          platform_request_id_state: "absent",
+          build_state: "unavailable",
+          attempt_denominator_kind: "unmeasured",
+        },
+      });
       const retained: { beforeSend?: (event: unknown) => unknown } = {};
       const layoutResults: unknown[] = [];
+      const agentStartResults: unknown[] = [];
       // A parent's layout effect runs after the child provider's layout effects
       // in the same commit and before any passive effect.
       function RetainedBeforeSendCaller({
@@ -581,6 +1007,7 @@ describe("PostHogProvider", () => {
         useLayoutEffect(() => {
           if (retained.beforeSend) {
             layoutResults.push(retained.beforeSend(contextEvent()));
+            agentStartResults.push(retained.beforeSend(agentStartEvent()));
           }
         });
         return <>{children}</>;
@@ -607,6 +1034,9 @@ describe("PostHogProvider", () => {
       expect(layoutResults).toEqual([
         expect.objectContaining({ event: "server_action_client_context" }),
       ]);
+      expect(agentStartResults).toEqual([
+        expect.objectContaining({ event: "agent_start_http413_diagnostic" }),
+      ]);
 
       mockUseAuth.mockReturnValue({ user: nextUser });
       view.rerender(
@@ -618,6 +1048,8 @@ describe("PostHogProvider", () => {
       );
       expect(layoutResults).toHaveLength(2);
       expect(layoutResults[1]).toBeNull();
+      expect(agentStartResults).toHaveLength(2);
+      expect(agentStartResults[1]).toBeNull();
       // Ordinary events from the retained callback are unchanged.
       expect(
         retained.beforeSend({
@@ -1446,6 +1878,92 @@ describe("Desktop runtime identity", () => {
     expect(JSON.stringify(exception)).not.toContain("PRIVATE");
   });
 
+  it("adds only the fresh measured identity to the strict Agent start 413 diagnostic", async () => {
+    jest.mocked(getPermittedAnalyticsUserId).mockReturnValue("user-123");
+    jest.mocked(getIdentifiedAnalyticsUserId).mockReturnValue("user-123");
+    try {
+      const { beforeSend, view } = await renderDesktop();
+      const retained = {
+        token: "phc_test",
+        distinct_id: "user-123",
+        $session_id: "0193a5b2-7c41-7a10-8f00-aaaaaaaaaaaa",
+        $lib: "web",
+        agent_start_http413_diagnostic_version: 1,
+        http_status: 413,
+        request_body_state: "unmeasured_unsupported",
+        app_rejection_marker_state: "known",
+        vercel_error_state: "absent",
+        platform_request_id_state: "invalid",
+        build_state: "measured",
+        hackerai_frontend_build_commit: "a".repeat(40),
+        attempt_denominator_kind: "unmeasured",
+      };
+      const sent = beforeSend({
+        event: "agent_start_http413_diagnostic",
+        properties: {
+          ...retained,
+          $current_url: "https://hackerai.co/c/PRIVATE",
+          $set: { email: "PRIVATE" },
+          body: "PRIVATE",
+          // Forged caller or SDK identity is replaced by measured values.
+          native_app_version: "0.0.99",
+          native_platform: "windows",
+          native_os_version: "PRIVATE",
+        },
+      });
+      expect(sent?.properties).toEqual({ ...retained, ...identity });
+      expect(JSON.stringify(sent)).not.toMatch(/PRIVATE|0\.0\.99|windows/);
+      view.unmount();
+    } finally {
+      jest.mocked(getPermittedAnalyticsUserId).mockReturnValue(null);
+      jest.mocked(getIdentifiedAnalyticsUserId).mockReturnValue(null);
+    }
+  });
+
+  it("adds only the fresh measured identity to the strict operation readiness failure", async () => {
+    jest.mocked(getPermittedAnalyticsUserId).mockReturnValue("user-123");
+    jest.mocked(getIdentifiedAnalyticsUserId).mockReturnValue("user-123");
+    try {
+      const { beforeSend, view } = await renderDesktop();
+      const retained = {
+        token: "phc_test",
+        distinct_id: "user-123",
+        $session_id: "0193a5b2-7c41-7a10-8f00-aaaaaaaaaaaa",
+        $lib: "web",
+        state: "error",
+        clientSurface: "desktop_bridge",
+        source: "operation_channel",
+        errorType: "operation_readiness",
+        connectionId: "0193a5b2-7c41-7a10-8f00-111111111111",
+        operation_readiness_version: 1,
+        operation_readiness_phase: "readiness_publish",
+        operation_readiness_kind: "pty",
+        operation_readiness_operation_id:
+          "0193a5b2-7c41-7a10-8f00-222222222222",
+        build_state: "measured",
+        hackerai_frontend_build_commit: "a".repeat(40),
+      };
+      const sent = beforeSend({
+        event: "desktop_bridge_relay_error",
+        properties: {
+          ...retained,
+          $current_url: "https://hackerai.co/c/PRIVATE",
+          error: "PRIVATE",
+          // Forged caller or SDK identity is replaced by measured values.
+          native_app_version: "0.0.99",
+          native_platform: "windows",
+          native_os_version: "PRIVATE",
+        },
+      });
+      expect(sent?.properties).toEqual({ ...retained, ...identity });
+      expect(JSON.stringify(sent)).not.toMatch(/PRIVATE|0\.0\.99|windows/);
+      view.unmount();
+    } finally {
+      jest.mocked(getPermittedAnalyticsUserId).mockReturnValue(null);
+      jest.mocked(getIdentifiedAnalyticsUserId).mockReturnValue(null);
+    }
+  });
+
   it("keeps identity through the strict ACK projections and preserves a valid send receipt", async () => {
     const { beforeSend } = await renderDesktop();
     const ack = {
@@ -1623,5 +2141,598 @@ describe("Desktop runtime identity", () => {
     expect(
       withdrawn.before_send(transport("https://hackerai.co/c/chat", appFrames)),
     ).toBeNull();
+  });
+
+  it("keeps Desktop identity last on a retained exception with React boundary context", async () => {
+    jest.mocked(getPermittedAnalyticsUserId).mockReturnValue("user-123");
+    jest.mocked(getIdentifiedAnalyticsUserId).mockReturnValue("user-123");
+    jest.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const posthog = sdk();
+      mockLoadPostHogClient.mockResolvedValue(posthog);
+      const view = render(
+        <PostHogProvider analyticsAllowed>
+          <ConvexErrorBoundary diagnosticScope="chat_layout">
+            child
+          </ConvexErrorBoundary>
+        </PostHogProvider>,
+      );
+      await waitFor(() => expect(posthog.init).toHaveBeenCalledTimes(1));
+      const { before_send: beforeSend } = posthog.init.mock.calls[0][1] as {
+        before_send: BeforeSend;
+      };
+      catchNullRemoveChild("chat_layout");
+
+      const exception = nullRemoveChildException();
+      const list = exception.properties.$exception_list;
+      const sent = beforeSend(exception);
+      expect(sent?.properties).toMatchObject({
+        ...identity,
+        $current_url: "https://hackerai.co/c/chat",
+        $exception_list: list,
+        hackerai_exception_category: "unknown",
+      });
+      expect(reactBoundaryFields(sent?.properties)).toEqual({
+        hackerai_react_boundary_context_version: 1,
+        hackerai_react_boundary_observer_state: "active",
+        hackerai_react_boundary_chat_content_mounted: false,
+        hackerai_react_boundary_chat_layout_mounted: true,
+        hackerai_react_boundary_unknown_scope_mounted: false,
+        hackerai_react_boundary_recent_catch_state: "observed",
+        hackerai_react_boundary_recent_scope: "chat_layout",
+        hackerai_react_boundary_recent_age: "lt_50ms",
+      });
+      expect(JSON.stringify(sent)).not.toMatch(/PRIVATE|user-123/);
+      view.unmount();
+    } finally {
+      jest.mocked(console.error).mockRestore();
+      jest.mocked(getPermittedAnalyticsUserId).mockReturnValue(null);
+      jest.mocked(getIdentifiedAnalyticsUserId).mockReturnValue(null);
+    }
+  });
+});
+
+describe("message navigator failure context", () => {
+  const CANARY = "PRIVATE_NAVIGATOR_CANARY";
+  type BeforeSend = (event: unknown) => {
+    event?: string;
+    properties?: Record<string, unknown>;
+  } | null;
+  const sdk = () => ({
+    __loaded: false,
+    init: jest.fn(),
+    set_config: jest.fn(),
+    opt_in_capturing: jest.fn(),
+    has_opted_out_capturing: jest.fn(() => false),
+    identify: jest.fn(),
+    sessionRecordingStarted: jest.fn(() => false),
+    startSessionRecording: jest.fn(),
+    stopSessionRecording: jest.fn(),
+    reset: jest.fn(),
+    opt_out_capturing: jest.fn(),
+  });
+  const navigatorFields = (properties: Record<string, unknown> | undefined) =>
+    Object.fromEntries(
+      Object.entries(properties ?? {}).filter(([key]) =>
+        key.startsWith("hackerai_recent_navigator_"),
+      ),
+    );
+  // A retained native stack exception as the SDK captures it, plus a stale
+  // field from earlier processing that must never survive re-enrichment.
+  const stackException = () => ({
+    event: "$exception",
+    properties: {
+      $current_url: "https://hackerai.co/c/chat?token=PRIVATE_URL_TOKEN",
+      $exception_list: [
+        {
+          type: "InternalError",
+          value: "too much recursion",
+          mechanism: { handled: false, synthetic: false, type: "generic" },
+          stacktrace: {
+            frames: [
+              {
+                source:
+                  "turbopack:///[project]/app/components/message-navigator.ts",
+              },
+            ],
+          },
+        },
+      ],
+      hackerai_recent_navigator_phase: "PRIVATE_STALE_PHASE",
+    },
+  });
+
+  /** Throw `original` from one String method, only for the canary, inside the actual navigator. */
+  function failNavigatorNormalization(
+    method: "replace" | "trim",
+    text: string,
+    original: Error,
+  ) {
+    const messages = [
+      {
+        id: "PRIVATE_USER_MESSAGE_ID",
+        role: "user",
+        parts: [{ type: "text", text }],
+      },
+      {
+        id: "PRIVATE_ASSISTANT_MESSAGE_ID",
+        role: "assistant",
+        parts: [{ type: "text", text: "Synthetic answer" }],
+      },
+    ] as ChatMessage[];
+    const rows = deriveChatTimelineRows({
+      messages,
+      status: "ready",
+      lastAssistantMessageIndex: undefined,
+      expandedAgentMessageIds: new Set(),
+    });
+    const prototype = String.prototype as unknown as Record<
+      string,
+      (...args: unknown[]) => unknown
+    >;
+    const actual = prototype[method];
+    prototype[method] = function (this: unknown, ...args: unknown[]) {
+      if (typeof this === "string" && this.includes(CANARY)) throw original;
+      return actual.apply(this, args);
+    };
+    try {
+      deriveMessageNavigatorItems(messages, rows);
+    } catch (error) {
+      return error;
+    } finally {
+      // Restore before any capture or privacy code runs.
+      prototype[method] = actual;
+    }
+    return undefined;
+  }
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    window.history.replaceState({}, "", "/");
+    mockUseAuth.mockReturnValue({
+      user: { id: "user-123", email: "user@example.com", locale: "en-US" },
+    });
+    mockUseGlobalState.mockReturnValue({ subscription: "pro" });
+    mockGetPostHogClient.mockReturnValue(null);
+    // Global analytics identity is reset only by the provider's passive
+    // effect, so it remains the previous owner throughout each new commit.
+    jest.mocked(getPermittedAnalyticsUserId).mockReturnValue("user-123");
+    jest.mocked(getIdentifiedAnalyticsUserId).mockReturnValue("user-123");
+    // A fixed clock keeps the five-second expiry out of the assertions.
+    jest.spyOn(performance, "now").mockReturnValue(1000);
+  });
+
+  afterEach(() => {
+    jest.mocked(performance.now).mockRestore();
+    window.history.replaceState({}, "", "/");
+    window.sessionStorage.clear();
+  });
+
+  it.each([
+    ["replace", "replace_whitespace", `${CANARY}  short\n\ntext`, "le255"],
+    [
+      "trim",
+      "trim_whitespace",
+      `  ${CANARY}  ${"x".repeat(5000)}  `,
+      "le65535",
+    ],
+  ] as const)(
+    "rethrows the original %s failure and delivers only closed nearby context",
+    async (method, phase, text, bucket) => {
+      const posthog = sdk();
+      mockLoadPostHogClient.mockResolvedValue(posthog);
+      const view = render(
+        <PostHogProvider analyticsAllowed>child</PostHogProvider>,
+      );
+      await waitFor(() => expect(posthog.init).toHaveBeenCalledTimes(1));
+      const { before_send: beforeSend } = posthog.init.mock.calls[0][1] as {
+        before_send: BeforeSend;
+      };
+      const original = Object.freeze(
+        Object.assign(new Error("too much recursion"), {
+          name: "InternalError",
+          syntheticDetail: "PRIVATE_ERROR_DETAIL",
+        }),
+      );
+
+      expect(failNavigatorNormalization(method, text, original)).toBe(original);
+
+      const exception = stackException();
+      const list = exception.properties.$exception_list;
+      const sent = beforeSend(exception);
+      expect(navigatorFields(sent?.properties)).toEqual({
+        hackerai_recent_navigator_version: 1,
+        hackerai_recent_navigator_phase: phase,
+        hackerai_recent_navigator_input_shape: "string",
+        hackerai_recent_navigator_length_bucket: bucket,
+        hackerai_recent_navigator_age: "lt_100ms",
+        hackerai_recent_navigator_association: "nearby_only",
+      });
+      expect(sent?.properties).toMatchObject({
+        hackerai_exception_category: "stack_overflow",
+        $exception_list: list,
+      });
+      expect(JSON.stringify(sent)).not.toContain("PRIVATE");
+
+      // The same context never reaches a retained non-stack exception.
+      const other = beforeSend({
+        event: "$exception",
+        properties: {
+          $exception_list: [{ type: "Error", value: "Unrelated failure" }],
+          hackerai_recent_navigator_phase: "PRIVATE_STALE_PHASE",
+        },
+      });
+      expect(other?.properties).toMatchObject({
+        hackerai_exception_category: "unknown",
+      });
+      expect(navigatorFields(other?.properties)).toEqual({});
+      view.unmount();
+    },
+  );
+
+  const transitions = [
+    [
+      "withdraws consent",
+      () => (
+        <PostHogProvider analyticsAllowed={false}>
+          updated child
+        </PostHogProvider>
+      ),
+    ],
+    [
+      "switches account",
+      () => {
+        mockUseAuth.mockReturnValue({ user: { id: "user-b" } });
+        return (
+          <PostHogProvider analyticsAllowed>updated child</PostHogProvider>
+        );
+      },
+    ],
+    [
+      "enters a private page",
+      () => {
+        window.history.pushState({}, "", "/abuse");
+        return (
+          <PostHogProvider analyticsAllowed>updated child</PostHogProvider>
+        );
+      },
+    ],
+  ] as const;
+  const ownerA = () => (
+    <PostHogProvider analyticsAllowed>child</PostHogProvider>
+  );
+  const recordFailure = () =>
+    failNavigatorNormalization(
+      "replace",
+      `${CANARY} text`,
+      new Error("too much recursion"),
+    );
+
+  /** Run `onCommit` with the first installed before_send in each commit's layout phase. */
+  async function renderWithRetainedCallback() {
+    const posthog = sdk();
+    mockLoadPostHogClient.mockResolvedValue(posthog);
+    const retained: {
+      beforeSend?: BeforeSend;
+      onCommit?: (beforeSend: BeforeSend) => void;
+    } = {};
+    // A parent's layout effect runs after the child provider's layout effects
+    // in the same commit and before any passive effect.
+    function RetainedBeforeSendCaller({
+      children,
+    }: {
+      children: React.ReactNode;
+    }) {
+      useLayoutEffect(() => {
+        if (retained.beforeSend) retained.onCommit?.(retained.beforeSend);
+      });
+      return <>{children}</>;
+    }
+    const view = render(
+      <RetainedBeforeSendCaller>{ownerA()}</RetainedBeforeSendCaller>,
+    );
+    await waitFor(() => expect(posthog.init).toHaveBeenCalledTimes(1));
+    retained.beforeSend = (
+      posthog.init.mock.calls[0][1] as { before_send: BeforeSend }
+    ).before_send;
+    const commit = (
+      provider: React.ReactElement,
+      onCommit?: (beforeSend: BeforeSend) => void,
+    ) => {
+      retained.onCommit = onCommit;
+      view.rerender(
+        <RetainedBeforeSendCaller>{provider}</RetainedBeforeSendCaller>,
+      );
+      retained.onCommit = undefined;
+    };
+    return { view, commit };
+  }
+
+  it.each(transitions)(
+    "drops a failure observed in the commit that %s from a retained callback",
+    async (_name, transition) => {
+      const { view, commit } = await renderWithRetainedCallback();
+      const results: ReturnType<BeforeSend>[] = [];
+      // Recorded after the provider's layout cleanup, while global analytics
+      // identity still names the previous owner; only the owner gate applies.
+      const recordThenSend = (beforeSend: BeforeSend) => {
+        recordFailure();
+        results.push(beforeSend(stackException()));
+      };
+
+      commit(ownerA(), recordThenSend);
+      expect(navigatorFields(results[0]?.properties)).toMatchObject({
+        hackerai_recent_navigator_phase: "replace_whitespace",
+      });
+      commit(transition(), recordThenSend);
+      expect(results).toHaveLength(2);
+      expect(navigatorFields(results[1]?.properties ?? {})).toEqual({});
+      view.unmount();
+    },
+  );
+
+  it.each(transitions)(
+    "does not revive an earlier failure after the owner %s and returns",
+    async (_name, transition) => {
+      const { view, commit } = await renderWithRetainedCallback();
+      const results: ReturnType<BeforeSend>[] = [];
+      const send = (beforeSend: BeforeSend) => {
+        results.push(beforeSend(stackException()));
+      };
+      recordFailure();
+      // Control: a valid same-owner read keeps the observation.
+      commit(ownerA(), send);
+      expect(navigatorFields(results[0]?.properties)).toMatchObject({
+        hackerai_recent_navigator_phase: "replace_whitespace",
+      });
+
+      // Nothing reads during the transition, so only its cleanup can clear.
+      commit(transition());
+      window.history.pushState({}, "", "/");
+      mockUseAuth.mockReturnValue({
+        user: { id: "user-123", email: "user@example.com", locale: "en-US" },
+      });
+      commit(ownerA(), send);
+      expect(results).toHaveLength(2);
+      expect(results[1]).toEqual(
+        expect.objectContaining({ event: "$exception" }),
+      );
+      expect(navigatorFields(results[1]?.properties)).toEqual({});
+      view.unmount();
+    },
+  );
+});
+
+describe("React boundary failure context", () => {
+  type BeforeSend = (event: unknown) => {
+    event?: string;
+    properties?: Record<string, unknown>;
+  } | null;
+  const sdk = () => ({
+    __loaded: false,
+    init: jest.fn(),
+    set_config: jest.fn(),
+    opt_in_capturing: jest.fn(),
+    has_opted_out_capturing: jest.fn(() => false),
+    identify: jest.fn(),
+    sessionRecordingStarted: jest.fn(() => false),
+    startSessionRecording: jest.fn(),
+    stopSessionRecording: jest.fn(),
+    reset: jest.fn(),
+    opt_out_capturing: jest.fn(),
+  });
+  const recentCatch = (sent: ReturnType<BeforeSend>) =>
+    reactBoundaryFields(sent?.properties)
+      .hackerai_react_boundary_recent_catch_state;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    window.history.replaceState({}, "", "/");
+    mockUseAuth.mockReturnValue({
+      user: { id: "user-123", email: "user@example.com", locale: "en-US" },
+    });
+    mockUseGlobalState.mockReturnValue({ subscription: "pro" });
+    mockGetPostHogClient.mockReturnValue(null);
+    // Global analytics identity is reset only by the provider's passive
+    // effect, so it remains the previous owner throughout each new commit.
+    jest.mocked(getPermittedAnalyticsUserId).mockReturnValue("user-123");
+    jest.mocked(getIdentifiedAnalyticsUserId).mockReturnValue("user-123");
+    // A fixed clock keeps the one-second window out of the assertions.
+    jest.spyOn(performance, "now").mockReturnValue(1000);
+    jest.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    jest.mocked(performance.now).mockRestore();
+    jest.mocked(console.error).mockRestore();
+    window.history.replaceState({}, "", "/");
+    window.sessionStorage.clear();
+  });
+
+  const transitions = [
+    [
+      "withdraws consent",
+      () => (
+        <PostHogProvider analyticsAllowed={false}>
+          updated child
+        </PostHogProvider>
+      ),
+    ],
+    [
+      "switches account",
+      () => {
+        mockUseAuth.mockReturnValue({ user: { id: "user-b" } });
+        return (
+          <PostHogProvider analyticsAllowed>updated child</PostHogProvider>
+        );
+      },
+    ],
+    [
+      "enters a private page",
+      () => {
+        window.history.pushState({}, "", "/abuse");
+        return (
+          <PostHogProvider analyticsAllowed>updated child</PostHogProvider>
+        );
+      },
+    ],
+  ] as const;
+  const ownerA = () => (
+    <PostHogProvider analyticsAllowed>
+      <ConvexErrorBoundary diagnosticScope="chat_content">
+        child
+      </ConvexErrorBoundary>
+    </PostHogProvider>
+  );
+
+  /** Run `onCommit` with the first installed before_send in each commit's layout phase. */
+  async function renderWithRetainedCallback() {
+    const posthog = sdk();
+    mockLoadPostHogClient.mockResolvedValue(posthog);
+    const retained: {
+      beforeSend?: BeforeSend;
+      onCommit?: (beforeSend: BeforeSend) => void;
+    } = {};
+    function RetainedBeforeSendCaller({
+      children,
+    }: {
+      children: React.ReactNode;
+    }) {
+      useLayoutEffect(() => {
+        if (retained.beforeSend) retained.onCommit?.(retained.beforeSend);
+      });
+      return <>{children}</>;
+    }
+    const view = render(
+      <RetainedBeforeSendCaller>{ownerA()}</RetainedBeforeSendCaller>,
+    );
+    await waitFor(() => expect(posthog.init).toHaveBeenCalledTimes(1));
+    const beforeSend = (
+      posthog.init.mock.calls[0][1] as { before_send: BeforeSend }
+    ).before_send;
+    retained.beforeSend = beforeSend;
+    const commit = (
+      provider: React.ReactElement,
+      onCommit?: (beforeSend: BeforeSend) => void,
+    ) => {
+      retained.onCommit = onCommit;
+      view.rerender(
+        <RetainedBeforeSendCaller>{provider}</RetainedBeforeSendCaller>,
+      );
+      retained.onCommit = undefined;
+    };
+    return { view, commit, beforeSend };
+  }
+
+  it("delivers only closed nearby context on the exact retained exception", async () => {
+    const { view, beforeSend } = await renderWithRetainedCallback();
+    catchNullRemoveChild("chat_content");
+
+    const exception = nullRemoveChildException();
+    const list = exception.properties.$exception_list;
+    const sent = beforeSend(exception);
+    expect(reactBoundaryFields(sent?.properties)).toEqual({
+      hackerai_react_boundary_context_version: 1,
+      hackerai_react_boundary_observer_state: "active",
+      hackerai_react_boundary_chat_content_mounted: true,
+      hackerai_react_boundary_chat_layout_mounted: false,
+      hackerai_react_boundary_unknown_scope_mounted: false,
+      hackerai_react_boundary_recent_catch_state: "observed",
+      hackerai_react_boundary_recent_scope: "chat_content",
+      hackerai_react_boundary_recent_age: "lt_50ms",
+    });
+    expect(sent?.properties?.$exception_list).toBe(list);
+    expect(JSON.stringify(sent)).not.toMatch(/PRIVATE|user-123/);
+
+    // A lookalike retained exception gets none of it, including forged fields.
+    const other = beforeSend({
+      event: "$exception",
+      properties: {
+        $exception_list: [{ type: "Error", value: NULL_REMOVE_CHILD }],
+        hackerai_react_boundary_recent_catch_state: "PRIVATE_FORGED",
+      },
+    });
+    expect(other?.properties).toMatchObject({
+      hackerai_exception_category: "unknown",
+    });
+    expect(reactBoundaryFields(other?.properties)).toEqual({});
+    view.unmount();
+  });
+
+  it.each(transitions)(
+    "drops a catch recorded in the commit that %s from a retained callback",
+    async (_name, transition) => {
+      const { view, commit } = await renderWithRetainedCallback();
+      const results: ReturnType<BeforeSend>[] = [];
+      // Caught after the provider's layout cleanup, while global analytics
+      // identity still names the previous owner; only the owner gate applies.
+      const catchThenSend = (beforeSend: BeforeSend) => {
+        catchNullRemoveChild("chat_content");
+        results.push(beforeSend(nullRemoveChildException()));
+      };
+
+      commit(ownerA(), catchThenSend);
+      expect(recentCatch(results[0])).toBe("observed");
+      commit(transition(), catchThenSend);
+      expect(results).toHaveLength(2);
+      expect(reactBoundaryFields(results[1]?.properties)).toEqual({});
+      view.unmount();
+    },
+  );
+
+  it.each(transitions)(
+    "does not revive an earlier catch after the owner %s and returns, but records a fresh one",
+    async (_name, transition) => {
+      const { view, commit, beforeSend } = await renderWithRetainedCallback();
+      const results: ReturnType<BeforeSend>[] = [];
+      const send = (retained: BeforeSend) => {
+        results.push(retained(nullRemoveChildException()));
+      };
+      catchNullRemoveChild("chat_content");
+      // Control: a valid same-owner read keeps the observation.
+      commit(ownerA(), send);
+      expect(recentCatch(results[0])).toBe("observed");
+
+      // Nothing reads during the transition, so only its cleanup can clear.
+      commit(transition());
+      window.history.pushState({}, "", "/");
+      mockUseAuth.mockReturnValue({
+        user: { id: "user-123", email: "user@example.com", locale: "en-US" },
+      });
+      const confirmed =
+        mockConfirmAuthenticatedAnalyticsUserId.mock.calls.length;
+      commit(ownerA(), send);
+      expect(results).toHaveLength(2);
+      expect(results[1]).toEqual(
+        expect.objectContaining({ event: "$exception" }),
+      );
+      expect(recentCatch(results[1])).not.toBe("observed");
+
+      // Once the provider confirms the returning owner, new catches count.
+      await waitFor(() =>
+        expect(
+          mockConfirmAuthenticatedAnalyticsUserId.mock.calls.length,
+        ).toBeGreaterThan(confirmed),
+      );
+      expect(recentCatch(beforeSend(nullRemoveChildException()))).toBe("none");
+      catchNullRemoveChild("chat_content");
+      expect(recentCatch(beforeSend(nullRemoveChildException()))).toBe(
+        "observed",
+      );
+      view.unmount();
+    },
+  );
+
+  it("stops the observer and unregisters boundaries when the provider unmounts", async () => {
+    const { view } = await renderWithRetainedCallback();
+    catchNullRemoveChild("chat_content");
+    view.unmount();
+    catchNullRemoveChild("chat_content");
+    // Read the module directly: the unmounted provider no longer commits an owner.
+    expect(getReactBoundaryDiagnostics("user-123")).toMatchObject({
+      hackerai_react_boundary_observer_state: "inactive",
+      hackerai_react_boundary_recent_catch_state: "unavailable",
+      hackerai_react_boundary_chat_content_mounted: false,
+    });
   });
 });

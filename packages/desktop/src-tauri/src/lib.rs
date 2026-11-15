@@ -1,3 +1,5 @@
+mod authorization_connector_diagnostics;
+mod authorization_response_diagnostics;
 mod authorization_send_diagnostics;
 mod platform;
 mod update_safety;
@@ -1063,19 +1065,43 @@ async fn redeem_authorized_message<R: tauri::Runtime>(
         authorization_id,
         message,
         window,
-        None::<fn(authorization_send_diagnostics::SendFailureReceipt)>,
+        None::<
+            fn(
+                authorization_send_diagnostics::SendFailureReceipt,
+                authorization_send_diagnostics::SendFailureCause,
+                authorization_send_diagnostics::SendTransportDetail,
+            ),
+        >,
+        None::<
+            fn(
+                authorization_response_diagnostics::ResponseRejectionReceipt,
+                authorization_response_diagnostics::ResponseMitigationReceipt,
+            ),
+        >,
+        None::<fn(authorization_connector_diagnostics::ConnectorPhaseSnapshot)>,
     )
     .await
 }
 
-async fn redeem_authorized_message_observed<R: tauri::Runtime, F>(
+async fn redeem_authorized_message_observed<R: tauri::Runtime, F, G, H>(
     authorization_id: &str,
     mut message: serde_json::Value,
     window: &tauri::WebviewWindow<R>,
     send_failure_observer: Option<F>,
+    response_rejection_observer: Option<G>,
+    connector_phase_observer: Option<H>,
 ) -> Result<serde_json::Value, String>
 where
-    F: FnOnce(authorization_send_diagnostics::SendFailureReceipt),
+    F: FnOnce(
+        authorization_send_diagnostics::SendFailureReceipt,
+        authorization_send_diagnostics::SendFailureCause,
+        authorization_send_diagnostics::SendTransportDetail,
+    ),
+    G: FnOnce(
+        authorization_response_diagnostics::ResponseRejectionReceipt,
+        authorization_response_diagnostics::ResponseMitigationReceipt,
+    ),
+    H: FnOnce(authorization_connector_diagnostics::ConnectorPhaseSnapshot),
 {
     if authorization_id.len() != 64
         || !authorization_id
@@ -1097,28 +1123,33 @@ where
     let endpoint = desktop_authorization_endpoint(&loaded_url)?;
     let origin_class = authorization_origin_class(&loaded_url);
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .redirect(reqwest::redirect::Policy::none())
+    // Without a connector observer the builder is unchanged and unlayered.
+    let (client_builder, connector_phase) = authorization_connector_diagnostics::observe_connector(
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .redirect(reqwest::redirect::Policy::none()),
+        connector_phase_observer,
+    );
+    let client = client_builder
         .build()
         .map_err(|_| "Desktop authorization client unavailable".to_string())?;
     let request = client
         .post(endpoint)
         .json(&serde_json::json!({ "id": authorization_id, "digest": digest }));
+    let send_failure_observer = authorization_connector_diagnostics::with_connector_phase(
+        send_failure_observer,
+        connector_phase,
+    );
     let response =
         authorization_send_diagnostics::observed_send(request, origin_class, send_failure_observer)
             .await
             .map_err(|_| "Desktop operation authorization unavailable".to_string())?;
-    if !response.status().is_success() {
-        return Err("Desktop operation was not authorized".to_string());
-    }
-    let approval: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|_| "Invalid Desktop authorization response".to_string())?;
-    if approval.get("approved") != Some(&serde_json::Value::Bool(true)) {
-        return Err("Desktop operation was not authorized".to_string());
-    }
+    authorization_response_diagnostics::observed_approval(
+        response,
+        origin_class,
+        response_rejection_observer,
+    )
+    .await?;
     Ok(message)
 }
 
@@ -1431,21 +1462,91 @@ async fn execute_authorized_stream_command<R: tauri::Runtime>(
     on_event: tauri::ipc::Channel<StreamEvent>,
     // Separate from the signed message and output events; older frontends omit it.
     on_authorization_diagnostic: Option<serde_json::Value>,
+    // The closed IO cause, on its own channel so the v1 receipt shape is frozen.
+    on_authorization_cause_diagnostic: Option<serde_json::Value>,
+    // An answered POST's rejection, independent of both send channels.
+    on_authorization_response_diagnostic: Option<serde_json::Value>,
+    // The same response's mitigation marker, on its own channel so the v1
+    // response receipt shape is frozen.
+    on_authorization_mitigation_diagnostic: Option<serde_json::Value>,
+    // The send error's unfolded IO kind and typed TLS presence, on its own
+    // channel so the cause receipt's buckets are frozen.
+    on_authorization_transport_diagnostic: Option<serde_json::Value>,
+    // An unmapped first IO error's remaining kind and OS code family, on its
+    // own channel so the transport detail's shape and buckets are frozen.
+    on_authorization_io_diagnostic: Option<serde_json::Value>,
+    // The send failure's connector phase, on its own channel so every send
+    // receipt's shape is frozen. Without it the client keeps no connector layer.
+    on_authorization_connector_diagnostic: Option<serde_json::Value>,
 ) -> Result<(), String> {
-    let send_failure_observer = authorization_diagnostic_channel_id(on_authorization_diagnostic)
-        .map(|id| {
-            let webview = AsRef::<tauri::Webview<R>>::as_ref(&window).clone();
-            let channel =
-                id.channel_on::<R, authorization_send_diagnostics::SendFailureReceipt>(webview);
-            move |receipt| {
-                let _ = channel.send(receipt);
+    use authorization_connector_diagnostics::ConnectorPhaseSnapshot;
+    use authorization_response_diagnostics::{ResponseMitigationReceipt, ResponseRejectionReceipt};
+    use authorization_send_diagnostics::{
+        SendFailureCause, SendFailureReceipt, SendIoSupplement, SendTransportDetail,
+    };
+    let webview = || AsRef::<tauri::Webview<R>>::as_ref(&window).clone();
+    let response_channel =
+        authorization_diagnostic_channel_id(on_authorization_response_diagnostic)
+            .map(|id| id.channel_on::<R, ResponseRejectionReceipt>(webview()));
+    let mitigation_channel =
+        authorization_diagnostic_channel_id(on_authorization_mitigation_diagnostic)
+            .map(|id| id.channel_on::<R, ResponseMitigationReceipt>(webview()));
+    // Either channel alone is enough; each send fails on its own.
+    let response_rejection_observer = (response_channel.is_some() || mitigation_channel.is_some())
+        .then(|| {
+            move |receipt: ResponseRejectionReceipt, mitigation: ResponseMitigationReceipt| {
+                if let Some(channel) = &response_channel {
+                    let _ = channel.send(receipt);
+                }
+                if let Some(channel) = &mitigation_channel {
+                    let _ = channel.send(mitigation);
+                }
             }
         });
+    let receipt_channel = authorization_diagnostic_channel_id(on_authorization_diagnostic)
+        .map(|id| id.channel_on::<R, SendFailureReceipt>(webview()));
+    let cause_channel = authorization_diagnostic_channel_id(on_authorization_cause_diagnostic)
+        .map(|id| id.channel_on::<R, SendFailureCause>(webview()));
+    let transport_channel =
+        authorization_diagnostic_channel_id(on_authorization_transport_diagnostic)
+            .map(|id| id.channel_on::<R, SendTransportDetail>(webview()));
+    let io_channel = authorization_diagnostic_channel_id(on_authorization_io_diagnostic)
+        .map(|id| id.channel_on::<R, SendIoSupplement>(webview()));
+    let any_send_channel = receipt_channel.is_some()
+        || cause_channel.is_some()
+        || transport_channel.is_some()
+        || io_channel.is_some();
+    let send_failure_observer = any_send_channel.then(|| {
+        move |receipt: SendFailureReceipt, cause: SendFailureCause, detail: SendTransportDetail| {
+            if let Some(channel) = &receipt_channel {
+                let _ = channel.send(receipt);
+            }
+            if let Some(channel) = &cause_channel {
+                let _ = channel.send(cause);
+            }
+            if let (Some(channel), Some(supplement)) = (&io_channel, detail.io_supplement()) {
+                let _ = channel.send(supplement);
+            }
+            if let Some(channel) = &transport_channel {
+                let _ = channel.send(detail);
+            }
+        }
+    });
+    let connector_phase_observer =
+        authorization_diagnostic_channel_id(on_authorization_connector_diagnostic)
+            .map(|id| id.channel_on::<R, ConnectorPhaseSnapshot>(webview()))
+            .map(|channel| {
+                move |snapshot: ConnectorPhaseSnapshot| {
+                    let _ = channel.send(snapshot);
+                }
+            });
     let message = redeem_authorized_message_observed(
         &authorization_id,
         message,
         &window,
         send_failure_observer,
+        response_rejection_observer,
+        connector_phase_observer,
     )
     .await?;
     authorized_operation_type(&message, &["command"])?;
@@ -2190,65 +2291,284 @@ mod tests {
         }
     }
 
+    // The published v1 command ABI has no cause-channel argument. Exercise that
+    // ABI with the pinned Tauri binding, rather than assuming extra arguments
+    // from a newer frontend are ignored. No native process can run here.
+    #[tauri::command(rename = "execute_authorized_stream_command")]
+    async fn legacy_authorized_command_fixture<R: tauri::Runtime>(
+        window: tauri::WebviewWindow<R>,
+        authorization_id: String,
+        message: serde_json::Value,
+        on_event: tauri::ipc::Channel<StreamEvent>,
+        on_authorization_diagnostic: Option<serde_json::Value>,
+    ) -> Result<(), String> {
+        let _ = (on_event, on_authorization_diagnostic);
+        redeem_authorized_message(&authorization_id, message, &window)
+            .await
+            .map(|_| ())
+    }
+
+    // The published send-and-cause ABI has no response-channel argument.
+    #[tauri::command(rename = "execute_authorized_stream_command")]
+    async fn cause_authorized_command_fixture<R: tauri::Runtime>(
+        window: tauri::WebviewWindow<R>,
+        authorization_id: String,
+        message: serde_json::Value,
+        on_event: tauri::ipc::Channel<StreamEvent>,
+        on_authorization_diagnostic: Option<serde_json::Value>,
+        on_authorization_cause_diagnostic: Option<serde_json::Value>,
+    ) -> Result<(), String> {
+        let _ = (
+            on_event,
+            on_authorization_diagnostic,
+            on_authorization_cause_diagnostic,
+        );
+        redeem_authorized_message(&authorization_id, message, &window)
+            .await
+            .map(|_| ())
+    }
+
+    // The published send, cause and response ABI has no mitigation argument.
+    #[tauri::command(rename = "execute_authorized_stream_command")]
+    async fn response_authorized_command_fixture<R: tauri::Runtime>(
+        window: tauri::WebviewWindow<R>,
+        authorization_id: String,
+        message: serde_json::Value,
+        on_event: tauri::ipc::Channel<StreamEvent>,
+        on_authorization_diagnostic: Option<serde_json::Value>,
+        on_authorization_cause_diagnostic: Option<serde_json::Value>,
+        on_authorization_response_diagnostic: Option<serde_json::Value>,
+    ) -> Result<(), String> {
+        let _ = (
+            on_event,
+            on_authorization_diagnostic,
+            on_authorization_cause_diagnostic,
+            on_authorization_response_diagnostic,
+        );
+        redeem_authorized_message(&authorization_id, message, &window)
+            .await
+            .map(|_| ())
+    }
+
+    // The published send, cause, response and mitigation ABI has no transport
+    // argument.
+    #[tauri::command(rename = "execute_authorized_stream_command")]
+    async fn mitigation_authorized_command_fixture<R: tauri::Runtime>(
+        window: tauri::WebviewWindow<R>,
+        authorization_id: String,
+        message: serde_json::Value,
+        on_event: tauri::ipc::Channel<StreamEvent>,
+        on_authorization_diagnostic: Option<serde_json::Value>,
+        on_authorization_cause_diagnostic: Option<serde_json::Value>,
+        on_authorization_response_diagnostic: Option<serde_json::Value>,
+        on_authorization_mitigation_diagnostic: Option<serde_json::Value>,
+    ) -> Result<(), String> {
+        let _ = (
+            on_event,
+            on_authorization_diagnostic,
+            on_authorization_cause_diagnostic,
+            on_authorization_response_diagnostic,
+            on_authorization_mitigation_diagnostic,
+        );
+        redeem_authorized_message(&authorization_id, message, &window)
+            .await
+            .map(|_| ())
+    }
+
+    // The published ABI with the transport argument has no IO supplement
+    // argument.
+    #[tauri::command(rename = "execute_authorized_stream_command")]
+    async fn transport_authorized_command_fixture<R: tauri::Runtime>(
+        window: tauri::WebviewWindow<R>,
+        authorization_id: String,
+        message: serde_json::Value,
+        on_event: tauri::ipc::Channel<StreamEvent>,
+        on_authorization_diagnostic: Option<serde_json::Value>,
+        on_authorization_cause_diagnostic: Option<serde_json::Value>,
+        on_authorization_response_diagnostic: Option<serde_json::Value>,
+        on_authorization_mitigation_diagnostic: Option<serde_json::Value>,
+        on_authorization_transport_diagnostic: Option<serde_json::Value>,
+    ) -> Result<(), String> {
+        let _ = (
+            on_event,
+            on_authorization_diagnostic,
+            on_authorization_cause_diagnostic,
+            on_authorization_response_diagnostic,
+            on_authorization_mitigation_diagnostic,
+            on_authorization_transport_diagnostic,
+        );
+        redeem_authorized_message(&authorization_id, message, &window)
+            .await
+            .map(|_| ())
+    }
+
+    // The published ABI with the IO supplement argument has no connector
+    // argument.
+    #[tauri::command(rename = "execute_authorized_stream_command")]
+    async fn io_authorized_command_fixture<R: tauri::Runtime>(
+        window: tauri::WebviewWindow<R>,
+        authorization_id: String,
+        message: serde_json::Value,
+        on_event: tauri::ipc::Channel<StreamEvent>,
+        on_authorization_diagnostic: Option<serde_json::Value>,
+        on_authorization_cause_diagnostic: Option<serde_json::Value>,
+        on_authorization_response_diagnostic: Option<serde_json::Value>,
+        on_authorization_mitigation_diagnostic: Option<serde_json::Value>,
+        on_authorization_transport_diagnostic: Option<serde_json::Value>,
+        on_authorization_io_diagnostic: Option<serde_json::Value>,
+    ) -> Result<(), String> {
+        let _ = (
+            on_event,
+            on_authorization_diagnostic,
+            on_authorization_cause_diagnostic,
+            on_authorization_response_diagnostic,
+            on_authorization_mitigation_diagnostic,
+            on_authorization_transport_diagnostic,
+            on_authorization_io_diagnostic,
+        );
+        redeem_authorized_message(&authorization_id, message, &window)
+            .await
+            .map(|_| ())
+    }
+
     #[test]
-    fn authorization_send_diagnostics_optional_argument_keeps_original_command_errors() {
+    fn authorization_diagnostics_optional_arguments_keep_original_command_errors() {
         use tauri::test::{get_ipc_response, mock_builder, INVOKE_KEY};
         // The compiled ACL admits the trusted IPC origin, while the loaded page
         // is untrusted for authorization: no POST can be attempted.
-        let app = mock_builder()
-            .manage(StreamCommandState::default())
-            .invoke_handler(tauri::generate_handler![execute_authorized_stream_command])
-            .build(app_context())
-            .unwrap();
-        let untrusted_page =
-            tauri::WebviewUrl::External("https://untrusted.invalid/".parse().unwrap());
-        let window = tauri::WebviewWindowBuilder::new(&app, "main", untrusted_page)
-            .build()
-            .unwrap();
-        let invoke = |authorization_id: &str, diagnostic: Option<serde_json::Value>| {
-            let mut body = serde_json::json!({
-                "authorizationId": authorization_id,
-                "message": { "type": "command", "commandId": "synthetic", "command": "true" },
-                "onEvent": "__CHANNEL__:1",
-            });
-            if let Some(value) = diagnostic {
-                body["onAuthorizationDiagnostic"] = value;
+        for abi in [
+            "v1",
+            "cause",
+            "response",
+            "mitigation",
+            "transport",
+            "io",
+            "current",
+        ] {
+            let builder = mock_builder().manage(StreamCommandState::default());
+            let builder = match abi {
+                "v1" => builder
+                    .invoke_handler(tauri::generate_handler![legacy_authorized_command_fixture]),
+                "cause" => builder
+                    .invoke_handler(tauri::generate_handler![cause_authorized_command_fixture]),
+                "response" => builder.invoke_handler(tauri::generate_handler![
+                    response_authorized_command_fixture
+                ]),
+                "mitigation" => builder.invoke_handler(tauri::generate_handler![
+                    mitigation_authorized_command_fixture
+                ]),
+                "transport" => builder.invoke_handler(tauri::generate_handler![
+                    transport_authorized_command_fixture
+                ]),
+                "io" => {
+                    builder.invoke_handler(tauri::generate_handler![io_authorized_command_fixture])
+                }
+                _ => builder
+                    .invoke_handler(tauri::generate_handler![execute_authorized_stream_command]),
+            };
+            let app = builder.build(app_context()).unwrap();
+            let untrusted_page =
+                tauri::WebviewUrl::External("https://untrusted.invalid/".parse().unwrap());
+            let window = tauri::WebviewWindowBuilder::new(&app, "main", untrusted_page)
+                .build()
+                .unwrap();
+            type Optional = Option<serde_json::Value>;
+            type Optionals = (
+                Optional,
+                Optional,
+                Optional,
+                Optional,
+                Optional,
+                Optional,
+                Optional,
+            );
+            let invoke =
+                |id: &str,
+                 (diagnostic, cause, response, mitigation, transport, io, connector): Optionals| {
+                    let mut body = serde_json::json!({
+                        "authorizationId": id,
+                        "message": { "type": "command", "commandId": "synthetic", "command": "true" },
+                        "onEvent": "__CHANNEL__:1",
+                    });
+                    if let Some(value) = diagnostic {
+                        body["onAuthorizationDiagnostic"] = value;
+                    }
+                    if let Some(value) = cause {
+                        body["onAuthorizationCauseDiagnostic"] = value;
+                    }
+                    if let Some(value) = response {
+                        body["onAuthorizationResponseDiagnostic"] = value;
+                    }
+                    if let Some(value) = mitigation {
+                        body["onAuthorizationMitigationDiagnostic"] = value;
+                    }
+                    if let Some(value) = transport {
+                        body["onAuthorizationTransportDiagnostic"] = value;
+                    }
+                    if let Some(value) = io {
+                        body["onAuthorizationIoDiagnostic"] = value;
+                    }
+                    if let Some(value) = connector {
+                        body["onAuthorizationConnectorDiagnostic"] = value;
+                    }
+                    get_ipc_response(
+                        &window,
+                        tauri::webview::InvokeRequest {
+                            cmd: "execute_authorized_stream_command".into(),
+                            callback: tauri::ipc::CallbackFn(0),
+                            error: tauri::ipc::CallbackFn(1),
+                            url: "https://hackerai.co/".parse().unwrap(),
+                            body: tauri::ipc::InvokeBody::Json(body),
+                            headers: Default::default(),
+                            invoke_key: INVOKE_KEY.to_string(),
+                        },
+                    )
+                    .map(|_| ())
+                };
+            let optional = [
+                None,
+                Some(serde_json::Value::Null),
+                Some(serde_json::json!(42)),
+                Some(serde_json::json!("not-a-channel")),
+                Some(serde_json::json!("__CHANNEL__:2")),
+            ];
+            // Each optional channel alone, the published send-and-cause pair,
+            // three- to six-channel sets, then all seven together as current
+            // frontends send them.
+            let channel = |id: u8| Some(serde_json::json!(format!("__CHANNEL__:{id}")));
+            let alone = |slot: usize, value: &Optional| {
+                let mut optionals: [Optional; 7] = Default::default();
+                optionals[slot] = value.clone();
+                let [a, b, c, d, e, f, g] = optionals;
+                (a, b, c, d, e, f, g)
+            };
+            let first = |count: u8| {
+                let mut optionals: [Optional; 7] = Default::default();
+                for (slot, id) in (2..2 + count).enumerate() {
+                    optionals[slot] = channel(id);
+                }
+                let [a, b, c, d, e, f, g] = optionals;
+                (a, b, c, d, e, f, g)
+            };
+            let variants: Vec<Optionals> = (0..7)
+                .flat_map(|slot| optional.iter().map(move |value| alone(slot, value)))
+                .chain((2..=7).map(first))
+                .collect();
+            for variant in variants.clone() {
+                assert_eq!(
+                    invoke("invalid", variant),
+                    Err(serde_json::json!("Invalid Desktop operation authorization"))
+                );
             }
-            get_ipc_response(
-                &window,
-                tauri::webview::InvokeRequest {
-                    cmd: "execute_authorized_stream_command".into(),
-                    callback: tauri::ipc::CallbackFn(0),
-                    error: tauri::ipc::CallbackFn(1),
-                    url: "https://hackerai.co/".parse().unwrap(),
-                    body: tauri::ipc::InvokeBody::Json(body),
-                    headers: Default::default(),
-                    invoke_key: INVOKE_KEY.to_string(),
-                },
-            )
-            .map(|_| ())
-        };
-        let variants = [
-            None,
-            Some(serde_json::Value::Null),
-            Some(serde_json::json!(42)),
-            Some(serde_json::json!("not-a-channel")),
-            Some(serde_json::json!("__CHANNEL__:2")),
-        ];
-        for variant in variants.clone() {
-            assert_eq!(
-                invoke("invalid", variant),
-                Err(serde_json::json!("Invalid Desktop operation authorization"))
-            );
-        }
-        let valid_id = "a".repeat(64);
-        for variant in variants {
-            assert_eq!(
-                invoke(&valid_id, variant),
-                Err(serde_json::json!(
-                    "Desktop origin is not allowed for native authorization"
-                ))
-            );
+            let valid_id = "a".repeat(64);
+            for variant in variants.clone() {
+                assert_eq!(
+                    invoke(&valid_id, variant),
+                    Err(serde_json::json!(
+                        "Desktop origin is not allowed for native authorization"
+                    ))
+                );
+            }
         }
     }
 

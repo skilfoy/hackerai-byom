@@ -66,6 +66,15 @@ export const BROWSER_OPEN_SOCKET_RETURN_STATUSES = [
   "unreadable",
 ] as const;
 
+// Wire code o1 is the index (bit1 help, bit2 version). Exact informational tokens
+// declared in that same OPEN's arguments; not its effective CLI result or daemon state.
+export const BROWSER_OPEN_INFO_FLAGS = [
+  "none",
+  "help",
+  "version",
+  "help_and_version",
+] as const;
+
 // Wire code k1 is the index. The latest wrapped command's declared first verb
 // token category; not its execution, the daemon's active command or a cause.
 export const BROWSER_WRAPPER_COMMAND_CLASSES = [
@@ -93,6 +102,16 @@ export const BROWSER_DAEMON_DEADLINE_PHASES = [
   "connecting",
   "awaiting_response",
   "partial_response",
+] as const;
+
+// Wire tuple r1 code is the index. Which check refused the daemon's first
+// response line at exit5; never its data, error, body or ID, and not a cause.
+export const BROWSER_DAEMON_RESPONSE_VALIDATIONS = [
+  "invalid_json",
+  "invalid_envelope",
+  "id_mismatch",
+  "success_false",
+  "success_other",
 ] as const;
 
 export const BROWSER_DAEMON_PROGRAM = String.raw`
@@ -319,6 +338,8 @@ function wrapperReceipt() {
       result.p1 = daemonProcess();
       // Recorded with this same OPEN's return; older writers omit it.
       if (Number.isInteger(open.os1) && open.os1 >= 0 && open.os1 <= 4) result.os1 = open.os1;
+      // That OPEN's declared help(1)/version(2) tokens; not its effective result.
+      if (Number.isInteger(open.o1) && open.o1 >= 0 && open.o1 <= 3) result.o1 = open.o1;
       const declared = daemonVersionFile();
       if (declared) result.dv = declared;
     }
@@ -416,6 +437,8 @@ function finish(code, value) {
     if (cli) value = { ...value, cv: cli };
     // Optional codes never displace existing context at the parser cap; the
     // newest is dropped first.
+    if (value?.o1 !== undefined && Buffer.byteLength(JSON.stringify(value)) > 544) delete value.o1;
+    if (value?.r1 !== undefined && Buffer.byteLength(JSON.stringify(value)) > 544) delete value.r1;
     if (value?.dv !== undefined && Buffer.byteLength(JSON.stringify(value)) > 544) delete value.dv;
     if (value?.k1 !== undefined && Buffer.byteLength(JSON.stringify(value)) > 544) delete value.k1;
     if (value?.os1 !== undefined && Buffer.byteLength(JSON.stringify(value)) > 544) delete value.os1;
@@ -474,11 +497,15 @@ try {
       if (buffer.length > 2 * 1024 * 1024) return finish(4);
       const newline = buffer.indexOf('\n');
       if (newline < 0) return;
+      // Every refusal keeps exit5; r1 records only which check refused it. Only
+      // the parse can throw before finish marks done, so catch remains invalid_json.
       try {
         const response = JSON.parse(buffer.slice(0, newline));
-        if (response.id !== id || response.success !== true) return finish(5);
+        const refused = response === null || typeof response !== 'object' || Array.isArray(response) ? 1 :
+          response.id !== id ? 2 : response.success === false ? 3 : response.success !== true ? 4 : -1;
+        if (refused >= 0) return finish(5, { r1: [1, refused] });
         finish(0, response);
-      } catch { finish(5); }
+      } catch { finish(5, { r1: [1, 0] }); }
     });
     socket.on('error', () => finish(6));
     socket.on('close', () => { if (!done) finish(6); });

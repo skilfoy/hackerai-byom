@@ -183,6 +183,29 @@ it("bounds failure bytes and never invokes output getters or reads successful fr
   expect(browserBridgeFailureContext({ exitCode: 0, stdout })).toEqual({});
 });
 
+it("applies the unchanged 128-byte cap to the largest v5 watchdog packet", () => {
+  const stdout = JSON.stringify({
+    bridge_failure: [
+      5,
+      "deadline",
+      "message_received",
+      "none",
+      16,
+      "not_observed",
+      "not_observed",
+    ],
+  });
+  expect(
+    browserBridgeFailureContext({ exitCode: 3, stdout: stdout.padEnd(128) }),
+  ).toHaveProperty(
+    "capture_bridge_status_message_screencasting",
+    "not_observed",
+  );
+  expect(
+    browserBridgeFailureContext({ exitCode: 3, stdout: stdout.padEnd(129) }),
+  ).toEqual({});
+});
+
 function receiveFrame(timestamp: unknown) {
   const listeners = new Map<string, (event: { data: string }) => void>();
   const timers = new Map<number, () => void>();
@@ -295,29 +318,61 @@ it("does not invoke error message accessors or export unknown error text", () =>
 });
 
 it.each([
-  ["connecting", 0, "not_observed"],
-  ["awaiting_frame", 0, "not_observed"],
-  ["message_received", 1, "not_observed"],
+  ["connecting", 0],
+  ["awaiting_frame", 0],
+  ["message_received", 1],
 ] as const)(
   "attributes the existing frame watchdog at %s without changing exit3 or allowing a late event to replace it",
-  (phase, count, status) => {
+  (phase, count) => {
     const result = transportFailure("deadline", phase);
     expect(result.exitCode).toBe(3);
     expect(result.receipt).toEqual({
-      bridge_failure: [4, "deadline", phase, "none", count, status],
+      bridge_failure: [
+        5,
+        "deadline",
+        phase,
+        "none",
+        count,
+        "not_observed",
+        "not_observed",
+      ],
     });
     expect(
       browserBridgeFailureContext({ exitCode: 3, stdout: result.output }),
     ).toEqual({
-      capture_bridge_diagnostic_version: 4,
+      capture_bridge_diagnostic_version: 5,
       capture_bridge_failure: "deadline",
       capture_bridge_phase: phase,
       capture_bridge_close_code: "none",
       capture_bridge_nonframe_message_count: count,
-      capture_bridge_status_message_connected: status,
+      capture_bridge_status_message_connected: "not_observed",
+      capture_bridge_status_message_screencasting: "not_observed",
     });
     expect(result.output.length).toBeLessThanOrEqual(128);
     expect(result.output).not.toContain("PRIVATE");
+  },
+);
+
+it.each([
+  [4, "deadline", "connecting", "none", 0, "not_observed"],
+  [4, "deadline", "message_received", "none", 7, "true"],
+  [4, "deadline", "message_received", "none", 16, "other"],
+] as const)(
+  "still reads v4 status summaries from older helpers without inventing a screencasting claim (%#)",
+  (...tuple) => {
+    expect(
+      browserBridgeFailureContext({
+        exitCode: 3,
+        stdout: JSON.stringify({ bridge_failure: tuple }),
+      }),
+    ).toEqual({
+      capture_bridge_diagnostic_version: 4,
+      capture_bridge_failure: "deadline",
+      capture_bridge_phase: tuple[2],
+      capture_bridge_close_code: "none",
+      capture_bridge_nonframe_message_count: tuple[4],
+      capture_bridge_status_message_connected: tuple[5],
+    });
   },
 );
 
@@ -373,107 +428,307 @@ function frameMessages(messages: string[], deadline = true) {
   });
   listeners.get("open")!();
   for (const data of messages) listeners.get("message")!({ data });
+  // The 6.5s watchdog is the first timer; an outcome before it clears it.
+  const watchdogPending = timers.has(1);
   if (deadline) timers.get(1)!();
   // Late daemon events cannot replace the first receipt.
   listeners.get("message")!({
-    data: JSON.stringify({ type: "status", connected: true }),
+    data: JSON.stringify({
+      type: "status",
+      connected: true,
+      screencasting: true,
+    }),
   });
   listeners.get("message")!({
     data: JSON.stringify({ type: "frame", data: "PRIVATE_LATE" }),
   });
   listeners.get("close")!({ code: 1000 });
   for (const callback of timers.values()) callback();
-  return { exitCode, output, receipt: output ? JSON.parse(output) : null };
+  return {
+    exitCode,
+    output,
+    receipt: output ? JSON.parse(output) : null,
+    watchdogPending,
+  };
 }
 
-const status = (connected?: unknown) =>
-  JSON.stringify({ type: "status", connected, url: "PRIVATE_URL" });
+const status = (connected?: unknown, screencasting?: unknown) =>
+  JSON.stringify({
+    type: "status",
+    connected,
+    screencasting,
+    url: "PRIVATE_URL",
+    port: 9223,
+    session: "PRIVATE_SESSION",
+  });
 const other = JSON.stringify({ type: "PRIVATE_TYPE", data: "PRIVATE" });
 
 it.each([
-  ["reported disconnected", [status(false)], 1, "false"],
-  ["reported connected", [status(true)], 1, "true"],
-  ["omitted connected", [status()], 1, "other"],
-  ["sent a non-boolean", [status("false")], 1, "other"],
-  ["sent a numeric flag", [status(1)], 1, "other"],
+  [
+    "claimed connected and screencasting",
+    [status(true, true)],
+    1,
+    "true",
+    "true",
+  ],
+  [
+    "claimed connected but not screencasting",
+    [status(true, false)],
+    1,
+    "true",
+    "false",
+  ],
+  [
+    "claimed connected and omitted screencasting",
+    [status(true)],
+    1,
+    "true",
+    "other",
+  ],
+  [
+    "sent a non-boolean screencasting flag",
+    [status(true, "true")],
+    1,
+    "true",
+    "other",
+  ],
+  ["sent a numeric screencasting flag", [status(true, 1)], 1, "true", "other"],
+  ["omitted both claims", [status()], 1, "other", "other"],
+  ["sent a non-boolean", [status("false")], 1, "other", "other"],
+  ["sent a numeric flag", [status(1)], 1, "other", "other"],
   [
     "sent only other messages",
     [other, '"PRIVATE"', "[]", "7"],
     4,
     "not_observed",
-  ],
-  [
-    "sent connected on a non-status message",
-    [JSON.stringify({ type: "PRIVATE_TYPE", connected: false })],
-    1,
     "not_observed",
   ],
-  ["exceeded the count cap", Array(20).fill(other), 16, "not_observed"],
+  [
+    "sent both claims on a non-status message",
+    [
+      JSON.stringify({
+        type: "PRIVATE_TYPE",
+        connected: false,
+        screencasting: true,
+      }),
+    ],
+    1,
+    "not_observed",
+    "not_observed",
+  ],
+  [
+    "exceeded the count cap",
+    Array(20).fill(other),
+    16,
+    "not_observed",
+    "not_observed",
+  ],
 ] as const)(
   "summarizes a deadline after the daemon %s without exporting message contents",
-  (_case, messages, count, connected) => {
+  (_case, messages, count, connected, screencasting) => {
     const result = frameMessages([...messages]);
     expect(result.exitCode).toBe(3);
     expect(result.receipt).toEqual({
       bridge_failure: [
-        4,
+        5,
         "deadline",
         "message_received",
         "none",
         count,
         connected,
+        screencasting,
       ],
     });
     expect(
       browserBridgeFailureContext({ exitCode: 3, stdout: result.output }),
     ).toMatchObject({
-      capture_bridge_diagnostic_version: 4,
+      capture_bridge_diagnostic_version: 5,
       capture_bridge_nonframe_message_count: count,
       capture_bridge_status_message_connected: connected,
+      capture_bridge_status_message_screencasting: screencasting,
     });
     expect(result.output.length).toBeLessThanOrEqual(128);
-    expect(result.output).not.toMatch(/PRIVATE|url|connected/);
+    expect(result.output).not.toMatch(
+      /PRIVATE|url|9223|connected|screencasting/,
+    );
   },
 );
 
-it("keeps the latest status after the count reaches its cap", () => {
-  const result = frameMessages([
-    status(true),
-    ...Array(18).fill(other),
-    status(false),
-  ]);
-  expect(result.exitCode).toBe(3);
-  expect(result.receipt.bridge_failure.slice(4)).toEqual([16, "false"]);
-});
+it.each([
+  // An omitted field resets to other instead of keeping an earlier claim.
+  [
+    [status(true, true), ...Array(18).fill(other), status(true)],
+    "true",
+    "other",
+  ],
+  [
+    [status(true, false), ...Array(18).fill(other), status(true, true)],
+    "true",
+    "true",
+  ],
+  [
+    [status("false", true), ...Array(18).fill(other), status(true, false)],
+    "true",
+    "false",
+  ],
+])(
+  "keeps only the latest status claims after the count reaches its cap (%#)",
+  (messages, connected, screencasting) => {
+    const result = frameMessages(messages);
+    expect(result.exitCode).toBe(3);
+    expect(result.receipt.bridge_failure.slice(4)).toEqual([
+      16,
+      connected,
+      screencasting,
+    ]);
+    expect(result.output.length).toBeLessThanOrEqual(128);
+  },
+);
 
-it("returns a later frame with its producer age instead of a status summary", () => {
-  const timestamp = Date.now() - 60_000;
-  const result = frameMessages(
+it.each([
+  ["a connected status", [status(true, false), other]],
+  ["an omitted claim", [status()]],
+  ["a non-boolean claim", [status("false")]],
+  ["no status", [other]],
+])(
+  "returns a later frame with its producer age after %s",
+  (_case, messages) => {
+    const timestamp = Date.now() - 60_000;
+    const result = frameMessages(
+      [
+        ...messages,
+        JSON.stringify({
+          type: "frame",
+          data: "image",
+          metadata: { deviceWidth: 800, deviceHeight: 600, timestamp },
+        }),
+      ],
+      false,
+    );
+    expect(result).toEqual({
+      exitCode: 0,
+      output: expect.any(String),
+      receipt: {
+        data: "image",
+        width: 800,
+        height: 600,
+        capturedAt: timestamp,
+      },
+      watchdogPending: false,
+    });
+  },
+);
+
+// The stream_status admission, relay and handoff checks already treat this
+// daemon claim as closed; a frame request must not wait out its watchdog.
+it.each([
+  ["reported disconnected", [status(false)]],
+  ["claimed screencasting while disconnected", [status(false, true)]],
+  ["reported disconnected after other messages", [other, status(false, false)]],
+  [
+    "reported disconnected after a connected status",
+    [status(true, true), status(false, false)],
+  ],
+  [
+    "reported disconnected before a frame",
     [
-      status(false),
-      other,
+      status(false, false),
       JSON.stringify({
         type: "frame",
-        data: "image",
-        metadata: { deviceWidth: 800, deviceHeight: 600, timestamp },
+        data: "PRIVATE_FRAME",
+        metadata: { deviceWidth: 800, deviceHeight: 600, timestamp: 1 },
       }),
     ],
-    false,
-  );
-  expect(result).toEqual({
+  ],
+])(
+  "ends a frame request as closed before its watchdog when the daemon %s",
+  (_case, messages) => {
+    // Late status, frame and close events follow and cannot replace exit 7.
+    expect(frameMessages(messages, false)).toEqual({
+      exitCode: 7,
+      output: "",
+      receipt: null,
+      watchdogPending: false,
+    });
+  },
+);
+
+it("keeps the frame watchdog pending after a status without a strict false claim", () => {
+  for (const messages of [
+    [status(true, false)],
+    [status()],
+    [status("false")],
+    [status(0)],
+    [JSON.stringify({ type: "PRIVATE_TYPE", connected: false })],
+  ])
+    expect(frameMessages(messages)).toMatchObject({
+      exitCode: 3,
+      watchdogPending: true,
+    });
+});
+
+it("keeps input mode independent of daemon status messages", () => {
+  const listeners = new Map<string, (value?: unknown) => void>();
+  const timers = new Map<number, () => void>();
+  const stdin = new Map<string, (value?: unknown) => void>();
+  const sent: string[] = [];
+  let nextTimer = 0;
+  let output = "";
+  let exitCode: number | undefined;
+  runInNewContext(BROWSER_BRIDGE_PROGRAM, {
+    WebSocket: class {
+      addEventListener(name: string, listener: (value?: unknown) => void) {
+        listeners.set(name, listener);
+      }
+      send(value: string) {
+        sent.push(value);
+      }
+      close() {}
+    },
+    process: {
+      argv: ["node", "1234", "input"],
+      stdin: {
+        setEncoding() {},
+        on: (name: string, listener: (value?: unknown) => void) =>
+          stdin.set(name, listener),
+      },
+      stdout: {
+        write: (value: string) => {
+          output += value;
+        },
+      },
+      exit: (value: number) => {
+        exitCode ??= value;
+      },
+    },
+    setTimeout: (callback: () => void) => {
+      timers.set(++nextTimer, callback);
+      return nextTimer;
+    },
+    clearTimeout: (id: number) => timers.delete(id),
+  });
+  stdin.get("data")!(JSON.stringify([{ type: "input_keyboard", key: "a" }]));
+  stdin.get("end")!();
+  listeners.get("open")!();
+  listeners.get("message")!({ data: status(false, false) });
+  // The 120ms send-drain timer (2) precedes the watchdog (1) and then exits.
+  timers.get(2)!();
+  for (const callback of timers.values()) callback();
+  expect(sent).toEqual([JSON.stringify({ type: "input_keyboard", key: "a" })]);
+  expect({ exitCode, output }).toEqual({
     exitCode: 0,
-    output: expect.any(String),
-    receipt: { data: "image", width: 800, height: 600, capturedAt: timestamp },
+    output: JSON.stringify({ ok: true }),
   });
 });
 
 it.each(["PRIVATE not json", "null"])(
   "keeps exit5 for an unreadable daemon message after a status: %p",
   (data) => {
-    expect(frameMessages([status(false), data], false)).toEqual({
+    expect(frameMessages([status(true), data], false)).toEqual({
       exitCode: 5,
       output: "",
       receipt: null,
+      watchdogPending: false,
     });
   },
 );
@@ -519,6 +774,40 @@ it.each([
   [3, [4, "deadline", "connecting", "none", 1, "not_observed"]],
   [3, [4, "deadline", "awaiting_frame", "none", 0, "false"]],
   [3, [4, "deadline", "awaiting_frame", "none", 2, "true"]],
+  [3, [4, "deadline", "message_received", "none", 1, "true", "true"]],
+  // v5 adds exactly one closed screencasting claim paired with connected.
+  [6, [5, "deadline", "message_received", "none", 1, "true", "true"]],
+  [2, [5, "deadline", "message_received", "none", 1, "true", "true"]],
+  [3, ["5", "deadline", "message_received", "none", 1, "true", "true"]],
+  [3, [5, "deadline", "message_received", "none", 1, "true"]],
+  [3, [5, "deadline", "message_received", "none", 1, "true", "true", "true"]],
+  [3, [5, "error", "message_received", "none", 1, "true", "true"]],
+  [3, [5, "deadline", "PRIVATE", "none", 1, "true", "true"]],
+  [3, [5, "deadline", "message_received", 1006, 1, "true", "true"]],
+  [3, [5, "deadline", "message_received", "none", 17, "true", "true"]],
+  [3, [5, "deadline", "message_received", "none", 1.5, "true", "true"]],
+  [3, [5, "deadline", "message_received", "none", 1, "PRIVATE", "true"]],
+  [3, [5, "deadline", "message_received", "none", 1, "true", "PRIVATE"]],
+  [3, [5, "deadline", "message_received", "none", 1, "true", true]],
+  [3, [5, "deadline", "message_received", "none", 1, "true", "TRUE"]],
+  [3, [5, "deadline", "message_received", "none", 1, "true", null]],
+  [3, [5, "deadline", "message_received", "none", 1, "true", "not_observed"]],
+  [3, [5, "deadline", "message_received", "none", 1, "not_observed", "false"]],
+  [
+    3,
+    [
+      5,
+      "deadline",
+      "message_received",
+      "none",
+      0,
+      "not_observed",
+      "not_observed",
+    ],
+  ],
+  [3, [5, "deadline", "connecting", "none", 1, "not_observed", "not_observed"]],
+  [3, [5, "deadline", "awaiting_frame", "none", 0, "not_observed", "true"]],
+  [3, [5, "deadline", "awaiting_frame", "none", 0, "false", "false"]],
 ])(
   "keeps watchdog metadata tied to its exact exit and finite packet (%#)",
   (exitCode, tuple) => {

@@ -8,6 +8,7 @@ import { browserSessionCommand } from "@/lib/ai/tools/utils/browser-session-prog
 import { buildSandboxCommandOptions } from "@/lib/ai/tools/utils/sandbox-command-options";
 import { checkpointCloudErrorContext } from "@/lib/ai/tools/utils/persistence-failure";
 import {
+  BROWSER_BRIDGE_CLOSED_EXIT,
   browserBridgeCommand,
   browserBridgeFailureContext,
   type BrowserBridgeFailureContext,
@@ -19,9 +20,11 @@ import {
   BROWSER_WRAPPER_AGES,
   BROWSER_OPEN_IDLE_ENV_VALUES,
   BROWSER_DAEMON_DEADLINE_PHASES,
+  BROWSER_DAEMON_RESPONSE_VALIDATIONS,
   BROWSER_CLI_AT_PREPARE_STATUSES,
   BROWSER_WRAPPER_PROCESS_VISIBILITIES,
   BROWSER_OPEN_SOCKET_RETURN_STATUSES,
+  BROWSER_OPEN_INFO_FLAGS,
   BROWSER_WRAPPER_COMMAND_CLASSES,
   BROWSER_DAEMON_VERSION_FILE_STATUSES,
 } from "./daemon-program";
@@ -230,6 +233,15 @@ function ownResultValue(result: unknown, key: "exitCode" | "stdout") {
   if (descriptor && !("value" in descriptor))
     throw new TypeError("Unreadable command result");
   return descriptor?.value as unknown;
+}
+
+/** Only an own numeric exit counts; accessors or unreadable results never do. */
+function bridgeReportedClosed(result: unknown) {
+  try {
+    return ownResultValue(result, "exitCode") === BROWSER_BRIDGE_CLOSED_EXIT;
+  } catch {
+    return false;
+  }
 }
 
 /** Record only this stop invocation's bounded receipt; never throws. */
@@ -643,6 +655,10 @@ export type BrowserCaptureFailureContext = FrameCaptureDiagnostic & {
     "missing" | "permission" | "not_directory" | "other";
   capture_deadline_diagnostic_version?: 1;
   capture_deadline_phase?: (typeof BROWSER_DAEMON_DEADLINE_PHASES)[number];
+  // Daemon exit5 only: which check refused the first response line, not a cause.
+  // Absent means unmeasured (older writer or budget).
+  capture_response_diagnostic_version?: 1;
+  capture_response_validation?: (typeof BROWSER_DAEMON_RESPONSE_VALIDATIONS)[number];
   capture_cli_at_prepare_diagnostic_version?: 1;
   capture_cli_at_prepare_status?: (typeof BROWSER_CLI_AT_PREPARE_STATUSES)[number];
   capture_cli_at_prepare_major?: number;
@@ -689,6 +705,10 @@ export type BrowserCaptureFailureContext = FrameCaptureDiagnostic & {
   // Absent means unmeasured (older writer or budget), never missing.
   capture_open_socket_return_version?: 1;
   capture_open_socket_return_status?: (typeof BROWSER_OPEN_SOCKET_RETURN_STATUSES)[number];
+  // Exact help/version tokens declared in that matching OPEN's arguments; not
+  // its effective CLI result or daemon state. Absent means unmeasured, never none.
+  capture_open_info_version?: 1;
+  capture_open_info_flags?: (typeof BROWSER_OPEN_INFO_FLAGS)[number];
   // The selected daemon's .version sidecar declaration beside that matching OPEN's
   // socket; not a verified daemon version, identity or health. Absent is unmeasured.
   capture_daemon_version_file_version?: 1;
@@ -740,7 +760,9 @@ export async function captureBrowserFrame(
     );
     if (result.exitCode !== 0) {
       returnedBridgeFailure = result;
-      throw new BrowserPreviewUnavailable("disconnected");
+      throw new BrowserPreviewUnavailable(
+        bridgeReportedClosed(result) ? "closed" : "disconnected",
+      );
     }
     let frame: {
       data: string;
@@ -869,6 +891,8 @@ export async function captureBrowserFrame(
         | "capture_wrapper_option_prefix_completed"
         | "capture_deadline_diagnostic_version"
         | "capture_deadline_phase"
+        | "capture_response_diagnostic_version"
+        | "capture_response_validation"
         | "capture_cli_at_prepare_diagnostic_version"
         | "capture_cli_at_prepare_status"
         | "capture_cli_at_prepare_major"
@@ -887,6 +911,8 @@ export async function captureBrowserFrame(
         | "capture_daemon_process_visibility"
         | "capture_open_socket_return_version"
         | "capture_open_socket_return_status"
+        | "capture_open_info_version"
+        | "capture_open_info_flags"
         | "capture_daemon_version_file_version"
         | "capture_daemon_version_file_status"
         | "capture_daemon_version_file_major"
@@ -968,6 +994,20 @@ export async function captureBrowserFrame(
               ) {
                 precondition.capture_deadline_diagnostic_version = 1;
                 precondition.capture_deadline_phase = deadline[1];
+              }
+              const validation = parsed?.r1;
+              if (
+                code === 5 &&
+                Array.isArray(validation) &&
+                validation.length === 2 &&
+                validation[0] === 1 &&
+                Number.isInteger(validation[1]) &&
+                validation[1] >= 0 &&
+                validation[1] < BROWSER_DAEMON_RESPONSE_VALIDATIONS.length
+              ) {
+                precondition.capture_response_diagnostic_version = 1;
+                precondition.capture_response_validation =
+                  BROWSER_DAEMON_RESPONSE_VALIDATIONS[validation[1]];
               }
               const reason = parsed?.diagnostic_reason;
               if (
@@ -1119,6 +1159,20 @@ export async function captureBrowserFrame(
                 precondition.capture_open_socket_return_status =
                   BROWSER_OPEN_SOCKET_RETURN_STATUSES[openSocket];
               }
+              const openInfo = parsed?.o1;
+              if (
+                precondition.capture_open_receipt_status === "recorded" &&
+                precondition.capture_open_phase === "completed" &&
+                precondition.capture_open_exit_code === 0 &&
+                precondition.capture_open_session_matches === true &&
+                Number.isInteger(openInfo) &&
+                openInfo >= 0 &&
+                openInfo < BROWSER_OPEN_INFO_FLAGS.length
+              ) {
+                precondition.capture_open_info_version = 1;
+                precondition.capture_open_info_flags =
+                  BROWSER_OPEN_INFO_FLAGS[openInfo];
+              }
               const daemonVersion = parsed?.dv;
               if (
                 precondition.capture_open_receipt_status === "recorded" &&
@@ -1243,6 +1297,19 @@ export async function captureBrowserFrame(
         /* Observers cannot change capture behavior. */
       }
     }
+    // The observer above keeps the SDK's exit; callers get the closed state.
+    let closed = false;
+    try {
+      closed =
+        stage === "frame_bridge" &&
+        error instanceof CommandExitError &&
+        bridgeReportedClosed(
+          Object.getOwnPropertyDescriptor(error, "result")?.value,
+        );
+    } catch {
+      /* An unreadable SDK error keeps its original rejection. */
+    }
+    if (closed) throw new BrowserPreviewUnavailable("closed");
     throw error;
   }
 }

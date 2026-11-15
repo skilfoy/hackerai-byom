@@ -41,6 +41,10 @@ import {
   agentRetestOutcomeValidator,
 } from "./findingAgentRetestValidators";
 import {
+  huntEnvironmentValidator,
+  huntStoredCandidateValidator,
+} from "./findingHuntValidators";
+import {
   researchCohortReportValidator,
   researchCoverageValidator,
   researchRunStatusValidator,
@@ -867,6 +871,35 @@ export default defineSchema({
     .index("by_user_and_started", ["user_id", "started_at"])
     .index("by_user_and_chat", ["user_id", "chat_id"]),
 
+  // One Agent hunt for surfaces sharing a finding's root cause. Provenance is
+  // server-supplied. Candidates are saved one at a time, are immutable, and are
+  // never findings; the seed finding is never changed.
+  finding_variant_hunts: defineTable({
+    user_id: v.string(),
+    chat_id: v.string(),
+    finding_id: v.string(),
+    assistant_message_id: v.string(),
+    // The active run that started this hunt: a Trigger run, or the chat's
+    // resumable stream for web Agent requests. Used to detect interruption.
+    trigger_run_id: v.optional(v.string()),
+    stream_id: v.optional(v.string()),
+    finding_updated_at: v.number(),
+    target: v.string(),
+    started_at: v.number(),
+    status: v.union(v.literal("running"), v.literal("finished")),
+    finished_at: v.optional(v.number()),
+    interrupted: v.optional(v.boolean()),
+    candidates: v.array(huntStoredCandidateValidator),
+    summary: v.optional(v.string()),
+    limitations: v.optional(v.array(v.string())),
+    environment: v.optional(huntEnvironmentValidator),
+    result_key: v.optional(v.string()),
+  })
+    .index("by_finding_and_started", ["finding_id", "started_at"])
+    .index("by_finding_and_message", ["finding_id", "assistant_message_id"])
+    .index("by_user_and_started", ["user_id", "started_at"])
+    .index("by_user_and_chat", ["user_id", "chat_id"]),
+
   // Legacy executable HTTP retest data from Preview. Hidden and read-only:
   // retained only so existing rows validate and are removed by deletion.
   finding_retest_recipes: defineTable({
@@ -1539,8 +1572,39 @@ export default defineSchema({
     tags: v.array(v.string()),
     tokens: v.number(),
     updated_at: v.number(),
+    // Relevant recall metadata. Legacy rows omit all four and stay unscoped.
+    // Normalized exact host, origin or `label:` engagement label.
+    target: v.optional(v.string()),
+    // Derived from the authenticated source chat, never from model input.
+    project_id: v.optional(v.id("projects")),
+    // When the noted behavior was actually observed; distinct from edits.
+    observed_at: v.optional(v.number()),
+    recheck_after: v.optional(v.number()),
+    // Bounded title, tags and label words for recall keyword matching.
+    // Written by every note write; legacy rows are filled by noteMigrations.
+    search_metadata: v.optional(v.string()),
   })
     .index("by_note_id", ["note_id"])
+    .index("by_user_and_target_and_updated", [
+      "user_id",
+      "target",
+      "updated_at",
+    ])
+    // Recall reads each scope (unprojected, current project) separately so
+    // newer notes from other projects cannot crowd out eligible ones.
+    .index("by_user_and_project_and_target_and_updated", [
+      "user_id",
+      "project_id",
+      "target",
+      "updated_at",
+    ])
+    .index("by_user_and_project_and_target_and_category_and_updated", [
+      "user_id",
+      "project_id",
+      "target",
+      "category",
+      "updated_at",
+    ])
     .index("by_user_and_category", ["user_id", "category"])
     .index("by_user_and_category_and_updated", [
       "user_id",
@@ -1550,7 +1614,11 @@ export default defineSchema({
     .index("by_user_and_updated", ["user_id", "updated_at"])
     .searchIndex("search_notes", {
       searchField: "content",
-      filterFields: ["user_id", "category"],
+      filterFields: ["user_id", "category", "project_id"],
+    })
+    .searchIndex("search_note_metadata", {
+      searchField: "search_metadata",
+      filterFields: ["user_id", "project_id"],
     }),
 
   // Local Sandbox Tables
@@ -1584,6 +1652,10 @@ export default defineSchema({
     connection_name: v.string(),
     container_id: v.optional(v.string()),
     client_version: v.string(),
+    // Set by the authenticated registration entry point, never by the client.
+    registration_origin: v.optional(
+      v.union(v.literal("runner"), v.literal("desktop")),
+    ),
     // Keep accepting legacy cloud rows until production data has been purged.
     // No current writer creates them, and connection queries exclude them.
     mode: v.union(
@@ -2236,14 +2308,36 @@ export default defineSchema({
   // Webhook idempotency (prevents double-crediting on Stripe retries)
   processed_webhooks: defineTable({
     event_id: v.string(),
+    // Fraud source IDs let support resolution fence an in-flight delivery.
+    source_id: v.optional(v.string()),
     processed_at: v.number(),
-    // State-machine fields for atomic claim/finalize. Optional for
+    // State-machine fields for atomic claim/handled/finalize. Optional for
     // backwards compatibility — legacy rows (no status) are treated as
     // completed since they were inserted under the old "mark on entry"
     // semantics for events whose lifecycle has already concluded.
-    status: v.optional(v.union(v.literal("pending"), v.literal("completed"))),
+    status: v.optional(
+      v.union(
+        v.literal("pending"),
+        v.literal("cleanup_started"),
+        v.literal("review_required"),
+        v.literal("handled"),
+        v.literal("completed"),
+      ),
+    ),
     claimed_at: v.optional(v.number()),
-  }).index("by_event_id", ["event_id"]),
+    claim_token: v.optional(v.string()),
+    review_reason: v.optional(v.string()),
+    review_customer_id: v.optional(v.string()),
+    review_resolution: v.optional(v.string()),
+    reviewed_by: v.optional(v.string()),
+    reviewed_at: v.optional(v.number()),
+  })
+    .index("by_event_id", ["event_id"])
+    .index("by_status", ["status"])
+    .index("by_status_and_processed_at", ["status", "processed_at"])
+    .index("by_review_customer_id_and_status", ["review_customer_id", "status"])
+    .index("by_source_id_and_status", ["source_id", "status"])
+    .index("by_source_status_event_id", ["source_id", "status", "event_id"]),
 
   // Durable idempotency records for user-visible checkout session confirms.
   // Unlike webhook retry deduplication, these keys must not be time-purged

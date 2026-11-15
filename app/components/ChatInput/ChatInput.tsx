@@ -70,7 +70,6 @@ import {
   reconnectOnlineStatus,
   useOnlineStatus,
 } from "@/app/hooks/useOnlineStatus";
-import { requestRemoteConnectionSelection } from "@/app/hooks/useAutoSelectNewRemoteConnection";
 import { isDesktopPreference } from "@/lib/sandbox/environment";
 import { WifiOff } from "lucide-react";
 import { GoalTargetIcon } from "@/components/icons/goal-target";
@@ -852,7 +851,6 @@ const ChatInputContent = ({
   // 1. Requires a connected local sandbox — Desktop may use either its
   //    built-in bridge or a separately connected local runner
   // 2. Force local sandbox preference (not e2b)
-  // 3. Force auto model selection
   const isFreeAgent =
     !!user &&
     !isCheckingProPlan &&
@@ -1422,7 +1420,6 @@ const ChatInputContent = ({
                 onReconnect={() => {
                   if (selectedNativeDesktop) retryDesktopBridge();
                   else {
-                    requestRemoteConnectionSelection(sandboxPreference);
                     openSettingsDialog("Remote Control");
                   }
                 }}

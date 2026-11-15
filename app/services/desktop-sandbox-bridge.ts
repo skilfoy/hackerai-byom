@@ -13,19 +13,54 @@ import {
   DesktopFileBridgeError,
   getDesktopFileFailure,
   type DesktopFileFailure,
+  type DesktopFileReceiverAdapter,
+  type DesktopFileReceiverDiagnostic,
+  type DesktopFileReceiverStage,
+  type DesktopNativeVersionLookup,
 } from "@/lib/centrifugo/desktop-file-errors";
 import { DesktopAckTelemetry } from "@/lib/analytics/desktop-ack";
 import {
+  nativeAuthorizationCauseDiagnostic,
+  nativeAuthorizationConnectorDiagnostic,
   nativeAuthorizationDiagnostic,
+  nativeAuthorizationIoDiagnostic,
+  nativeAuthorizationMitigationDiagnostic,
+  nativeAuthorizationResponseDiagnostic,
+  nativeAuthorizationTransportDiagnostic,
+  parseNativeAuthorizationResponseMitigation,
+  parseNativeAuthorizationResponseReceipt,
+  parseNativeAuthorizationSendCause,
+  parseNativeAuthorizationSendConnector,
+  parseNativeAuthorizationSendIo,
   parseNativeAuthorizationSendReceipt,
+  parseNativeAuthorizationSendTransport,
+  type NativeAuthorizationResponseMitigation,
+  type NativeAuthorizationResponseReceipt,
+  type NativeAuthorizationSendCause,
+  type NativeAuthorizationSendConnector,
+  type NativeAuthorizationSendIo,
   type NativeAuthorizationSendReceipt,
+  type NativeAuthorizationSendTransport,
 } from "@/lib/analytics/native-authorization-diagnostics";
 import {
   isDesktopAckStopSource,
   type DesktopAckStopSource,
 } from "@/lib/analytics/desktop-ack-privacy";
+import {
+  classifyNativeTerminalError,
+  desktopTerminalErrorDiagnostic,
+  type DesktopTerminalErrorKind,
+} from "@/lib/analytics/desktop-terminal-error-diagnostics";
 import { DesktopRelayTelemetry } from "@/lib/analytics/desktop-relay";
+import { captureDesktopOperationReadinessFailure } from "@/lib/analytics/desktop-operation-readiness";
 import { isUnauthenticatedConvexError } from "@/lib/auth/expected-auth-errors";
+import {
+  readClosedConvexAuthProviderState,
+  readClosedConvexAuthTokenDecision,
+  readConvexAuthTokenDecision,
+  type ClosedConvexAuthTokenDecision,
+  type ConvexAuthProviderState,
+} from "@/lib/auth/convex-auth-diagnostics";
 import {
   sandboxConnectionChannel,
   DESKTOP_COMMAND_DELIVERY_GRACE_MS,
@@ -129,6 +164,35 @@ function usesPublishedLegacyDesktopCommands(version: string): boolean {
   const patch = Number(match[1]);
   // 0.0.0 is an unversioned development build, not a published legacy binary.
   return patch >= 1 && patch <= 72;
+}
+
+/** Distinguishes the 500ms deadline from a native lookup resolving undefined. */
+const NATIVE_VERSION_LOOKUP_TIMED_OUT = Symbol("native version lookup timeout");
+
+/**
+ * One file_stat invocation's last attempted boundary and selected adapter, with
+ * the version lookup outcome read alongside that selection.
+ * Callers that pass none record into a discarded object.
+ */
+interface FileStatReceiverTrace {
+  stage?: DesktopFileReceiverStage;
+  adapter?: DesktopFileReceiverAdapter;
+  nativeVersionLookup?: DesktopNativeVersionLookup;
+}
+
+function fileStatReceiverDiagnostic(
+  trace: FileStatReceiverTrace,
+): DesktopFileReceiverDiagnostic | undefined {
+  return trace.stage && trace.adapter
+    ? {
+        version: 1,
+        stage: trace.stage,
+        adapter: trace.adapter,
+        ...(trace.nativeVersionLookup && {
+          nativeVersionLookup: trace.nativeVersionLookup,
+        }),
+      }
+    : undefined;
 }
 
 /** Recognize browser transport failures without swallowing native filesystem errors. */
@@ -249,20 +313,116 @@ function isTargetedIncomingMessage(
   );
 }
 
-// Join an existing auth-stop event to its backend failure without copying error
-// text. SDK formats may change; missing/malformed markers simply omit the ID.
+/**
+ * Committed foreground WorkOS user presence plus Convex SDK auth readiness.
+ * This is telemetry context only, not proof of the backend principal or token.
+ */
+export type NativeAuthFrontendState =
+  | "owner_absent"
+  | "owner_present_convex_loading"
+  | "owner_present_convex_authenticated"
+  | "owner_present_convex_unauthenticated"
+  | "unavailable";
+
+const NATIVE_AUTH_FRONTEND_STATES: readonly NativeAuthFrontendState[] = [
+  "owner_absent",
+  "owner_present_convex_loading",
+  "owner_present_convex_authenticated",
+  "owner_present_convex_unauthenticated",
+  "unavailable",
+];
+
+// Only a known closed value may reach analytics; anything else is unavailable.
+function readNativeAuthFrontendState(
+  read: (() => NativeAuthFrontendState) | undefined,
+): NativeAuthFrontendState {
+  try {
+    const state: unknown = read?.();
+    return (
+      NATIVE_AUTH_FRONTEND_STATES.find((known) => known === state) ??
+      "unavailable"
+    );
+  } catch {
+    return "unavailable";
+  }
+}
+
+// State read immediately before the app invokes one registration, heartbeat or
+// token callback. This is app-level callback invocation, not network dispatch:
+// Convex may queue the mutation, so it does not prove what the backend saw or
+// why it failed.
+type NativeAuthInvocation = {
+  convexFunction:
+    | "localSandbox:connectDesktop"
+    | "localSandbox:heartbeatDesktop"
+    | "localSandbox:refreshCentrifugoTokenDesktop";
+  frontendState: NativeAuthFrontendState;
+  providerState: ConvexAuthProviderState;
+  tokenDecision: ClosedConvexAuthTokenDecision;
+};
+
+// The committed provider's latest token attempt is telemetry context only: it
+// does not identify the token a heartbeat/token callback actually carried.
+function readNativeAuthTokenDecision(
+  read: (() => unknown) | undefined,
+): ClosedConvexAuthTokenDecision {
+  return readClosedConvexAuthTokenDecision(read ?? readConvexAuthTokenDecision);
+}
+
+// Join an existing auth-stop (or registration rejection) event to its backend
+// failure without copying error text. SDK formats may change; missing or
+// malformed markers simply omit the ID.
 function nativeAuthDiagnostics(
   error: unknown,
-  convexFunction:
-    | "localSandbox:heartbeatDesktop"
-    | "localSandbox:refreshCentrifugoTokenDesktop",
+  {
+    convexFunction,
+    frontendState,
+    providerState,
+    tokenDecision,
+  }: NativeAuthInvocation,
+  {
+    readNativeAuthFrontendState: readFrontendState,
+    readNativeAuthProviderState: readProviderState,
+    readNativeAuthTokenDecision: readTokenDecision,
+  }: NativeAuthStateReaders,
 ): Record<string, string | number> {
+  const stopTokenDecision = readNativeAuthTokenDecision(readTokenDecision);
   const diagnostics: Record<string, string | number> = {
     native_auth_diagnostic_version: 1,
     // Distinguish this pending-heartbeat guard from older loaded bridges.
     // This identifies the heartbeat policy, not the native binary or build.
     heartbeat_backpressure_version: 1,
     convex_function: convexFunction,
+    // Read at the stop; compare with the invocation value to separate state
+    // present when the callback was invoked from a later transition.
+    native_auth_frontend_state: readNativeAuthFrontendState(readFrontendState),
+    native_auth_request_state_version: 1,
+    native_auth_request_frontend_state: frontendState,
+    // Which provider boolean (AuthKit loading and/or our token recovery) held
+    // Convex in loading, at invocation and again at the stop.
+    native_auth_provider_state_version: 1,
+    native_auth_request_provider_state: providerState,
+    native_auth_provider_state:
+      readClosedConvexAuthProviderState(readProviderState),
+    // The provider's latest token attempt at invocation and again at the stop.
+    // "same" means the invocation's attempt was still the latest at the stop.
+    native_auth_token_decision_version: 1,
+    native_auth_request_token_mode: tokenDecision.mode,
+    native_auth_request_token_outcome: tokenDecision.outcome,
+    native_auth_request_token_result: tokenDecision.result,
+    native_auth_request_token_age: tokenDecision.age,
+    native_auth_request_token_context: tokenDecision.context,
+    native_auth_token_mode: stopTokenDecision.mode,
+    native_auth_token_outcome: stopTokenDecision.outcome,
+    native_auth_token_result: stopTokenDecision.result,
+    native_auth_token_age: stopTokenDecision.age,
+    native_auth_token_context: stopTokenDecision.context,
+    native_auth_token_attempt:
+      tokenDecision.attempt && stopTokenDecision.attempt
+        ? tokenDecision.attempt === stopTokenDecision.attempt
+          ? "same"
+          : "changed"
+        : "unavailable",
   };
   try {
     const message = error instanceof Error ? error.message : undefined;
@@ -271,7 +431,7 @@ function nativeAuthDiagnostics(
         ? message
             .slice(0, 512)
             .match(
-              /^\[CONVEX M\((localSandbox:(?:heartbeatDesktop|refreshCentrifugoTokenDesktop))\)\] \[Request ID: ([a-f0-9]{16})\]/,
+              /^\[CONVEX M\((localSandbox:(?:connectDesktop|heartbeatDesktop|refreshCentrifugoTokenDesktop))\)\] \[Request ID: ([a-f0-9]{16})\]/,
             )
         : null;
     if (match?.[1] === convexFunction) diagnostics.convex_request_id = match[2];
@@ -319,7 +479,20 @@ interface DesktopBridgeConfig {
     environmentId?: string,
   ) => void;
   onTerminated?: (reason: DesktopBridgeTerminationReason) => void;
+  // Read before each registration/heartbeat/token callback invocation and again
+  // at its catch; reported only for that callback's authentication failure.
+  readNativeAuthFrontendState?: () => NativeAuthFrontendState;
+  readNativeAuthProviderState?: () => ConvexAuthProviderState;
+  // Defaults to the committed provider's module state; injectable for tests.
+  readNativeAuthTokenDecision?: () => unknown;
 }
+
+type NativeAuthStateReaders = Pick<
+  DesktopBridgeConfig,
+  | "readNativeAuthFrontendState"
+  | "readNativeAuthProviderState"
+  | "readNativeAuthTokenDecision"
+>;
 
 export class DesktopSandboxBridge {
   private environmentId?: string;
@@ -345,6 +518,8 @@ export class DesktopSandboxBridge {
   private nativeFileIpcAvailable: boolean | null = null;
   private nativeFileIpcFailure: DesktopFileFailure | undefined;
   private nativeAppVersion = "unknown";
+  // Always assigned together with nativeAppVersion.
+  private nativeVersionLookup: DesktopNativeVersionLookup = "unobserved";
   private nativePlatform = "unknown";
 
   private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
@@ -396,6 +571,25 @@ export class DesktopSandboxBridge {
     );
   }
 
+  // Call immediately before invoking the callback; each pending call keeps its
+  // own value so a later invocation or transition cannot overwrite it.
+  private nativeAuthInvocation(
+    convexFunction: NativeAuthInvocation["convexFunction"],
+  ): NativeAuthInvocation {
+    return {
+      convexFunction,
+      frontendState: readNativeAuthFrontendState(
+        this.config.readNativeAuthFrontendState,
+      ),
+      providerState: readClosedConvexAuthProviderState(
+        this.config.readNativeAuthProviderState,
+      ),
+      tokenDecision: readNativeAuthTokenDecision(
+        this.config.readNativeAuthTokenDecision,
+      ),
+    };
+  }
+
   private async sendHeartbeat(): Promise<void> {
     const connectionId = this.connectionId;
     const generation = this.startupGeneration;
@@ -409,6 +603,7 @@ export class DesktopSandboxBridge {
     // Convex queues unresolved mutations across disconnects. Keep the timer from
     // building a heartbeat backlog while the current request is still pending.
     this.heartbeatInFlightGeneration = generation;
+    let invocation = this.nativeAuthInvocation("localSandbox:heartbeatDesktop");
     try {
       const result = await this.config.heartbeatDesktop({ connectionId });
       if (
@@ -420,6 +615,10 @@ export class DesktopSandboxBridge {
       if (!result.success) {
         // The legacy heartbeat response has no reason. Resolve it through the
         // existing token endpoint so a displaced session cannot kick its replacement.
+        // An auth failure here belongs to this callback, not the earlier heartbeat.
+        invocation = this.nativeAuthInvocation(
+          "localSandbox:refreshCentrifugoTokenDesktop",
+        );
         const state = await this.config.refreshCentrifugoTokenDesktop({
           connectionId,
         });
@@ -456,7 +655,7 @@ export class DesktopSandboxBridge {
       if (isUnauthenticatedConvexError(error)) {
         this.logRelayState("disconnected", {
           reason: "heartbeat_unauthenticated",
-          ...nativeAuthDiagnostics(error, "localSandbox:heartbeatDesktop"),
+          ...nativeAuthDiagnostics(error, invocation, this.config),
         });
         this.terminateClient("unauthenticated");
         return;
@@ -599,7 +798,9 @@ export class DesktopSandboxBridge {
     if (environmentId) {
       this.config.onConnectionState?.("connecting", environmentId);
     }
-    this.nativeAppVersion = await this.getNativeAppVersion();
+    const nativeVersion = await this.lookupNativeAppVersion();
+    this.nativeAppVersion = nativeVersion.version;
+    this.nativeVersionLookup = nativeVersion.lookup;
     if (wasStopped()) throw new Error("Desktop bridge stopped during startup");
     const osInfo = await this.getOsInfo();
     if (wasStopped()) throw new Error("Desktop bridge stopped during startup");
@@ -614,8 +815,12 @@ export class DesktopSandboxBridge {
     const commandStdin = await this.probeCommandStdin();
     if (wasStopped()) throw new Error("Desktop bridge stopped during startup");
 
-    const { connectionId, centrifugoToken, centrifugoWsUrl } =
-      await this.config.connectDesktop({
+    const registration = this.nativeAuthInvocation(
+      "localSandbox:connectDesktop",
+    );
+    let registered: Awaited<ReturnType<DesktopBridgeConfig["connectDesktop"]>>;
+    try {
+      registered = await this.config.connectDesktop({
         ...(environmentId ? { environmentId } : {}),
         connectionName: osInfo?.hostname || "Desktop",
         osInfo,
@@ -627,6 +832,25 @@ export class DesktopSandboxBridge {
           ...(commandStdin && { commandStdin: true }),
         },
       });
+    } catch (error) {
+      // Observe only: an authentication rejection before any connection ID
+      // exists. The caller still receives this exact error and owns retries.
+      try {
+        if (!wasStopped() && isUnauthenticatedConvexError(error)) {
+          this.logRelayState("error", {
+            source: "registration",
+            errorType: "unauthenticated",
+            native_app_version: this.nativeAppVersion,
+            native_platform: this.nativePlatform,
+            ...nativeAuthDiagnostics(error, registration, this.config),
+          });
+        }
+      } catch {
+        // Diagnostics must not replace the registration error.
+      }
+      throw error;
+    }
+    const { connectionId, centrifugoToken, centrifugoWsUrl } = registered;
 
     if (wasStopped()) {
       // stop() could not see this connection while registration was pending.
@@ -652,6 +876,9 @@ export class DesktopSandboxBridge {
           );
         }
         let result: RefreshTokenResult;
+        const invocation = this.nativeAuthInvocation(
+          "localSandbox:refreshCentrifugoTokenDesktop",
+        );
         try {
           result = await this.config.refreshCentrifugoTokenDesktop({
             connectionId: this.connectionId,
@@ -662,10 +889,7 @@ export class DesktopSandboxBridge {
               connectionId: this.connectionId,
               clientSurface: "desktop_bridge",
               reason: "unauthenticated" as const,
-              ...nativeAuthDiagnostics(
-                error,
-                "localSandbox:refreshCentrifugoTokenDesktop",
-              ),
+              ...nativeAuthDiagnostics(error, invocation, this.config),
             };
             console.warn(
               "[DesktopSandboxBridge] Centrifugo refresh aborted — user not authenticated; stopping client to break retry loop",
@@ -926,6 +1150,23 @@ export class DesktopSandboxBridge {
             );
           });
       },
+      ({ phase, kind, id, rejectionCode }) => {
+        // Only this live router's connection, for this bridge's account.
+        if (
+          this.isStoppingOrStopped ||
+          this.operationRouter !== operationRouter ||
+          this.connectionId !== connectionId
+        )
+          return;
+        captureDesktopOperationReadinessFailure({
+          owner: userId,
+          connectionId,
+          phase,
+          kind,
+          operationId: id,
+          rejectionCode,
+        });
+      },
     );
     this.operationRouter = operationRouter;
     const reassembler = new CentrifugoMessageReassembler();
@@ -992,11 +1233,17 @@ export class DesktopSandboxBridge {
     channelArgs: Record<string, unknown> = {},
     // Optional arguments older authorized binaries ignore; never sent to legacy.
     authorizedOnlyArgs: Record<string, unknown> = {},
+    trace: FileStatReceiverTrace = {},
   ): Promise<T> {
+    trace.stage = "module_load";
     const { invoke } = await import("@tauri-apps/api/core");
+    trace.stage = "native_invoke";
+    trace.nativeVersionLookup = this.nativeVersionLookup;
     if (usesPublishedLegacyDesktopCommands(this.nativeAppVersion)) {
+      trace.adapter = "published_legacy_native";
       return invoke<T>(legacyCommand, { ...legacyArgs, ...channelArgs });
     }
+    trace.adapter = "authorized_native";
     try {
       return await invoke<T>(authorizedCommand, {
         authorizationId: message.authorizationId ?? "",
@@ -1006,28 +1253,44 @@ export class DesktopSandboxBridge {
       });
     } catch (error) {
       if (!nativeCommandMissing(error, authorizedCommand)) throw error;
+      trace.adapter = "compatibility_native";
       return invoke<T>(legacyCommand, { ...legacyArgs, ...channelArgs });
     }
   }
 
-  private async getNativeAppVersion(): Promise<string> {
+  private async lookupNativeAppVersion(): Promise<{
+    version: string;
+    lookup: DesktopNativeVersionLookup;
+  }> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       const version = await Promise.race([
         invoke<unknown>("plugin:app|version"),
-        new Promise<undefined>((resolve) => {
-          timer = setTimeout(() => resolve(undefined), 500);
+        new Promise<typeof NATIVE_VERSION_LOOKUP_TIMED_OUT>((resolve) => {
+          timer = setTimeout(
+            () => resolve(NATIVE_VERSION_LOOKUP_TIMED_OUT),
+            500,
+          );
         }),
       ]);
+      if (version === NATIVE_VERSION_LOOKUP_TIMED_OUT)
+        return { version: "unknown", lookup: "timeout" };
       // Only the native package version, never the fixed browser user agent or
       // arbitrary error text. Diagnostics must not delay or prevent recovery.
-      return typeof version === "string" &&
+      if (
+        typeof version === "string" &&
         /^\d{1,5}\.\d{1,5}\.\d{1,5}$/.test(version)
-        ? version
-        : "unknown";
+      )
+        return {
+          version,
+          lookup: usesPublishedLegacyDesktopCommands(version)
+            ? "resolved_published_legacy"
+            : "resolved_other",
+        };
+      return { version: "unknown", lookup: "invalid" };
     } catch {
-      return "unknown";
+      return { version: "unknown", lookup: "rejected" };
     } finally {
       if (timer) clearTimeout(timer);
     }
@@ -1148,14 +1411,49 @@ export class DesktopSandboxBridge {
       (command.timeout ?? 30_000) +
       DESKTOP_COMMAND_DELIVERY_GRACE_MS;
     let terminalExitCode: number | null = null;
-    // Invocation-local native send receipt: one callback attempt, closed by
-    // settlement, owned by the analytics identity at command start, and joined
-    // only to this invocation's rejection.
+    // Invocation-local native send receipts: one callback attempt per channel,
+    // closed by settlement, owned by the analytics identity at command start,
+    // and joined only to this invocation's rejection. The cause receipt and the
+    // transport detail each have their own channel and latch; no callback
+    // closes another, and both join only the v1 receipt. The response receipt
+    // likewise has its own channel and latch, independent of the send ones, and
+    // the same response's mitigation marker joins only that response receipt.
+    // The IO supplement has its own channel and latch too, and joins only the
+    // v1, cause and transport receipts that describe the same IO error. The
+    // connector snapshot has its own channel and latch and joins only the v1
+    // receipt.
     const { nativeAppVersion } = this;
     const receiptOwner = getIdentifiedAnalyticsUserId();
+    const receiptFenced = () =>
+      this.isStoppingOrStopped ||
+      this.operationRouter !== router ||
+      this.connectionId !== connectionId ||
+      getIdentifiedAnalyticsUserId() !== receiptOwner;
     let receiptOpen = true;
+    let causeOpen = true;
+    let transportOpen = true;
+    let ioOpen = true;
+    let connectorOpen = true;
+    let responseOpen = true;
+    let mitigationOpen = true;
     let sendReceipt: NativeAuthorizationSendReceipt | null = null;
+    let sendCause: NativeAuthorizationSendCause | null = null;
+    let sendTransport: NativeAuthorizationSendTransport | null = null;
+    let sendIo: NativeAuthorizationSendIo | null = null;
+    let sendConnector: NativeAuthorizationSendConnector | null = null;
+    let responseReceipt: NativeAuthorizationResponseReceipt | null = null;
+    let responseMitigation: NativeAuthorizationResponseMitigation | null = null;
     let invocationRejected = false;
+    // The stream keeps only the first terminal it is handed, so the kind
+    // latches with it, synchronously before append can settle. A later
+    // terminal, a fenced callback or settlement itself can never set it.
+    let terminalLatched = false;
+    let terminalErrorKind: DesktopTerminalErrorKind | null = null;
+    const latchTerminal = (errorKind: DesktopTerminalErrorKind | null) => {
+      if (terminalLatched) return;
+      terminalLatched = true;
+      if (errorKind && !receiptFenced()) terminalErrorKind = errorKind;
+    };
     const onSettled = this.ackTelemetry.start({
       connectionId,
       commandId: command.commandId,
@@ -1172,16 +1470,51 @@ export class DesktopSandboxBridge {
         this.connectionId === connectionId,
       (settlement) => {
         receiptOpen = false;
+        causeOpen = false;
+        transportOpen = false;
+        ioOpen = false;
+        connectorOpen = false;
+        responseOpen = false;
+        mitigationOpen = false;
+        terminalLatched = true;
         onSettled(
           {
             ...settlement,
             terminalExitCode,
+            ...(terminalErrorKind && {
+              terminalError: desktopTerminalErrorDiagnostic(terminalErrorKind),
+            }),
             ...(invocationRejected &&
               sendReceipt && {
                 nativeAuthorization: nativeAuthorizationDiagnostic(
                   sendReceipt,
                   nativeAppVersion,
                 ),
+                ...(sendCause && {
+                  nativeAuthorizationCause:
+                    nativeAuthorizationCauseDiagnostic(sendCause),
+                }),
+                ...(sendTransport && {
+                  nativeAuthorizationTransport:
+                    nativeAuthorizationTransportDiagnostic(sendTransport),
+                }),
+                ...(sendIo && {
+                  nativeAuthorizationIo:
+                    nativeAuthorizationIoDiagnostic(sendIo),
+                }),
+                ...(sendConnector && {
+                  nativeAuthorizationConnector:
+                    nativeAuthorizationConnectorDiagnostic(sendConnector),
+                }),
+              }),
+            ...(invocationRejected &&
+              responseReceipt && {
+                nativeAuthorizationResponse:
+                  nativeAuthorizationResponseDiagnostic(responseReceipt),
+                ...(responseMitigation && {
+                  nativeAuthorizationMitigation:
+                    nativeAuthorizationMitigationDiagnostic(responseMitigation),
+                }),
               }),
           },
           this.commandOutputStopSource,
@@ -1192,11 +1525,17 @@ export class DesktopSandboxBridge {
     this.commandDeliveryDeadlines.set(command.commandId, deadline);
     this.activeCommands.add(command.commandId);
     let diagnosticChannel: object | undefined;
+    let causeChannel: object | undefined;
+    let responseChannel: object | undefined;
+    let mitigationChannel: object | undefined;
+    let transportChannel: object | undefined;
+    let ioChannel: object | undefined;
+    let connectorChannel: object | undefined;
     try {
       const { invoke, Channel } = await import("@tauri-apps/api/core");
       // Optional: construction or delivery failure leaves the command unchanged.
       // Published legacy binaries take the legacy command, which has no use for
-      // it, and an unidentified owner could never report it.
+      // them, and an unidentified owner could never report them.
       if (
         receiptOwner &&
         !usesPublishedLegacyDesktopCommands(nativeAppVersion)
@@ -1206,28 +1545,118 @@ export class DesktopSandboxBridge {
           receiptChannel.onmessage = (value) => {
             if (!receiptOpen) return;
             receiptOpen = false;
-            if (
-              this.isStoppingOrStopped ||
-              this.operationRouter !== router ||
-              this.connectionId !== connectionId ||
-              getIdentifiedAnalyticsUserId() !== receiptOwner
-            )
-              return;
+            if (receiptFenced()) return;
             sendReceipt = parseNativeAuthorizationSendReceipt(value);
           };
           diagnosticChannel = receiptChannel;
         } catch {
           diagnosticChannel = undefined;
         }
+        // A cause is only ever reported with the v1 receipt.
+        if (diagnosticChannel) {
+          try {
+            const channel = new Channel<unknown>();
+            channel.onmessage = (value) => {
+              if (!causeOpen) return;
+              causeOpen = false;
+              if (receiptFenced()) return;
+              sendCause = parseNativeAuthorizationSendCause(value);
+            };
+            causeChannel = channel;
+          } catch {
+            causeChannel = undefined;
+          }
+        }
+        // Independent of the send channels: either can fail on its own.
+        try {
+          const channel = new Channel<unknown>();
+          channel.onmessage = (value) => {
+            if (!responseOpen) return;
+            responseOpen = false;
+            if (receiptFenced()) return;
+            responseReceipt = parseNativeAuthorizationResponseReceipt(value);
+          };
+          responseChannel = channel;
+        } catch {
+          responseChannel = undefined;
+        }
+        // A mitigation marker is only ever reported with the response receipt.
+        if (responseChannel) {
+          try {
+            const channel = new Channel<unknown>();
+            channel.onmessage = (value) => {
+              if (!mitigationOpen) return;
+              mitigationOpen = false;
+              if (receiptFenced()) return;
+              responseMitigation =
+                parseNativeAuthorizationResponseMitigation(value);
+            };
+            mitigationChannel = channel;
+          } catch {
+            mitigationChannel = undefined;
+          }
+        }
+        // A transport detail, like the cause, is only ever reported with the
+        // v1 receipt.
+        if (diagnosticChannel) {
+          try {
+            const channel = new Channel<unknown>();
+            channel.onmessage = (value) => {
+              if (!transportOpen) return;
+              transportOpen = false;
+              if (receiptFenced()) return;
+              sendTransport = parseNativeAuthorizationSendTransport(value);
+            };
+            transportChannel = channel;
+          } catch {
+            transportChannel = undefined;
+          }
+        }
+        // An IO supplement only ever refines the transport detail.
+        if (transportChannel) {
+          try {
+            const channel = new Channel<unknown>();
+            channel.onmessage = (value) => {
+              if (!ioOpen) return;
+              ioOpen = false;
+              if (receiptFenced()) return;
+              sendIo = parseNativeAuthorizationSendIo(value);
+            };
+            ioChannel = channel;
+          } catch {
+            ioChannel = undefined;
+          }
+        }
+        // A connector snapshot is only ever reported with the v1 receipt.
+        if (diagnosticChannel) {
+          try {
+            const channel = new Channel<unknown>();
+            channel.onmessage = (value) => {
+              if (!connectorOpen) return;
+              connectorOpen = false;
+              if (receiptFenced()) return;
+              sendConnector = parseNativeAuthorizationSendConnector(value);
+            };
+            connectorChannel = channel;
+          } catch {
+            connectorChannel = undefined;
+          }
+        }
       }
       const channel = new Channel<StreamChunk>();
       channel.onmessage = (chunk) => {
-        if (chunk.type === "exit") terminalExitCode = chunk.exitCode ?? null;
+        if (chunk.type === "exit") {
+          terminalExitCode = chunk.exitCode ?? null;
+          latchTerminal(null);
+        }
+        if (chunk.type === "error")
+          latchTerminal(classifyNativeTerminalError(chunk.message));
         if (shouldForwardStreamChunk(chunk)) stream.append(chunk);
       };
       try {
         if (wasDesktopRunStopped(command.chatId, command.triggerRunId)) {
           terminalExitCode = 130;
+          latchTerminal(null);
           stream.append({ type: "exit", exitCode: 130 });
         } else {
           await this.invokeAuthorizedDesktopOperation(
@@ -1246,13 +1675,32 @@ export class DesktopSandboxBridge {
               timeoutMs: command.timeout ?? 30_000,
             },
             { onEvent: channel },
-            diagnosticChannel
-              ? { onAuthorizationDiagnostic: diagnosticChannel }
-              : {},
+            {
+              ...(diagnosticChannel && {
+                onAuthorizationDiagnostic: diagnosticChannel,
+              }),
+              ...(causeChannel && {
+                onAuthorizationCauseDiagnostic: causeChannel,
+              }),
+              ...(responseChannel && {
+                onAuthorizationResponseDiagnostic: responseChannel,
+              }),
+              ...(mitigationChannel && {
+                onAuthorizationMitigationDiagnostic: mitigationChannel,
+              }),
+              ...(transportChannel && {
+                onAuthorizationTransportDiagnostic: transportChannel,
+              }),
+              ...(ioChannel && { onAuthorizationIoDiagnostic: ioChannel }),
+              ...(connectorChannel && {
+                onAuthorizationConnectorDiagnostic: connectorChannel,
+              }),
+            },
           );
         }
       } catch (error) {
         invocationRejected = true;
+        latchTerminal("invocation_rejected");
         stream.append({
           type: "error",
           message: error instanceof Error ? error.message : String(error),
@@ -1282,15 +1730,25 @@ export class DesktopSandboxBridge {
       }
     } finally {
       stream.stop();
-      // Native apps that ignore the optional argument never end its channel.
-      // Release the callback through the pinned SDK Channel's own method, which
+      // Native apps that ignore an optional argument never end its channel.
+      // Release each callback through the pinned SDK Channel's own method, which
       // its typings mark private; the focused bridge test pins this behavior.
-      try {
-        (
-          diagnosticChannel as { cleanupCallback?: () => void } | undefined
-        )?.cleanupCallback?.();
-      } catch {
-        // Diagnostics must never affect command settlement.
+      for (const optional of [
+        diagnosticChannel,
+        causeChannel,
+        responseChannel,
+        mitigationChannel,
+        transportChannel,
+        ioChannel,
+        connectorChannel,
+      ]) {
+        try {
+          (
+            optional as { cleanupCallback?: () => void } | undefined
+          )?.cleanupCallback?.();
+        } catch {
+          // Diagnostics must never affect command settlement.
+        }
       }
       this.acknowledgedOutputs.delete(command.commandId);
       this.commandDeliveryDeadlines.delete(command.commandId);
@@ -1692,6 +2150,7 @@ export class DesktopSandboxBridge {
     requestId: string,
     error: unknown,
     reply: (message: SandboxMessage) => Promise<void>,
+    receiverDiagnostic?: DesktopFileReceiverDiagnostic,
   ): Promise<void> {
     const fileFailure = getDesktopFileFailure(error);
     await reply({
@@ -1699,6 +2158,7 @@ export class DesktopSandboxBridge {
       requestId,
       message: this.getErrorMessage(error),
       ...(fileFailure !== "unknown" ? { fileFailure } : {}),
+      ...(receiverDiagnostic ? { receiverDiagnostic } : {}),
     });
   }
 
@@ -1725,11 +2185,16 @@ export class DesktopSandboxBridge {
   private async callLegacyLocalFileServer<T>(
     route: string,
     body: Record<string, unknown>,
+    trace: FileStatReceiverTrace = {},
   ): Promise<T> {
+    trace.adapter = "legacy_loopback";
+    trace.stage = "module_load";
     const { invoke } = await import("@tauri-apps/api/core");
+    trace.stage = "loopback_info";
     const info = await invoke<{ port: number; token: string }>(
       "get_cmd_server_info",
     );
+    trace.stage = "loopback_setup";
     if (!info.port || !info.token) {
       throw new DesktopFileBridgeError(
         "legacy_http_rejected",
@@ -1737,6 +2202,7 @@ export class DesktopSandboxBridge {
       );
     }
 
+    trace.stage = "loopback_request";
     const response = await fetch(`http://127.0.0.1:${info.port}${route}`, {
       method: "POST",
       headers: {
@@ -1745,6 +2211,7 @@ export class DesktopSandboxBridge {
       },
       body: JSON.stringify(body),
     });
+    trace.stage = "loopback_response";
     const payload = await response.json().catch(() => null);
     if (!response.ok) {
       throw new DesktopFileBridgeError(
@@ -1837,8 +2304,15 @@ export class DesktopSandboxBridge {
     legacyRoute: string,
     body: Record<string, unknown>,
     message?: { authorizationId?: string },
+    trace: FileStatReceiverTrace = {},
   ): Promise<T> {
     if (this.nativeFileIpcAvailable !== false) {
+      // A module failure here precedes the authorized helper's own selection.
+      trace.stage = "module_load";
+      trace.nativeVersionLookup = this.nativeVersionLookup;
+      trace.adapter = usesPublishedLegacyDesktopCommands(this.nativeAppVersion)
+        ? "published_legacy_native"
+        : "authorized_native";
       const { invoke } = await import("@tauri-apps/api/core");
       try {
         const request = { ...body, type: requestType };
@@ -1849,6 +2323,9 @@ export class DesktopSandboxBridge {
             "authorized_desktop_file_request",
             "desktop_file_request",
             { request },
+            {},
+            {},
+            trace,
           );
         } else if (usesPublishedLegacyDesktopCommands(this.nativeAppVersion)) {
           payload = await invoke<T>("desktop_file_request", { request });
@@ -1900,7 +2377,7 @@ export class DesktopSandboxBridge {
       );
     }
     try {
-      return await this.callLegacyLocalFileServer<T>(legacyRoute, body);
+      return await this.callLegacyLocalFileServer<T>(legacyRoute, body, trace);
     } catch (error) {
       if (isFileTransportError(error)) {
         throw this.fileTransportFailure(requestType, "legacy_http");
@@ -1998,12 +2475,15 @@ export class DesktopSandboxBridge {
   private async handleFileStat(message: FileStatMessage): Promise<void> {
     const reply = this.fileReplyPublisher();
     const { requestId, path } = message;
+    // Invocation-local, so concurrent stats never share or overwrite evidence.
+    const trace: FileStatReceiverTrace = {};
     try {
       const payload = await this.callDesktopFileBridge<{
         kind: "file" | "not_file" | "missing";
         path: string;
         sizeBytes?: number;
-      }>("file_stat", "/files/stat", { path }, message);
+      }>("file_stat", "/files/stat", { path }, message, trace);
+      trace.stage = "stat_reply_validation";
       if (
         typeof payload.path !== "string" ||
         (payload.kind !== "file" &&
@@ -2021,6 +2501,7 @@ export class DesktopSandboxBridge {
           "Desktop file bridge returned an invalid stat payload",
         );
       }
+      trace.stage = "reply_publication";
       await reply({
         type: "file_stat_result",
         requestId,
@@ -2029,7 +2510,12 @@ export class DesktopSandboxBridge {
         ...(payload.kind === "file" ? { sizeBytes: payload.sizeBytes } : {}),
       });
     } catch (error) {
-      await this.publishFileError(requestId, error, reply);
+      await this.publishFileError(
+        requestId,
+        error,
+        reply,
+        fileStatReceiverDiagnostic(trace),
+      );
     }
   }
 

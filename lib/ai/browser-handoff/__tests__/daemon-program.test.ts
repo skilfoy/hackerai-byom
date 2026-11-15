@@ -13,6 +13,8 @@ function expectPacketBudgets(text: string) {
     os1: _openSocket,
     k1: _commandClass,
     dv: _daemonVersion,
+    r1: _responseValidation,
+    o1: _openInfo,
     ...previousContext
   } = JSON.parse(text);
   expect(
@@ -91,6 +93,8 @@ function daemon(
     versionFifo?: boolean;
     versionError?: string;
     versionReadError?: boolean;
+    // Charges extra bytes to every packet measurement to simulate a tighter cap.
+    chargedBytes?: number;
   } = {},
 ) {
   const socketPath = path.join(
@@ -412,7 +416,13 @@ function daemon(
       stdout: { write: output },
       exit,
     },
-    Buffer,
+    Buffer:
+      options.chargedBytes !== undefined
+        ? Object.assign(Object.create(Buffer), {
+            byteLength: (text: string) =>
+              Buffer.byteLength(text) + options.chargedBytes!,
+          })
+        : Buffer,
     setTimeout: (callback: () => void) => {
       deadline = callback;
       return 1;
@@ -748,14 +758,20 @@ it("distinguishes owner mismatch without exposing UID or path", () => {
 });
 
 it.each([
-  { id: "other-request", success: true, data: { port: 9223 } },
-  { id: "hackerai-preview", success: false, error: "private failure" },
-])("refuses an unsuccessful or mismatched daemon response", (response) => {
-  const d = daemon();
-  d.reply(response);
-  expect(d.exit).toHaveBeenCalledWith(5);
-  expect(JSON.parse(d.output.mock.calls[0][0])).toEqual({ cv: [1, 0] });
-});
+  [{ id: "other-request", success: true, data: { port: 9223 } }, 2],
+  [{ id: "hackerai-preview", success: false, error: "private failure" }, 3],
+])(
+  "refuses an unsuccessful or mismatched daemon response",
+  (response, refused) => {
+    const d = daemon();
+    d.reply(response);
+    expect(d.exit).toHaveBeenCalledWith(5);
+    expect(JSON.parse(d.output.mock.calls[0][0])).toEqual({
+      r1: [1, refused],
+      cv: [1, 0],
+    });
+  },
+);
 
 it.each(["error", "close", "timeout", "malformed", "oversized"])(
   "fails closed for %s without invoking a CLI or returning daemon data",
@@ -770,6 +786,11 @@ it.each(["error", "close", "timeout", "malformed", "oversized"])(
     if (failure === "timeout")
       expect(JSON.parse(d.output.mock.calls[0][0])).toEqual({
         deadline: [1, "connecting"],
+        cv: [1, 0],
+      });
+    else if (failure === "malformed")
+      expect(JSON.parse(d.output.mock.calls[0][0])).toEqual({
+        r1: [1, 0],
         cv: [1, 0],
       });
     else expect(JSON.parse(d.output.mock.calls[0][0])).toEqual({ cv: [1, 0] });
@@ -1520,6 +1541,61 @@ it("does not read or add the at-return socket code to a successful daemon respon
   expect(d.openReceipt).not.toHaveBeenCalled();
 });
 
+it.each([0, 1, 2, 3])(
+  "forwards the selected successful OPEN's informational-token code %s beside os1",
+  (code) => {
+    const d = daemon({
+      ...missingSocket,
+      receipt: { ...receipt, action: "version", open_receipt_support: 1 },
+      openReceipt: { ...successfulOpen, os1: 2, o1: code },
+    });
+    expect(d.exit).toHaveBeenCalledWith(2);
+    expect(d.connect).not.toHaveBeenCalled();
+    const text = d.output.mock.calls[0][0];
+    expect(JSON.parse(text)).toMatchObject({
+      diagnostic_reason: "socket_stat",
+      open_phase: "completed",
+      open_exit: 0,
+      open_session_matches: true,
+      p1: [1, 0, 0],
+      os1: 2,
+      o1: code,
+    });
+    expectPacketBudgets(text);
+    expect(text).not.toMatch(/PRIVATE|\/dev\/shm|default|\.sock/);
+  },
+);
+
+it.each<[string, Record<string, unknown>, boolean]>([
+  ["a STARTED OPEN", { phase: "started", exit: null }, false],
+  ["a failed OPEN", { exit: 37 }, false],
+  ["another session's OPEN", { session_key: "a".repeat(64) }, false],
+  ["an out-of-range code", { o1: 4 }, true],
+  ["a negative code", { o1: -1 }, true],
+  ["a fractional code", { o1: 1.5 }, true],
+  ["a string code", { o1: "1" }, true],
+  ["null", { o1: null }, true],
+  ["an older writer", { o1: undefined }, true],
+])(
+  "omits the informational-token code for %s without dropping os1",
+  (_case, override, selected) => {
+    const d = daemon({
+      ...missingSocket,
+      receipt: { ...receipt, action: "version", open_receipt_support: 1 },
+      openReceipt: { ...successfulOpen, os1: 2, o1: 3, ...override },
+    });
+    expect(d.exit).toHaveBeenCalledWith(2);
+    const value = JSON.parse(d.output.mock.calls[0][0]);
+    expect(value).toMatchObject({
+      diagnostic_reason: "socket_stat",
+      open_receipt_status: "recorded",
+    });
+    expect(value).not.toHaveProperty("o1");
+    // The selected successful OPEN's existing code is independent of o1.
+    expect(value.os1).toBe(selected ? 2 : undefined);
+  },
+);
+
 /** Maximal legacy context, optionally with a started wrapper's w1 and an os1 code. */
 const maximalOpenSocket = (started: boolean, os1?: number, exit = 999) => {
   const longest = { ...receipt, at: Date.now() + 60_000, exit };
@@ -2213,3 +2289,172 @@ it.each<Record<string, unknown>>([
     expect(JSON.parse(d.output.mock.calls[0][0])).toEqual(response);
   },
 );
+
+const screenshotRequest = {
+  action: "screenshot",
+  path: directory + "/preview-PRIVATE.jpg",
+  format: "jpeg",
+  quality: 65,
+};
+/** First daemon response lines and the check that refuses each one. */
+const refusedResponses: [string, string, number][] = [
+  ["invalid JSON", "PRIVATE_BODY", 0],
+  ["an empty line", "", 0],
+  ["a truncated object", '{"id":"hackerai-preview","data":"PRIVATE', 0],
+  ["null", "null", 1],
+  ["an array", '["hackerai-preview",true,"PRIVATE"]', 1],
+  ["a string", '"PRIVATE"', 1],
+  ["a number", "7", 1],
+  ["a boolean", "true", 1],
+  ["another ID", '{"id":"PRIVATE_ID","success":true,"data":"PRIVATE"}', 2],
+  ["a missing ID", '{"success":true,"data":"PRIVATE"}', 2],
+  [
+    "an own __proto__ key",
+    '{"__proto__":{"id":"hackerai-preview","success":true}}',
+    2,
+  ],
+  ["another ID with success false", '{"id":null,"success":false}', 2],
+  [
+    "success false",
+    '{"id":"hackerai-preview","success":false,"error":"PRIVATE","data":"PRIVATE"}',
+    3,
+  ],
+  ["a missing success", '{"id":"hackerai-preview","data":"PRIVATE"}', 4],
+  ["a string success", '{"id":"hackerai-preview","success":"true"}', 4],
+  ["a numeric success", '{"id":"hackerai-preview","success":1}', 4],
+  ["a null success", '{"id":"hackerai-preview","success":null}', 4],
+];
+
+it.each(
+  refusedResponses.flatMap(([name, line, refused]) =>
+    [{ action: "stream_status" }, screenshotRequest].map(
+      (request) => [name, request.action, line, refused, request] as const,
+    ),
+  ),
+)(
+  "keeps exit5 for %s at %s and records only its refusal code",
+  (_case, _action, line, refused, request) => {
+    const d = daemon({ request });
+    d.socket.emit("connect");
+    d.socket.emit("data", line + "\n");
+    // Neither a later valid line nor the deadline can replace the first refusal.
+    d.socket.emit("data", '{"id":"hackerai-preview","success":true}\n');
+    d.timeout();
+    expect(d.exit.mock.calls).toEqual([[5]]);
+    expect(d.socket.destroy).toHaveBeenCalled();
+    expect(d.connect).toHaveBeenCalledTimes(1);
+    expect(d.socket.write.mock.calls).toEqual([
+      [JSON.stringify({ ...request, id: "hackerai-preview" }) + "\n"],
+    ]);
+    expect(d.output.mock.calls).toHaveLength(1);
+    const text = d.output.mock.calls[0][0];
+    expect(JSON.parse(text)).toEqual({ r1: [1, refused], cv: [1, 0] });
+    expect(text).not.toMatch(/PRIVATE|hackerai-preview|data|error|true/);
+  },
+);
+
+it("returns a successful response unchanged without a refusal code or receipt reads", () => {
+  const line =
+    '{"id":"hackerai-preview","success":true,"data":{"connected":true,"port":9223},"r1":"daemon"}';
+  const d = daemon({ receipt, request: screenshotRequest });
+  d.socket.emit("connect");
+  d.socket.emit("data", line + "\n");
+  expect(d.exit.mock.calls).toEqual([[0]]);
+  expect(d.output.mock.calls).toEqual([[line]]);
+  expect(d.readReceipt).not.toHaveBeenCalled();
+});
+
+it("preserves exit5 when the refusal packet cannot be written", () => {
+  const d = daemon({ receipt, stdoutThrows: true });
+  d.socket.emit("connect");
+  expect(() => d.socket.emit("data", "null\n")).not.toThrow();
+  expect(d.exit.mock.calls).toEqual([[5]]);
+});
+
+/** Every maximal optional context field beside a connected daemon response. */
+const maximalResponse = (line?: string, chargedBytes?: number, o1?: number) => {
+  const longest = { ...receipt, at: Date.now() + 60_000, exit: 999 };
+  const d = daemon({
+    chargedBytes,
+    pidFile: "314159",
+    processVisibility: "same_uid",
+    cliReceipt: [1, 1, 999999999],
+    wrapperStat: procStat(),
+    versionFile: "999.999.999",
+    receipt: {
+      ...longest,
+      action: "other",
+      phase: "started",
+      exit: null,
+      process: startedWrapper.process,
+      open_receipt_support: 1,
+      close_receipt_support: 1,
+      history: [1, true, true],
+      k1: 6,
+    },
+    openReceipt: {
+      ...longest,
+      action: "open",
+      exit: 0,
+      idle_env_version: 1,
+      idle_env: "unparsed",
+      os1: 4,
+      o1,
+    },
+    closeReceipt: { ...longest, action: "close", close_all: false },
+  });
+  d.socket.emit("connect");
+  // Without a line the daemon closes first: exit6 carries the same context, no r1.
+  if (line === undefined) d.socket.emit("close");
+  else d.socket.emit("data", line + "\n");
+  expect(d.exit.mock.calls).toEqual([[line === undefined ? 6 : 5]]);
+  return d.output.mock.calls[0][0] as string;
+};
+
+it("retains the refusal code beside every maximal existing field within the unchanged budgets", () => {
+  const text = maximalResponse('{"id":"hackerai-preview","success":"x"}');
+  expectPacketBudgets(text);
+  const { r1, ...existing } = JSON.parse(text);
+  expect(r1).toEqual([1, 4]);
+  expect(existing).toEqual(JSON.parse(maximalResponse()));
+  expect(existing).toMatchObject({
+    wrapper_phase: "started",
+    w1: 3,
+    k1: 6,
+    h1: 3,
+    open_exit: 0,
+    open_idle: [1, "unparsed"],
+    os1: 4,
+    p1: [1, 3, 2],
+    dv: [1, 1, 999999999],
+    cv: [1, 1, 999999999],
+  });
+  expect(text).not.toMatch(/PRIVATE|314159|271828|default|\/dev\/shm/);
+});
+
+it("drops the refusal code first, before the declaration or any existing field, under cap pressure", () => {
+  const line = '{"id":"PRIVATE","success":true}';
+  const full = Buffer.byteLength(maximalResponse(line));
+  const baseline = maximalResponse();
+  const refusalBytes = full - Buffer.byteLength(baseline);
+  // Existing closed fields cannot reach the cap at exit5 today; charge extra
+  // bytes so the complete packet measures one byte over it.
+  const justOver = maximalResponse(line, 545 - full);
+  expect(JSON.parse(justOver)).toEqual(JSON.parse(baseline));
+  // When dropping r1 is not enough, the existing order continues with dv only.
+  const { dv, ...rest } = JSON.parse(baseline);
+  expect(dv).toEqual([1, 1, 999999999]);
+  expect(JSON.parse(maximalResponse(line, 545 - full + refusalBytes))).toEqual(
+    rest,
+  );
+});
+
+it("drops the OPEN informational-token code first, before the refusal code or any existing field", () => {
+  const line = '{"id":"PRIVATE","success":true}';
+  const complete = maximalResponse(line, undefined, 3);
+  expectPacketBudgets(complete);
+  expect(JSON.parse(complete)).toMatchObject({ o1: 3, r1: [1, 2], os1: 4 });
+  // One byte over the cap drops only o1; r1 and every existing field remain.
+  const justOver = maximalResponse(line, 545 - Buffer.byteLength(complete), 3);
+  expect(JSON.parse(justOver)).toEqual(JSON.parse(maximalResponse(line)));
+});
