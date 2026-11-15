@@ -61,6 +61,7 @@
     "e2b:build:eu:dev": "npx tsx e2b/build.eu.ts dev",
     "e2b:build:eu:prod": "npx tsx e2b/build.eu.ts prod",
     "local-sandbox": "npx tsx packages/local/src/index.ts",
+    "mcp": "tsx lib/mcp/stdio.ts",
     "local-sandbox:build": "cd packages/local && pnpm build",
     "desktop:dev": "cd packages/desktop && pnpm dev",
     "desktop:build": "cd packages/desktop && pnpm build",

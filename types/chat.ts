@@ -47,6 +47,7 @@ export const BYOM_SELECTED_MODELS = [
   "byom-ollama",
   "byom-vllm",
   "byom-hermes",
+  "byom-hermes-local",
   "byom-unsloth",
 ] as const;
 

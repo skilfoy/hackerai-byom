@@ -66,6 +66,7 @@ describe("ModelSelector", () => {
     expect(screen.getByText("Ollama")).toBeVisible();
     expect(screen.getByText("vLLM")).toBeVisible();
     expect(screen.getByText("Hermes")).toBeVisible();
+    expect(screen.getByText("Hermes Local")).toBeVisible();
     expect(screen.getByText("Unsloth")).toBeVisible();
     expect(screen.queryByText(/Runpod port 8000/i)).not.toBeInTheDocument();
   });

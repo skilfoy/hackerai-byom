@@ -1471,6 +1471,7 @@ export const modelDisplayNames: Record<ModelName, string> &
   "byom-ollama": "Ollama",
   "byom-vllm": "vLLM",
   "byom-hermes": "Hermes",
+  "byom-hermes-local": "Hermes Local",
   "byom-unsloth": "Unsloth",
 };
 
@@ -1591,6 +1592,7 @@ export function resolveAgentTierToProviderKey(
     case "byom-ollama":
     case "byom-vllm":
     case "byom-hermes":
+    case "byom-hermes-local":
     case "byom-unsloth":
       return tier;
   }

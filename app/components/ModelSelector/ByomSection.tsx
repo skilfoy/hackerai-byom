@@ -151,6 +151,14 @@ export function ByomSection({
                   request. Localhost works when HackerAI is running on this
                   computer. Cloud runs need a URL the server can reach.
                 </p>
+                {kind === "hermes-local" ? (
+                  <p className="text-[11px] leading-snug text-muted-foreground">
+                    Hermes Agent serves this with llama.cpp at{" "}
+                    <span className="font-mono">127.0.0.1:8080</span>. No Nous
+                    account. The model id is the name Hermes loaded. A
+                    llama-server you start yourself is often on port 8081.
+                  </p>
+                ) : null}
                 {kind === "vllm" ? (
                   <p className="text-[11px] leading-snug text-muted-foreground">
                     Serve with{" "}

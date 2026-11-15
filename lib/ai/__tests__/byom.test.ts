@@ -175,6 +175,16 @@ describe("BYOM routing", () => {
     }
     expect(toConnectionModel("hackerai-max")).toBe("byom-openrouter");
     expect(toConnectionModel("byom-vllm")).toBe("byom-vllm");
+    const localHermes = parseByomRequest(undefined, "byom-hermes-local");
+    expect(localHermes).toEqual({
+      ok: true,
+      route: {
+        kind: "hermes-local",
+        modelId: "local",
+        baseURL: "http://127.0.0.1:8080/v1",
+        apiKey: "hermes",
+      },
+    });
   });
 
   it("keeps delegated agent calls on the parent BYOM route", () => {

@@ -10,11 +10,13 @@ import { isByomSelectedModel } from "@/types/chat";
  *   - openai-compatible: any other base URL
  *   - ollama: local Ollama's OpenAI shim
  *   - vllm: a vLLM OpenAI server (local, Docker, Kubernetes, Runpod, Modal)
- *   - hermes: Nous Research inference (Hermes and the Portal catalog)
+ *   - hermes: Nous Portal (Hermes catalog, API key required)
+ *   - hermes-local: Hermes Agent's local llama.cpp server, no Portal account
  *   - unsloth: Unsloth Studio / llama.cpp, with Dynamic GGUF or NVFP4/FP8 weights
  *
- * The server makes the HTTP call. localhost reaches Ollama, vLLM, or Unsloth
- * only when this process is on the same machine. Cloud runs need a reachable URL.
+ * The server makes the HTTP call. localhost reaches Ollama, vLLM, Hermes
+ * Local, or Unsloth only when this process is on the same machine. Cloud
+ * runs need a reachable URL.
  */
 
 export const BYOM_PROVIDER_KINDS = [
@@ -23,6 +25,7 @@ export const BYOM_PROVIDER_KINDS = [
   "ollama",
   "vllm",
   "hermes",
+  "hermes-local",
   "unsloth",
 ] as const;
 
@@ -60,6 +63,7 @@ const SELECTED_MODEL_BY_KIND = {
   ollama: "byom-ollama",
   vllm: "byom-vllm",
   hermes: "byom-hermes",
+  "hermes-local": "byom-hermes-local",
   unsloth: "byom-unsloth",
 } as const satisfies Record<ByomProviderKind, ByomSelectedModel>;
 
@@ -69,6 +73,7 @@ const KIND_BY_SELECTED_MODEL: Record<ByomSelectedModel, ByomProviderKind> = {
   "byom-ollama": "ollama",
   "byom-vllm": "vllm",
   "byom-hermes": "hermes",
+  "byom-hermes-local": "hermes-local",
   "byom-unsloth": "unsloth",
 };
 
@@ -131,6 +136,15 @@ export const BYOM_PROVIDER_DEFAULTS: Record<ByomProviderKind, ProviderDefault> =
       altEnvApiKey: "NOUS_API_KEY",
       placeholderApiKey: "",
       apiKeyRequired: true,
+    },
+    "hermes-local": {
+      baseURL: "http://127.0.0.1:8080/v1",
+      modelId: "local",
+      envBaseURL: "HERMES_LOCAL_BASE_URL",
+      envModel: "HERMES_LOCAL_MODEL",
+      envApiKey: "HERMES_LOCAL_API_KEY",
+      placeholderApiKey: "hermes",
+      apiKeyRequired: false,
     },
     unsloth: {
       baseURL: "http://127.0.0.1:8888/v1",

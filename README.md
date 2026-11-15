@@ -51,20 +51,46 @@ You'll need the following accounts:
 
 The model selector sends Ask, Agent, and delegated subagents to a connection you configure. Saved Auto, Standard, Pro, and Max choices migrate to the OpenRouter connection. They are not selectable.
 
-| Route             | Default endpoint                            | What it calls                                                                                                            |
-| ----------------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| OpenRouter        | `https://openrouter.ai/api/v1`              | Your OpenRouter key. Default model `openrouter/auto`. This replaces hosted Auto.                                         |
-| OpenAI-compatible | The base URL you enter                      | `POST {base}/chat/completions`                                                                                           |
-| Ollama            | `http://127.0.0.1:11434/v1`                 | Local Ollama's OpenAI shim                                                                                               |
-| vLLM              | `http://127.0.0.1:8000/v1`                  | A vLLM OpenAI server. The model id is the weights vLLM loaded.                                                           |
-| Hermes            | `https://inference-api.nousresearch.com/v1` | Nous Portal directly. Defaults include Hermes 4.3 36B, Hermes 4 70B, and Hermes 4 405B. Other Portal model ids work too. |
-| Unsloth           | `http://127.0.0.1:8888/v1`                  | Unsloth Studio, not OpenRouter. `default` uses the model loaded in Studio.                                               |
+| Route             | Default endpoint                            | What it calls                                                                                                                                                              |
+| ----------------- | ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| OpenRouter        | `https://openrouter.ai/api/v1`              | Your OpenRouter key. Default model `openrouter/auto`. This replaces hosted Auto.                                                                                           |
+| OpenAI-compatible | The base URL you enter                      | `POST {base}/chat/completions`                                                                                                                                             |
+| Ollama            | `http://127.0.0.1:11434/v1`                 | Local Ollama's OpenAI shim                                                                                                                                                 |
+| vLLM              | `http://127.0.0.1:8000/v1`                  | A vLLM OpenAI server. The model id is the weights vLLM loaded.                                                                                                             |
+| Hermes            | `https://inference-api.nousresearch.com/v1` | Nous Portal directly. Defaults include Hermes 4.3 36B, Hermes 4 70B, and Hermes 4 405B. Other Portal model ids work too.                                                   |
+| Hermes Local      | `http://127.0.0.1:8080/v1`                  | llama.cpp managed by Hermes Agent. No Portal account or key. Set the model id to the name Hermes loaded. Port 8081 is the usual port when you start llama-server yourself. |
+| Unsloth           | `http://127.0.0.1:8888/v1`                  | Unsloth Studio, not OpenRouter. `default` uses the model loaded in Studio.                                                                                                 |
 
-API keys typed in the selector stay in browser storage and are sent only with the chat request. Server env fallbacks are `OPENROUTER_*`, `BYOM_OPENAI_*`, `OLLAMA_*`, `VLLM_*`, `HERMES_API_KEY` or `NOUS_API_KEY`, and `UNSLOTH_*`.
+API keys typed in the selector stay in browser storage and are sent only with the chat request. Server env fallbacks are `OPENROUTER_*`, `BYOM_OPENAI_*`, `OLLAMA_*`, `VLLM_*`, `HERMES_API_KEY` or `NOUS_API_KEY`, `HERMES_LOCAL_*`, and `UNSLOTH_*`.
 
-`localhost` is the machine running the HackerAI server. It reaches Ollama, vLLM, or Unsloth during local dev, or through a tunnel. A cloud Agent worker cannot open your laptop's loopback address. OpenRouter and Hermes are public APIs, so they work from cloud runs when the key is set.
+`localhost` is the machine running the HackerAI server. It reaches Ollama, vLLM, Hermes Local, or Unsloth during local dev, or through a tunnel. A cloud Agent worker cannot open your laptop's loopback address. OpenRouter and Nous Portal are public APIs, so they work from cloud runs when the key is set.
 
 BYOM token use is not billed at HackerAI hosted rates. You pay the endpoint you configured. Sandbox and other non-model costs still apply.
+
+#### Hermes Agent calling HackerAI
+
+Hermes Local above is only the model server. To let a local Hermes Agent use HackerAI, run HackerAI on this machine, sign in, and start the MCP server from this repo:
+
+```bash
+HACKERAI_BASE_URL=http://127.0.0.1:3000 \
+HACKERAI_SESSION_COOKIE='<wos-session cookie value>' \
+pnpm mcp
+```
+
+The server speaks MCP over stdio and refuses a non-loopback HackerAI URL unless `HACKERAI_MCP_ALLOW_REMOTE=1`. Add it to `~/.hermes/config.yaml`:
+
+```yaml
+mcp_servers:
+  hackerai:
+    command: pnpm
+    args: ["mcp"]
+    cwd: /path/to/hackerai-byom
+    env:
+      HACKERAI_BASE_URL: http://127.0.0.1:3000
+      HACKERAI_SESSION_COOKIE: "<wos-session cookie value>"
+```
+
+The ten tools are `start_engagement`, `ask`, `get_run`, `continue_run`, `decide_approval`, `cancel_run`, `get_engagement`, `list_findings`, `get_finding`, and `get_transcript`. Engagements start on Hermes Local with ask-approval. They do not grant Hermes a raw shell inside HackerAI.
 
 #### vLLM
 

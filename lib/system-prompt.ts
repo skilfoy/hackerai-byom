@@ -401,6 +401,7 @@ export const systemPrompt = async (
     "byom-ollama": "Ollama",
     "byom-vllm": "vLLM",
     "byom-hermes": "Hermes",
+    "byom-hermes-local": "Hermes Local",
     "byom-unsloth": "Unsloth",
   }[selectedModel];
 

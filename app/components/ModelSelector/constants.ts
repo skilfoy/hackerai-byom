@@ -47,6 +47,13 @@ export const BYOM_MODEL_OPTIONS: Array<
     poweredBy: "inference-api.nousresearch.com",
   },
   {
+    id: "byom-hermes-local",
+    label: "Hermes Local",
+    description:
+      "llama.cpp that Hermes Agent runs on this machine. No Portal key",
+    poweredBy: "http://127.0.0.1:8080/v1",
+  },
+  {
     id: "byom-unsloth",
     label: "Unsloth",
     description: "Studio inference. Load a Dynamic GGUF or NVFP4/FP8 build",
