@@ -6,7 +6,10 @@ import {
   CloudRecoveryAdmissionContext,
   useCloudRecoveryAdmission,
 } from "@/app/hooks/useCloudRecoveryAdmission";
-import { LOCAL_CONNECTION_LOST_FINISH_REASON } from "@/lib/chat/local-connection-stop";
+import {
+  BROWSER_HANDOFF_ABANDONED_FINISH_REASON,
+  requiresManualAgentResume,
+} from "@/lib/chat/manual-agent-resume";
 
 import { useChat, type UseChatHelpers } from "@ai-sdk/react";
 import { DefaultChatTransport, type FileUIPart } from "ai";
@@ -39,6 +42,7 @@ import { BrowserHandoffEntry } from "./BrowserHandoffEntry";
 import { byomRequestForSelectedModel } from "@/lib/ai/byom-client";
 import { toConnectionModel } from "@/lib/ai/byom";
 import { isByomSelectedModel } from "@/types/chat";
+import { EarlyRenewalPaymentNotice } from "./EarlyRenewalPaymentNotice";
 import type { RateLimitWarningData } from "./RateLimitWarning";
 import ChatHeader from "./ChatHeader";
 import Footer from "./Footer";
@@ -70,6 +74,7 @@ import { getBranchErrorMessage } from "@/lib/chat/branch-error";
 import {
   GoalSubmissionUnconfirmedError,
   isGoalAdmissionRefused,
+  isGoalWorkspaceSelectionRefusal,
 } from "@/lib/chat/goal-submission";
 import {
   cancelAgentLongRealtimeStreams,
@@ -97,7 +102,14 @@ import {
 import { isTauriEnvironment } from "@/app/hooks/useTauri";
 import { stripAgentLongHeartbeatPartsFromMessages } from "@/lib/chat/agent-long-heartbeat";
 import { createAgentPartialSaveQueue } from "@/lib/chat/agent-partial-save-queue";
+import { fetchAgentPartialSaveWithDiagnostic } from "@/lib/analytics/agent-partial-save-diagnostics";
 import { getAgentLongMessageProgressFingerprint } from "@/lib/chat/agent-long-message-progress";
+import {
+  CONTEXT_USAGE_PART_TYPE,
+  selectLatestContextPressure,
+} from "@/lib/chat/context-pressure";
+import { useContextDetailsPreference } from "@/app/hooks/useContextDetailsPreference";
+import type { ContextMeterData } from "./ChatContextDetails";
 import { getLatestAgentLongAssistantMessageForPartialSave } from "@/lib/chat/agent-partial-save-snapshot";
 import { toast } from "sonner";
 import {
@@ -122,8 +134,9 @@ import { v4 as uuidv4 } from "uuid";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { useComputerSidebarOverlay } from "@/hooks/use-workspace-layout";
 import { useSelectedComputerConnection } from "@/app/hooks/useSelectedComputerConnection";
-import { useParams, useRouter } from "next/navigation";
+import { useParams, usePathname, useRouter } from "next/navigation";
 import { ConvexErrorBoundary } from "./ConvexErrorBoundary";
+import { useWorkspaceFilesEnabled } from "./ComputerPanelToggle";
 import { SlowLoadingNotice } from "./SlowLoadingNotice";
 import { useAutoResume } from "../hooks/useAutoResume";
 import { useAutoContinue } from "../hooks/useAutoContinue";
@@ -137,7 +150,7 @@ import {
 } from "@/lib/utils/client-storage";
 import { parseRateLimitWarning } from "@/lib/utils/parse-rate-limit-warning";
 import { formatTaskUiCopy } from "@/app/utils/task-ui-copy";
-import { finalizeNewChatRoute } from "./chat-route";
+import { finalizeNewChatRoute, getRouteChatIdFromPathname } from "./chat-route";
 import { ChatPerformanceTracker } from "@/lib/analytics/chat-performance";
 import { useChatPerformance } from "@/app/hooks/useChatPerformance";
 import { useBrowserResponsiveness } from "@/app/hooks/useBrowserResponsiveness";
@@ -269,17 +282,29 @@ export function getExistingChatLoadState({
 const shouldReleaseStreamedTitle = (
   streamedTitle: string | null,
   persistedTitle: string | null | undefined,
-): boolean => Boolean(streamedTitle && persistedTitle === streamedTitle);
+  titleManuallyEdited: boolean | undefined,
+): boolean =>
+  Boolean(
+    streamedTitle && (titleManuallyEdited || persistedTitle === streamedTitle),
+  );
 
 export function useStreamedChatTitle(
   persistedTitle: string | null | undefined,
+  titleManuallyEdited?: boolean,
 ) {
   const [streamedTitle, setStreamedTitle] = useState<string | null>(null);
 
   // The streamed title only bridges the gap until Convex receives the same
-  // generated title. This guarded adjustment restarts the current render
-  // before children commit with a stale title source.
-  if (shouldReleaseStreamedTitle(streamedTitle, persistedTitle)) {
+  // generated title, or the owner's rename supersedes it. This guarded
+  // adjustment restarts the current render before children commit with a
+  // stale title source.
+  if (
+    shouldReleaseStreamedTitle(
+      streamedTitle,
+      persistedTitle,
+      titleManuallyEdited,
+    )
+  ) {
     setStreamedTitle(null);
   }
 
@@ -555,7 +580,13 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
   const { sendDisabledReason: connectionSendDisabledReason } =
     useSelectedComputerConnection();
   const params = useParams();
-  const routeChatId = params?.id as string | undefined;
+  const pathname = usePathname();
+  // The URL owns the displayed chat. Back/Forward can restore the home-page
+  // tree (no dynamic params) at a /c/<id> URL saved by finalizeNewChatRoute.
+  const routeChatId =
+    (pathname
+      ? getRouteChatIdFromPathname(pathname)
+      : (params?.id as string | undefined)) ?? undefined;
   const router = useRouter();
   const isMobile = useIsMobile();
   const computerSidebarOverlay = useComputerSidebarOverlay();
@@ -645,7 +676,12 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
           ].join(", "),
         ),
       ).filter((element) => {
-        if (element.getClientRects().length === 0) return false;
+        if (
+          element.tabIndex < 0 ||
+          element.closest("[hidden], [inert]") ||
+          element.getClientRects().length === 0
+        )
+          return false;
         // Closed details can still give descendants layout boxes in Chromium.
         // Only their direct summary remains keyboard-accessible.
         for (
@@ -709,12 +745,16 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
     };
 
     const focusTimeout = window.setTimeout(() => {
-      if (!hasNestedDialogFocus())
-        (
-          dialog.querySelector<HTMLElement>('[aria-label="Goal objective"]') ??
-          getFocusableElements()[0] ??
-          dialog
-        ).focus();
+      if (hasNestedDialogFocus()) return;
+      const focusableElements = getFocusableElements();
+      (
+        dialog.querySelector<HTMLElement>('[aria-label="Goal objective"]') ??
+        focusableElements.find((element) =>
+          element.matches('[role="tab"][aria-selected="true"]'),
+        ) ??
+        focusableElements[0] ??
+        dialog
+      ).focus();
     }, 0);
     document.addEventListener("keydown", handleKeyDown);
 
@@ -758,6 +798,16 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
   const [chatId, setChatId] = useState<string>(() => {
     return routeChatId || uuidv4();
   });
+  // Committed before the route sync below so a new chat started while the old
+  // saved URL is still visible is not mistaken for a route change.
+  const committedChatIdRef = useCommittedRef(chatId);
+  // Only chats adopted from the URL may resume a server stream. A draft that
+  // gains its saved URL already owns its in-flight request.
+  const [routeAdoptedChatId, setRouteAdoptedChatId] = useState<
+    string | undefined
+  >(routeChatId);
+  const lastSyncedRouteChatIdRef = useRef<string | undefined | null>(null);
+  const freshChatIdAwaitingHomeRef = useRef<string | null>(null);
 
   useEffect(() => {
     clearAgentApprovalSession();
@@ -861,25 +911,10 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
     chatData && (chatData as any).id === chatId ? chatData : undefined;
   const [chatTitle, setStreamedTitle] = useStreamedChatTitle(
     chatDataForCurrentChat?.title,
+    chatDataForCurrentChat?.title_manually_edited,
   );
   const loadedChatDocumentId = chatDataForCurrentChat?._id;
   const lastRunFinishedAt = chatDataForCurrentChat?.last_run_finished_at;
-
-  // Sync local chat state from URL (single source of truth)
-  useLayoutEffect(() => {
-    setStreamedTitle(null);
-    lastAppliedTodoOutputRef.current = null;
-    if (routeChatId) {
-      setChatId(routeChatId);
-      setIsExistingChat(true);
-    } else {
-      // Navigated to "/" (new chat) — reset to fresh state
-      resetSandboxPreference();
-      setChatId(uuidv4());
-      setIsExistingChat(false);
-      wasNewChatRef.current = true;
-    }
-  }, [routeChatId, setStreamedTitle, resetSandboxPreference]);
 
   useEffect(() => {
     if (!loadedChatDocumentId) return;
@@ -1375,6 +1410,9 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
         }
         return;
       }
+      // A context snapshot replaces itself in its response's parts. It is
+      // display diagnostics, neither Agent progress nor shared stream data.
+      if (dataPart.type === CONTEXT_USAGE_PART_TYPE) return;
       agentLongHasVisibleProgressRef.current = true;
       appendDataPart({ ...dataPart, __chatId: chatId });
       switch (dataPart.type) {
@@ -1569,8 +1607,12 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
       ) {
         goalAdmissionRef.current.rejected =
           isGoalAdmissionRefused(displayError);
-        goalAdmissionRef.current.error =
-          displayError instanceof ChatSDKError
+        // Keep the structured refusal so the composer can offer the selector.
+        goalAdmissionRef.current.error = isGoalWorkspaceSelectionRefusal(
+          displayError,
+        )
+          ? displayError
+          : displayError instanceof ChatSDKError
             ? new Error(
                 formatTaskUiCopy(
                   typeof displayError.cause === "string"
@@ -1945,6 +1987,43 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
     [clearDataStream, setIsAutoResuming],
   );
 
+  useLayoutEffect(() => {
+    if (lastSyncedRouteChatIdRef.current === routeChatId) return;
+    const isInitialSync = lastSyncedRouteChatIdRef.current === null;
+    lastSyncedRouteChatIdRef.current = routeChatId;
+    const freshChatId = freshChatIdAwaitingHomeRef.current;
+    freshChatIdAwaitingHomeRef.current = null;
+    const currentChatId = committedChatIdRef.current;
+    // Keep the mounted draft when its saved URL or explicit New Task
+    // navigation commits. A history traversal still changes ownership.
+    if (
+      !isInitialSync &&
+      (routeChatId === currentChatId ||
+        (routeChatId === undefined && currentChatId === freshChatId))
+    ) {
+      return;
+    }
+
+    const nextChatId = routeChatId ?? uuidv4();
+    // Back/Forward can switch chats within the same mounted home page.
+    if (!isInitialSync && activeChatIdRef.current !== nextChatId) {
+      stopActiveBrowserStream(nextChatId);
+    }
+    setStreamedTitle(null);
+    lastAppliedTodoOutputRef.current = null;
+    if (!routeChatId) resetSandboxPreference();
+    wasNewChatRef.current = !routeChatId;
+    setChatId(nextChatId);
+    setIsExistingChat(!!routeChatId);
+    setRouteAdoptedChatId(routeChatId);
+  }, [
+    routeChatId,
+    committedChatIdRef,
+    resetSandboxPreference,
+    setStreamedTitle,
+    stopActiveBrowserStream,
+  ]);
+
   useEffect(() => {
     setChatNavigationHandler(stopActiveBrowserStream);
     return () => setChatNavigationHandler(null);
@@ -1975,11 +2054,14 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
         chatId,
         saveKey,
         async () => {
-          return fetch(AGENT_PARTIAL_SAVE_ENDPOINT, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: requestBody,
-          });
+          return fetchAgentPartialSaveWithDiagnostic(
+            AGENT_PARTIAL_SAVE_ENDPOINT,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: requestBody,
+            },
+          );
         },
       );
     },
@@ -2300,6 +2382,7 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
   useEffect(() => {
     const reset = () => {
       const nextChatId = uuidv4();
+      freshChatIdAwaitingHomeRef.current = nextChatId;
       stopActiveBrowserStream(nextChatId);
       setMessages([]);
       setChatId(nextChatId);
@@ -2696,6 +2779,9 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
     agentLongRunId ?? activeTriggerRunId,
   );
 
+  // Matches ComputerSidebar's decision to render tabbed Computer.
+  const computerTabsEnabled = useWorkspaceFilesEnabled(chatId);
+
   // Chat handlers
   const {
     handleSubmit,
@@ -2742,6 +2828,7 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
     resetAutoContinueCount,
     sendDisabledReason: computerSendDisabledReason,
     pendingUserWait,
+    computerTabsEnabled,
   });
 
   // Automatic queue processing - send next queued message when ready
@@ -2763,8 +2850,8 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
       persistedGoal?.state !== "running" &&
       !agentLongRunId &&
       !activeTriggerRunId &&
-      chatDataForCurrentChat?.finish_reason !==
-        LOCAL_CONNECTION_LOST_FINISH_REASON &&
+      // Hold queued messages until the user explicitly resumes this stop.
+      !requiresManualAgentResume(chatDataForCurrentChat?.finish_reason) &&
       !computerSendDisabledReason &&
       messageQueue.length > 0 &&
       !messageQueue[0].deliveryStatus &&
@@ -2886,6 +2973,25 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
     });
   const canResolveApprovalPresentation =
     !isInitialExistingChatLoad && chatDataForCurrentChat !== undefined;
+  const [showContextUsage] = useContextDetailsPreference();
+  const latestContextPressure = useMemo(
+    () => (showContextUsage ? selectLatestContextPressure(messages) : null),
+    [messages, showContextUsage],
+  );
+  // Only this chat's loaded record and messages; never a chat in transition.
+  // No meter until this chat has a measured request.
+  const contextMeter: ContextMeterData | undefined =
+    latestContextPressure &&
+    isExistingChat &&
+    hasMessages &&
+    !isChatNotFound &&
+    chatDataForCurrentChat
+      ? {
+          chatId,
+          snapshot: latestContextPressure,
+          completedCompactions: chatDataForCurrentChat.agent_compaction_count,
+        }
+      : undefined;
 
   useEffect(() => {
     if (!isExistingChat || canResolveApprovalPresentation) {
@@ -2909,6 +3015,10 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
     rateLimitWarning?.warningType === "agent-run-spend-cap"
       ? rateLimitWarning
       : undefined;
+  // The blocked-limit warning mounts the full billing recovery panel.
+  const isQuotaBlocked =
+    rateLimitWarning?.warningType === "token-bucket" &&
+    rateLimitWarning.remainingPercent === 0;
 
   // Get branched chat info directly from chatData (no additional query needed)
   const branchedFromChatId = chatDataForCurrentChat?.branched_from_chat_id;
@@ -2933,12 +3043,45 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
     ["queued", "running", "needs_approval"].includes(
       persistedGoal?.state ?? "",
     );
+  // A Goal settles its own abandoned handoff run as paused. Its existing Goal
+  // Resume is the only continuation, so the transcript notice has no button.
+  // Goal claims record run-owned message IDs, which survive cancellation.
+  const lastAssistantMessageId = messages.findLast(
+    (message) => message.role === "assistant",
+  )?.id;
+  const isBrowserHandoffAbandoned =
+    chatDataForCurrentChat?.finish_reason ===
+    BROWSER_HANDOFF_ABANDONED_FINISH_REASON;
+  const goalOwnsAbandonedRun =
+    isBrowserHandoffAbandoned &&
+    !!persistedGoal &&
+    ["queued", "running", "waiting", "needs_approval", "paused"].includes(
+      persistedGoal.state,
+    ) &&
+    (!!persistedGoal.activeRunId ||
+      (!!lastAssistantMessageId &&
+        !!persistedGoal.evidenceSources?.some(
+          (source) =>
+            source.messageId === lastAssistantMessageId ||
+            source.runId === lastAssistantMessageId,
+        )));
   const pauseGoalOnSend = [
     "queued",
     "running",
     "waiting",
     "needs_approval",
   ].includes(persistedGoal?.state ?? "");
+  // Opening billing navigates this tab away. Hold it while chat or durable
+  // Agent work is in flight, waiting for input, or awaiting approval. This
+  // only disables the billing action; Send is never disabled by it.
+  const billingNavigationBlocked =
+    status === "submitted" ||
+    status === "streaming" ||
+    (!!currentAgentRunUiId && !isAgentRunUiTerminal) ||
+    hasActiveGoalRun ||
+    pauseGoalOnSend ||
+    !!pendingUserWait ||
+    !!storedAgentApprovalRequest;
   const stopGoalRunBeforeControl = async (runId: string) => {
     // Never let a delayed goal control stop a replacement or unrelated run.
     if (activeTriggerRunId === runId) cancellationTriggerRunRef.current = runId;
@@ -2976,6 +3119,8 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
         status === "ready" &&
         !activeTriggerRunId &&
         (messageQueue.length === 0 ||
+          // This stop deliberately holds queued messages until a manual resume.
+          isBrowserHandoffAbandoned ||
           persistedGoal?.state === "blocked" ||
           persistedGoal?.state === "needs_input")
       }
@@ -3011,7 +3156,7 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
         sendDisabledReason={computerSendDisabledReason}
         key={chatId}
         chatId={chatId}
-        autoResume={autoResume}
+        autoResume={autoResume || routeAdoptedChatId === chatId}
         serverMessages={serverMessages}
         resumeStream={resumeStream}
         setMessages={setMessages}
@@ -3117,7 +3262,9 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
                       setMessages={setMessages}
                       onRegenerate={handleRegenerate}
                       onRetry={handleRetry}
-                      onContinue={handleContinue}
+                      onContinue={
+                        goalOwnsAbandonedRun ? undefined : handleContinue
+                      }
                       onReconnect={resumeStream}
                       onEditMessage={handleEditMessage}
                       onBranchMessage={handleBranchMessage}
@@ -3188,13 +3335,20 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
                     hasActiveGoalRun={hasActiveGoalRun}
                     pauseGoalOnSend={pauseGoalOnSend}
                     topNotice={
-                      showChatLayout ? (
-                        <BrowserHandoffEntry
-                          chatId={chatId}
-                          messages={messages}
-                          persistedMessages={serverMessages}
+                      <>
+                        {showChatLayout && (
+                          <BrowserHandoffEntry
+                            chatId={chatId}
+                            messages={messages}
+                            persistedMessages={serverMessages}
+                          />
+                        )}
+                        {/* New chats too: returning subscribers often start there. */}
+                        <EarlyRenewalPaymentNotice
+                          actionDisabled={billingNavigationBlocked}
+                          suppressed={isQuotaBlocked}
                         />
-                      ) : undefined
+                      </>
                     }
 
                     onSubmit={handleSubmit}
@@ -3207,6 +3361,7 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
                     hasMessages={hasMessages}
                     isNewChat={!isExistingChat}
                     chatId={chatId}
+                    contextMeter={contextMeter}
                     sendDisabledReason={
                       pendingUserWait ? undefined : computerSendDisabledReason
                     }
@@ -3247,7 +3402,7 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
             className={
               computerSidebarOverlay
                 ? sidebarOpen
-                  ? "fixed inset-0 z-50 flex items-center justify-center bg-background p-4"
+                  ? "fixed inset-0 z-50 flex items-center justify-center bg-background p-0 max-sm:pt-[env(safe-area-inset-top)] max-sm:pb-[env(safe-area-inset-bottom)] max-sm:pl-[env(safe-area-inset-left)] max-sm:pr-[env(safe-area-inset-right)] sm:p-4"
                   : "hidden"
                 : `min-w-0 transition-[width] duration-300 ${sidebarOpen ? "w-1/2 flex-shrink-0" : "w-0 overflow-hidden"}`
             }
@@ -3275,7 +3430,7 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
             >
               {(sidebarOpen || hasOpenedComputerSidebar) && (
                 <ComputerSidebar
-                  key={chatId}
+                  key={chatId ?? "new"}
                   stopGoalRunBeforeControl={stopGoalRunBeforeControl}
                   continueGoal={async (goal) => {
                     if (computerSendDisabledReason)

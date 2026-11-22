@@ -1,5 +1,6 @@
 import type { LimitRescueRequest } from "@/types/chat";
 import { LOCAL_CONNECTION_LOST_FINISH_REASON } from "@/lib/chat/local-connection-stop";
+import { requiresManualAgentResume } from "@/lib/chat/manual-agent-resume";
 import { FinishReasonNotice } from "./FinishReasonNotice";
 import { TaskOutcomeFeedback } from "./TaskOutcomeFeedback";
 import {
@@ -275,7 +276,8 @@ export const Messages = ({
 }: MessagesProps) => {
   const { isAutoResuming } = useDataStreamState();
   // Prefetch and cache image URLs for better performance
-  const { getCachedUrl, setCachedUrl } = useFileUrlCache(messages);
+  const { getCachedUrl, setCachedUrl, loadImageUrl } =
+    useFileUrlCache(messages);
 
   // Filter out auto-continue messages for rendering
   const visibleMessages = useMemo(
@@ -952,12 +954,14 @@ export const Messages = ({
       </div>
     ) : null;
 
-  const showLocalStopWithoutAssistant =
-    finishReason === LOCAL_CONNECTION_LOST_FINISH_REASON &&
+  // A manual-resume stop before the turn saved an assistant message has no
+  // last-message notice to attach to, so its Resume notice renders here.
+  const showManualResumeWithoutAssistant =
+    requiresManualAgentResume(finishReason) &&
     status !== "streaming" &&
     (lastAssistantMessageIndex ?? -1) <= (lastUserMessageIndex ?? -1);
   const timelineFooter =
-    showLocalStopWithoutAssistant ||
+    showManualResumeWithoutAssistant ||
     showSummarizationSeparately ||
     uploadStatus?.isUploading ||
     shouldShowLoadingDots ||
@@ -966,9 +970,10 @@ export const Messages = ({
         className="mx-auto flex min-h-20 w-full max-w-full flex-col items-start sm:max-w-[768px]"
         data-testid="messages-timeline-footer"
       >
-        {showLocalStopWithoutAssistant && (
+        {showManualResumeWithoutAssistant && (
           <FinishReasonNotice
             finishReason={finishReason}
+            lastSavedStep="request"
             mode={mode}
             status={status}
             continueDisabledReason={continueDisabledReason}
@@ -1031,6 +1036,7 @@ export const Messages = ({
     <FileUrlCacheProvider
       getCachedUrl={getCachedUrl}
       setCachedUrl={setCachedUrl}
+      loadImageUrl={loadImageUrl}
     >
       <div className="relative flex-1 min-h-0">
         <LegendList<ChatTimelineRow>

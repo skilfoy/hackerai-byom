@@ -3,11 +3,18 @@ import {
   INFERENCE_MAX_IMAGES_PER_REQUEST,
   isInferenceCyberModel,
 } from "@/lib/ai/inference";
-import { withInferenceFallback } from "@/lib/ai/inference-fallback";
+import {
+  shouldDeferInferenceRejectionToSizeRecovery,
+  withInferenceFallback,
+} from "@/lib/ai/inference-fallback";
 import { getSandboxBrowserGuidance } from "@/lib/ai/browser-guidance";
 import { createBrowserHandoffNoteProjector } from "@/lib/ai/browser-handoff/context";
 import { recoverBrowserHandoffCompletion } from "@/lib/ai/browser-handoff/completion-recovery";
-import { getAgentContextBudget } from "@/lib/ai/agent-context-budget";
+import {
+  getAgentContextBudget,
+  getAgentContextPolicy,
+  type AgentContextPolicy,
+} from "@/lib/ai/agent-context-budget";
 import {
   restoreProviderRecoveryContext,
   type ProviderRecoveryContext,
@@ -22,6 +29,10 @@ import {
   LocalConnectionLostError,
   LOCAL_CONNECTION_LOST_FINISH_REASON,
 } from "@/lib/chat/local-connection-stop";
+import {
+  BROWSER_HANDOFF_ABANDONED_FINISH_REASON,
+  BrowserHandoffAbandonedError,
+} from "@/lib/chat/manual-agent-resume";
 import type {
   AbliteratedModelTelemetry,
   ModelStepRouting,
@@ -117,6 +128,11 @@ import {
   resolveServedModelForCostAccounting,
 } from "@/lib/api/chat-stream-helpers";
 import {
+  CONTEXT_USAGE_PART_TYPE,
+  CONTEXT_USAGE_SNAPSHOT_ID_PREFIX,
+  toContextPressureSnapshot,
+} from "@/lib/chat/context-pressure";
+import {
   elapsedTimeExceeds,
   tokenExhaustedAfterSummarization,
   doomLoopDetected,
@@ -136,6 +152,11 @@ import {
   ToolLoopObserver,
   type AgentGuardrailObservation,
 } from "@/lib/chat/tool-loop-observer";
+import {
+  buildToolFailureNotice,
+  ToolFailureRecovery,
+  type ToolFailureNotice,
+} from "@/lib/chat/tool-failure-recovery";
 import {
   createAssistantContentLoopMonitor,
   type AssistantContentLoopDetection,
@@ -164,6 +185,7 @@ import {
   getMaxTokensForSubscription,
   safeCountTokens,
 } from "@/lib/token-utils";
+import { isValidTokenCount } from "@/lib/token-usage";
 import { getSummarizationThresholdTokens } from "@/lib/chat/summarization/constants";
 import { compactModelMessagesInRun } from "@/lib/chat/summarization";
 import {
@@ -178,6 +200,11 @@ import {
   RollingCompactionAttempts,
   type RollingModelContextCheckpoint,
 } from "@/lib/chat/summarization/rolling-context";
+import {
+  buildContextBudgetProjectionDiagnostics,
+  CONTEXT_BUDGET_DECISION_NOT_EVALUATED,
+  type ContextBudgetDecision,
+} from "@/lib/chat/summarization/context-budget-diagnostics";
 import {
   withProviderRequestSizeRecovery,
   type ProviderRequestRetryParams,
@@ -463,6 +490,8 @@ export type AgentStreamState = {
     toolCallCount?: number;
   };
   toolCycleRecoveryCount: number;
+  /** Varied explicit failures of one tool; counts only, shared by replacements. */
+  toolFailureRecovery: ToolFailureRecovery;
   /** True only when the final provider attempt stopped at the step condition. */
   stoppedDueToStepLimit: boolean;
   stoppedDueToTokenExhaustion: boolean;
@@ -500,6 +529,7 @@ export function initAgentStreamState(
     hasCompletedAbliterationStep: false,
     toolLoopObserver: new ToolLoopObserver(),
     toolCycleRecoveryCount: 0,
+    toolFailureRecovery: new ToolFailureRecovery(),
     stoppedDueToStepLimit: false,
     stoppedDueToTokenExhaustion: false,
     stoppedDueToElapsedTimeout: false,
@@ -762,6 +792,36 @@ const buildProviderRequestDiagnostics = (args: {
   };
 };
 
+/**
+ * Display-only Agent context pressure: the provider-reported input of this
+ * step and the compaction threshold active for it. A missing or malformed
+ * report keeps the previous valid snapshot. One stable part ID per response
+ * replaces the previous value live, and the tracker carries it to the save.
+ */
+const reportContextPressure = (
+  ctx: Pick<AgentStreamContext, "mode" | "writer" | "summarizationTracker">,
+  usedTokens: number | undefined,
+  compactionThresholdTokens: number,
+  partId: string,
+): void => {
+  if (ctx.mode !== "agent") return;
+  const snapshot = toContextPressureSnapshot(
+    usedTokens,
+    compactionThresholdTokens,
+  );
+  if (!snapshot) return;
+  try {
+    ctx.summarizationTracker.recordContextPressure(snapshot, partId);
+    ctx.writer.write({
+      type: CONTEXT_USAGE_PART_TYPE,
+      id: partId,
+      data: snapshot,
+    });
+  } catch {
+    // Display diagnostics must never disrupt generation.
+  }
+};
+
 // ---------------------------------------------------------------------------
 // Immutable context — everything the runner needs besides mutable state.
 // ---------------------------------------------------------------------------
@@ -830,6 +890,8 @@ export type AgentStreamContext = {
     getSandboxType(toolName: string): string | undefined;
     getSandboxInfo?(): import("@/types").SandboxInfo | null;
     supportsInteractivePty?(): Promise<boolean>;
+    /** Fresh verification of the run's watched local host before completion. */
+    confirmLocalConnection?(signal?: AbortSignal): Promise<void>;
   };
   getTodoManager: () => { getAllTodos: () => import("@/types").Todo[] };
   ensureSandbox: import("@/lib/chat/summarization").EnsureSandbox;
@@ -900,7 +962,17 @@ export async function createAgentStream(
   };
   const configuredMaxSteps = getMaxStepsForUser(ctx.mode);
   const generationStepOffset = state.agentStepCount;
+  // A replacement stream can inherit the previous response's SDK parts.
+  // Keep each attempt's snapshot from overwriting that recovery prefix.
+  const contextPressurePartId = `${CONTEXT_USAGE_SNAPSHOT_ID_PREFIX}-${generationStepOffset}`;
   state.configuredMaxSteps = configuredMaxSteps;
+  try {
+    // Callers save the previous attempt's response before starting this one;
+    // a replacement stream must measure its own response.
+    ctx.summarizationTracker.clearContextPressure();
+  } catch {
+    // Display diagnostics must never disrupt generation.
+  }
   const reportGuardrail = (
     observation: Omit<
       AgentGuardrailObservation,
@@ -1068,8 +1140,32 @@ export async function createAgentStream(
     ctx.mode === "agent" &&
     ctx.agentModelContextEnabled &&
     contextFlag !== undefined;
+  // Derived from the run's final selector, so a normalized Max request cannot
+  // keep a stale policy. Explicit Pro/Max still needs the caller's snapshot.
+  const paidContext =
+    !expandedContextEnabled &&
+    getAgentContextPolicy({
+      subscription: ctx.subscription,
+      mode: ctx.mode,
+      selectedModelOverride: ctx.selectedModelOverride,
+    }) === "paid_480k";
+  const contextPolicy: AgentContextPolicy = expandedContextEnabled
+    ? "expanded"
+    : paidContext
+      ? "paid_480k"
+      : "baseline";
+  // Route-aware budgets, pre-send enforcement and prepared-input estimates.
+  const routeAwareContext =
+    ctx.mode === "agent" &&
+    (ctx.agentModelContextEnabled === true || paidContext);
   let activeModelInputTokens = 0;
   let lastPreparedInputEstimate = 0;
+  // Failure diagnostics only: the compaction decision value actually compared
+  // in the current prepareStep. Reset per step so a guard never reports a
+  // previous step's or stream's decision.
+  let contextBudgetDecision: ContextBudgetDecision =
+    CONTEXT_BUDGET_DECISION_NOT_EVALUATED;
+  let contextBudgetStepIndex: number | undefined;
   let lastCompletedResponseMessages: ModelMessage[] = [];
   let summarizationThreshold = getSummarizationThresholdTokens(
     getMaxTokensForSubscription(ctx.subscription, { mode: ctx.mode }),
@@ -1134,6 +1230,14 @@ export async function createAgentStream(
       ) {
         recoveryModel = withInferenceFallback(recoveryModel, fallback, {
           abortSignal,
+          // Ask has no size recovery and keeps the immediate fallback.
+          ...(ctx.mode === "agent" && {
+            deferPreStreamRejection: (error: unknown) =>
+              shouldDeferInferenceRejectionToSizeRecovery(
+                error,
+                state.requestSizeRecovery,
+              ),
+          }),
           prepareFallbackPrompt: (prompt) =>
             preprocessAbliterationImages(prompt),
           onDiscardedUsage: (usage) => {
@@ -1273,6 +1377,7 @@ export async function createAgentStream(
   type DoomLoopRecovery = {
     nudge?: string;
     excludedTools?: ReadonlySet<string>;
+    toolFailure?: ToolFailureNotice;
   };
 
   // Repeated results are a reason to inspect progress, not proof of failure.
@@ -1292,12 +1397,14 @@ export async function createAgentStream(
       ? confirmedFailureCycleNudge
       : toolCycleNudge;
   let preparedToolCycleRecovery: AgentStreamState["pendingToolCycleRecovery"];
-  const markToolCycleRecoveryPrepared = (recovery: DoomLoopRecovery) => {
+  let preparedToolFailureRecovery: ToolFailureNotice | undefined;
+  const markRecoveryPrepared = (recovery: DoomLoopRecovery) => {
     if (
       recovery.nudge?.includes(toolCycleNudge) ||
       recovery.nudge?.includes(confirmedFailureCycleNudge)
     )
       preparedToolCycleRecovery = state.pendingToolCycleRecovery;
+    preparedToolFailureRecovery = recovery.toolFailure;
   };
 
   const getDoomLoopRecovery = (
@@ -1310,10 +1417,17 @@ export async function createAgentStream(
       // the hard stop. Keep only malformed-input recovery in this path.
       isAgentMode(ctx.mode) ? null : undefined,
     );
+    const toolFailure = isAgentMode(ctx.mode)
+      ? state.toolFailureRecovery.getPendingNotice()
+      : undefined;
+    const pendingNudges = [
+      ...(state.pendingToolCycleRecovery ? [pendingToolCycleNudge()] : []),
+      ...(toolFailure ? [buildToolFailureNotice(toolFailure)] : []),
+    ];
 
     if (loopCheck.severity === "none") {
-      return state.pendingToolCycleRecovery
-        ? { nudge: pendingToolCycleNudge() }
+      return pendingNudges.length
+        ? { nudge: pendingNudges.join("\n\n"), toolFailure }
         : {};
     }
 
@@ -1333,10 +1447,8 @@ export async function createAgentStream(
     });
 
     const recovery: DoomLoopRecovery = {
-      nudge: [
-        generateDoomLoopNudge(loopCheck),
-        ...(state.pendingToolCycleRecovery ? [pendingToolCycleNudge()] : []),
-      ].join("\n\n"),
+      nudge: [generateDoomLoopNudge(loopCheck), ...pendingNudges].join("\n\n"),
+      toolFailure,
     };
     console.log("[doom-loop] Injecting nudge as last user message");
 
@@ -1431,9 +1543,9 @@ export async function createAgentStream(
       useInference ? INFERENCE_CYBER_MODEL_KEY : effectiveModelName,
     );
     lastRequestedSlug = languageModel.modelId;
-    if (ctx.mode === "agent" && ctx.agentModelContextEnabled) {
+    if (routeAwareContext) {
       activeContextBudget = getAgentContextBudget({
-        enabled: expandedContextEnabled,
+        policy: contextPolicy,
         mode: ctx.mode,
         subscription: ctx.subscription,
         modelId: languageModel.modelId,
@@ -1565,27 +1677,30 @@ export async function createAgentStream(
           effectiveModelName,
         );
 
+    const attachedFileAnnotations = openRouterFileAnnotations;
     const prepared = addPromptCacheBreakpoints(
       addOpenRouterFileAnnotationsToLastAssistantMessage(
         messagesWithAuthorization,
-        openRouterFileAnnotations,
+        attachedFileAnnotations,
       ),
       ctx.trackedProvider.languageModel(effectiveModelName).modelId,
     );
+    let preparedMessageTokens: number | undefined;
+    let preparedSystemTokens: number | undefined;
     // A failed compaction must not send expanded history to a smaller model.
     // Preserve the transcript for retry instead of silently deleting context.
     if (
       ctx.mode === "agent" &&
-      (ctx.agentModelContextEnabled || compactionAttempts.pendingVerdict)
+      (routeAwareContext || compactionAttempts.pendingVerdict)
     ) {
-      lastPreparedInputEstimate =
-        estimateSummaryInputTokens(prepared) +
-        Math.max(
-          ctx.systemPromptTokens + runtimePromptTokens,
-          safeCountTokens(
-            JSON.stringify(requestSystemPrompt(effectiveModelName)),
-          ),
-        );
+      preparedMessageTokens = estimateSummaryInputTokens(prepared);
+      preparedSystemTokens = Math.max(
+        ctx.systemPromptTokens + runtimePromptTokens,
+        safeCountTokens(
+          JSON.stringify(requestSystemPrompt(effectiveModelName)),
+        ),
+      );
+      lastPreparedInputEstimate = preparedMessageTokens + preparedSystemTokens;
       if (compactionAttempts.pendingVerdict) {
         // Include fixed request overhead before falling back to this estimate
         // when the provider omits usage. All tools are a conservative bound
@@ -1602,22 +1717,38 @@ export async function createAgentStream(
       }
       lastCompletedResponseMessages = [];
     }
+    // Tool schemas are sent with every request, so the final send guard counts
+    // them (memoized; all tools bound steps that activate only a subset).
+    const toolSchemaTokens =
+      enforceContextBudget && routeAwareContext
+        ? await getToolSchemaInputEstimate()
+        : 0;
     if (
       enforceContextBudget &&
-      ctx.mode === "agent" &&
-      ctx.agentModelContextEnabled &&
-      lastPreparedInputEstimate > activeContextBudget
+      routeAwareContext &&
+      lastPreparedInputEstimate + toolSchemaTokens > activeContextBudget
     ) {
       console.warn(
         JSON.stringify({
           event: "agent_context_budget_exceeded",
           chat_id: ctx.chatId,
           model: effectiveModelName,
-          estimated_input_tokens: lastPreparedInputEstimate,
+          estimated_input_tokens: lastPreparedInputEstimate + toolSchemaTokens,
+          tool_schema_tokens: toolSchemaTokens,
           previous_provider_input_tokens: state.lastStepInputTokens,
           max_tokens: activeContextBudget,
           compaction_attempt_count: compactionAttempts.attemptCount,
           unproductive_compaction_count: compactionAttempts.unproductiveCount,
+          // Bounded, failure-only breakdown; never throws or tokenizes on
+          // healthy requests.
+          ...buildContextBudgetProjectionDiagnostics({
+            stepIndex: contextBudgetStepIndex,
+            decision: contextBudgetDecision,
+            preparedMessageTokens,
+            systemTokens: preparedSystemTokens,
+            preparedMessages: prepared,
+            attachedFileAnnotations,
+          }),
         }),
       );
       throw new AgentContextBudgetError(
@@ -2043,7 +2174,7 @@ export async function createAgentStream(
       baselineModel: modelName,
       selectedModel: ctx.selectedModelOverride,
       platformAuthorized: ctx.platformAuthorized,
-      expandedAgentContext: expandedContextEnabled,
+      agentContextPolicy: contextPolicy,
       onDiscardedUsage: (usage) =>
         ctx.summarizationTracker.recordSummarizationUsage(
           usage,
@@ -2152,6 +2283,21 @@ export async function createAgentStream(
           { deduplicate: false },
         );
       }
+      if (!abortSignal.aborted && preparedToolFailureRecovery) {
+        const notice = preparedToolFailureRecovery;
+        preparedToolFailureRecovery = undefined;
+        state.toolFailureRecovery.recordExposure(notice);
+        reportGuardrail(
+          {
+            reason: "repeated_tool_failure",
+            action: "nudge",
+            tool_names: [notice.toolName],
+            repeat_count: notice.failureCount,
+          },
+          // Bounded by MAX_TOOL_FAILURE_NOTICES actual exposures per request.
+          { deduplicate: false },
+        );
+      }
       if (
         !abortSignal.aborted &&
         !state.agentContextBudgetExposed &&
@@ -2194,6 +2340,8 @@ export async function createAgentStream(
     },
 
     prepareStep: async ({ steps, messages, stepNumber }) => {
+      contextBudgetDecision = CONTEXT_BUDGET_DECISION_NOT_EVALUATED;
+      contextBudgetStepIndex = undefined;
       reportMemoryActivity({ operation: "prepare_step" });
       await ctx.waitForBrowserHandoff?.(abortSignal);
       // Keep admission outside preparation recovery: an exhausted shared ledger
@@ -2228,12 +2376,14 @@ export async function createAgentStream(
       runtimeSection = nextRuntimeSection;
       runtimePromptTokens = safeCountTokens(runtimeSection);
       preparedToolCycleRecovery = undefined;
+      preparedToolFailureRecovery = undefined;
       const localGenerationStepIndex =
         Number.isInteger(stepNumber) && stepNumber >= 0
           ? stepNumber
           : steps.length;
       const generationStepIndex =
         generationStepOffset + localGenerationStepIndex;
+      contextBudgetStepIndex = generationStepIndex;
       const rawModelMessages = messages as ModelMessage[];
       if (
         historyEnabled &&
@@ -2322,6 +2472,14 @@ export async function createAgentStream(
         const effectiveModelInfo = getEffectiveModelInfo(generationStepIndex);
 
         const loopRecovery = getDoomLoopRecovery(steps, steps.length);
+        // Compaction checkpoints are replayed by later steps and replacement
+        // streams. Add recovery guidance to this provider request only.
+        const withRecoveryNudge = (messages: ModelMessage[]): ModelMessage[] =>
+          !loopRecovery.nudge
+            ? messages
+            : historyEnabled
+              ? historyReplay.append(messages, "recovery", loopRecovery.nudge)
+              : [...messages, { role: "user", content: loopRecovery.nudge }];
         const providerPromptPressure = getProviderPromptPressure(
           rollingModelMessages,
           {
@@ -2331,21 +2489,48 @@ export async function createAgentStream(
         const shouldCheckDurableSummary =
           ctx.summarizationTracker.summarizationCount === 0 &&
           steps.length === 0;
+        // Records the value only when the existing short-circuited comparison
+        // actually evaluates it; no additional estimate is computed.
+        const rollingCheckInputTokens = async (): Promise<number> => {
+          // The route-aware send guard counts parsed-file annotations attached
+          // to the prepared request and the memoized tool schema estimate.
+          // Count both here so compaction triggers before that guard fails.
+          const decisionMessages = routeAwareContext
+            ? addOpenRouterFileAnnotationsToLastAssistantMessage(
+                rollingModelMessages,
+                openRouterFileAnnotations,
+              )
+            : rollingModelMessages;
+          const inputTokens =
+            estimateSummaryInputTokens(decisionMessages) +
+            ctx.systemPromptTokens +
+            runtimePromptTokens +
+            (routeAwareContext ? await getToolSchemaInputEstimate() : 0);
+          contextBudgetDecision = { source: "rolling_check", inputTokens };
+          return inputTokens;
+        };
         const shouldCompactInRun =
           !shouldCheckDurableSummary &&
           (providerPromptPressure !== null ||
             state.lastStepInputTokens > summarizationThreshold ||
             (ctx.mode === "agent" &&
-              estimateSummaryInputTokens(rollingModelMessages) +
-                ctx.systemPromptTokens +
-                runtimePromptTokens >
-                summarizationThreshold));
+              (await rollingCheckInputTokens()) > summarizationThreshold));
 
         if (
           canSummarizeAgain() &&
           (shouldCheckDurableSummary || shouldCompactInRun)
         ) {
           if (shouldCheckDurableSummary) {
+            // Same request overhead as the route-aware send guard.
+            const durablePreparedInputTokens = routeAwareContext
+              ? lastPreparedInputEstimate + (await getToolSchemaInputEstimate())
+              : undefined;
+            if (durablePreparedInputTokens !== undefined) {
+              contextBudgetDecision = {
+                source: "durable_check",
+                inputTokens: durablePreparedInputTokens,
+              };
+            }
             const result = await runSummarizationStep({
               compactionPolicy,
               messages: state.finalMessages,
@@ -2366,10 +2551,7 @@ export async function createAgentStream(
                 (ctx.contextUsageOn ? runtimePromptTokens : 0),
               ctxMaxTokens: activeContextBudget,
               providerInputTokens: state.lastStepInputTokens,
-              preparedInputTokens:
-                ctx.mode === "agent" && ctx.agentModelContextEnabled
-                  ? lastPreparedInputEstimate
-                  : undefined,
+              preparedInputTokens: durablePreparedInputTokens,
               chatSystemPrompt: ctx.currentSystemPrompt,
               tools: ctx.tools,
               providerOptions: getStepProviderOptions(
@@ -2443,12 +2625,12 @@ export async function createAgentStream(
               state.postSummarizationContinuationActive = true;
               state.postSummarizationToolCallCount = 0;
               state.postSummarizationText = "";
-              const continuationPrompt = loopRecovery.nudge
-                ? `${POST_SUMMARIZATION_CONTINUATION_PROMPT}\n\n${loopRecovery.nudge}`
-                : POST_SUMMARIZATION_CONTINUATION_PROMPT;
               summarizedModelMessages = [
                 ...summarizedModelMessages,
-                { role: "user", content: continuationPrompt },
+                {
+                  role: "user",
+                  content: POST_SUMMARIZATION_CONTINUATION_PROMPT,
+                },
                 ...(parentGate.reminder
                   ? [{ role: "user" as const, content: parentGate.reminder }]
                   : []),
@@ -2476,7 +2658,7 @@ export async function createAgentStream(
                 1,
               );
               const preparedMessages = await prepareProviderMessages(
-                summarizedModelMessages,
+                withRecoveryNudge(summarizedModelMessages),
                 continuationModelInfo.modelName,
               );
               if (historyEnabled) {
@@ -2494,7 +2676,7 @@ export async function createAgentStream(
                 providerOptions,
                 activeTools,
               });
-              markToolCycleRecoveryPrepared(loopRecovery);
+              markRecoveryPrepared(loopRecovery);
               return {
                 model: getNamespacedLanguageModel(
                   continuationModelInfo.languageModel,
@@ -2555,9 +2737,6 @@ export async function createAgentStream(
               // The helper clears its transient UI state. A later raw cursor
               // may retry while the bounded attempt budget remains.
             } else {
-              const continuationPrompt = loopRecovery.nudge
-                ? `${POST_SUMMARIZATION_CONTINUATION_PROMPT}\n\n${loopRecovery.nudge}`
-                : POST_SUMMARIZATION_CONTINUATION_PROMPT;
               const {
                 baseMessages: nextBaseMessages,
                 summaryMessageCount: compactedMessageCount,
@@ -2568,7 +2747,10 @@ export async function createAgentStream(
                 sourceMessages: rollingModelMessages,
                 tools: ctx.tools,
                 trailingMessages: [
-                  { role: "user", content: continuationPrompt },
+                  {
+                    role: "user",
+                    content: POST_SUMMARIZATION_CONTINUATION_PROMPT,
+                  },
                   ...(parentGate.reminder
                     ? [{ role: "user" as const, content: parentGate.reminder }]
                     : []),
@@ -2661,7 +2843,9 @@ export async function createAgentStream(
                   continuationModelInfo.modelName,
                 );
                 const preparedMessages = await prepareProviderMessages(
-                  withHandoffNotes(nextBaseMessages, compactedMessageCount),
+                  withRecoveryNudge(
+                    withHandoffNotes(nextBaseMessages, compactedMessageCount),
+                  ),
                   continuationModelInfo.modelName,
                 );
                 if (historyEnabled) {
@@ -2682,7 +2866,7 @@ export async function createAgentStream(
                   providerOptions,
                   activeTools,
                 });
-                markToolCycleRecoveryPrepared(loopRecovery);
+                markRecoveryPrepared(loopRecovery);
                 return {
                   model: getNamespacedLanguageModel(
                     continuationModelInfo.languageModel,
@@ -2792,7 +2976,7 @@ export async function createAgentStream(
           providerOptions,
           activeTools,
         });
-        markToolCycleRecoveryPrepared(loopRecovery);
+        markRecoveryPrepared(loopRecovery);
         return {
           model: getNamespacedLanguageModel(
             effectiveModelInfo.languageModel,
@@ -2908,7 +3092,7 @@ export async function createAgentStream(
           return summarizationThreshold;
         },
         getLastStepInputTokens: () =>
-          ctx.agentModelContextEnabled && !canSummarizeAgain()
+          (ctx.agentModelContextEnabled || paidContext) && !canSummarizeAgain()
             ? Math.max(
                 state.lastStepInputTokens,
                 lastPreparedInputEstimate +
@@ -3149,6 +3333,11 @@ export async function createAgentStream(
         getOpenRouterFileAnnotations(providerMetadata) ??
         openRouterFileAnnotations;
       let stepUsageCostIndex: number | undefined;
+      // A malformed count is unknown: it must not lower context usage or
+      // confirm that an earlier compaction recovered the context.
+      const reportedInputTokens = isValidTokenCount(usage?.inputTokens)
+        ? usage.inputTokens
+        : undefined;
       if (usage) {
         const stepAccountingModel = resolveServedModelForCostAccounting({
           modelName: activeStepModelName,
@@ -3162,15 +3351,21 @@ export async function createAgentStream(
           usage as Parameters<typeof ctx.usageTracker.accumulateStep>[0],
           stepAccountingModel,
         );
-        state.lastStepInputTokens = usage.inputTokens || 0;
-        if (usage.inputTokens) {
+        state.lastStepInputTokens = reportedInputTokens ?? 0;
+        if (reportedInputTokens) {
           state.ctxUsage = {
             ...state.ctxUsage,
-            usedTokens: usage.inputTokens,
+            usedTokens: reportedInputTokens,
           };
         }
       }
-      compactionAttempts.confirm(usage?.inputTokens, summarizationThreshold);
+      compactionAttempts.confirm(reportedInputTokens, summarizationThreshold);
+      reportContextPressure(
+        ctx,
+        reportedInputTokens,
+        summarizationThreshold,
+        contextPressurePartId,
+      );
       stepUsageCostIndexes.push(stepUsageCostIndex);
 
       const stepOpenRouterMetadata = extractOpenRouterMetadata({
@@ -3231,6 +3426,25 @@ export async function createAgentStream(
           state.toolLoopObserver.reset();
           state.pendingToolCycleRecovery = undefined;
         }
+        try {
+          const failure = state.toolFailureRecovery.observe(
+            toolCalls ?? [],
+            toolResults ?? [],
+            // Exact repeats already receive the cycle notice and hard stop.
+            { armNotice: !state.toolLoopObserver.getCurrentCycle() },
+          );
+          if (failure) {
+            reportGuardrail({
+              reason: "repeated_tool_failure",
+              action: "observe",
+              tool_names: [failure.toolName],
+              repeat_count: failure.failureCount,
+              run_cost_dollars: currentCostDollars,
+            });
+          }
+        } catch {
+          state.toolFailureRecovery.reset();
+        }
       }
       const budgetDecision =
         ctx.budgetMonitor?.checkAfterStep(currentCostDollars);
@@ -3271,9 +3485,46 @@ export async function createAgentStream(
       // A final response can arrive while the user is taking control. Hold normal
       // completion so caller cleanup cannot close the browser underneath them.
       ctx.onModelStreamFinish?.();
-      if (!abortSignal.aborted) await ctx.waitForBrowserHandoff?.(abortSignal);
-      const { finishReason, usage, response } = finishResult;
+      const handoffAbandoned = () =>
+        ctx.abortController.signal.reason instanceof
+        BrowserHandoffAbandonedError;
+      if (!abortSignal.aborted) {
+        try {
+          await ctx.waitForBrowserHandoff?.(abortSignal);
+        } catch (error) {
+          // An abandoned handoff is a resumable stop: settle this response's
+          // usage below. Any other interruption still propagates unchanged.
+          if (!handoffAbandoned()) throw error;
+        }
+      }
+      // Close terminals first: a confirmed exit is a known outcome, so an
+      // open healthy session never reads as uncertain work below.
+      await ptySessionManager
+        .closeAll(ctx.chatId)
+        .catch((err) =>
+          console.error("[agent-stream] PTY closeAll (onFinish) failed:", err),
+        );
+      // A model can finish while its selected host is recovering. Completion
+      // waits for fresh proof of the same session, or for the loss; a stop,
+      // budget or timeout never waits on the host.
+      let localConnectionLoss: LocalConnectionLostError | undefined;
+      if (
+        !abortSignal.aborted &&
+        ctx.getHardTimeoutReason() === null &&
+        !state.stoppedDueToElapsedTimeout &&
+        !state.stoppedDueToBudgetExhaustion &&
+        !state.stoppedDueToAgentRunSpendCap
+      ) {
+        try {
+          await ctx.sandboxManager.confirmLocalConnection?.(abortSignal);
+        } catch (error) {
+          if (error instanceof LocalConnectionLostError)
+            localConnectionLoss = error;
+          else if (!abortSignal.aborted) throw error;
+        }
+      }
       const hardReason = ctx.getHardTimeoutReason();
+      const { finishReason, usage, response } = finishResult;
       if (
         hardReason === null &&
         state.postSummarizationContinuationActive &&
@@ -3296,9 +3547,12 @@ export async function createAgentStream(
         });
       }
       if (
+        localConnectionLoss ||
         ctx.abortController.signal.reason instanceof LocalConnectionLostError
       ) {
         state.streamFinishReason = LOCAL_CONNECTION_LOST_FINISH_REASON;
+      } else if (handoffAbandoned()) {
+        state.streamFinishReason = BROWSER_HANDOFF_ABANDONED_FINISH_REASON;
       } else if (hardReason !== null) {
         state.streamFinishReason = hardReason;
       } else if (state.stoppedDueToElapsedTimeout) {
@@ -3405,11 +3659,6 @@ export async function createAgentStream(
         settled: true,
       });
 
-      await ptySessionManager
-        .closeAll(ctx.chatId)
-        .catch((err) =>
-          console.error("[agent-stream] PTY closeAll (onFinish) failed:", err),
-        );
       if (
         historyEnabled &&
         historyToSave &&
@@ -3557,6 +3806,11 @@ export async function createAgentStream(
         ctx.abortController.signal.reason instanceof LocalConnectionLostError
       ) {
         state.streamFinishReason = LOCAL_CONNECTION_LOST_FINISH_REASON;
+      } else if (
+        ctx.abortController.signal.reason instanceof
+        BrowserHandoffAbandonedError
+      ) {
+        state.streamFinishReason = BROWSER_HANDOFF_ABANDONED_FINISH_REASON;
       }
       recordAssistantContentLoopAbortState(steps);
       await refundProviderContentBlockedIfSettled({

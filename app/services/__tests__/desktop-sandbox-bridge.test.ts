@@ -18,7 +18,17 @@ import {
 import type * as TauriCore from "@tauri-apps/api/core";
 import { DesktopRelayTelemetry } from "@/lib/analytics/desktop-relay";
 import { sanitizeDesktopAckEvent } from "@/lib/analytics/desktop-ack-privacy";
+import {
+  applyDesktopRuntimeIdentity,
+  startDesktopRuntimeIdentityLookup,
+} from "@/lib/analytics/desktop-runtime-identity";
 import { DESKTOP_TERMINAL_ERROR_PROPERTIES } from "@/lib/analytics/desktop-terminal-error-diagnostics";
+import {
+  DESKTOP_INVOCATION_ADMISSION_PROPERTIES,
+  DESKTOP_INVOCATION_REJECTION_PROPERTIES,
+  DESKTOP_INVOCATION_SPAWN_HINT_PROPERTIES,
+  DESKTOP_INVOCATION_UNKNOWN_PROPERTIES,
+} from "@/lib/analytics/desktop-invocation-rejection-diagnostics";
 import {
   NATIVE_AUTHORIZATION_CAUSE_PROPERTIES,
   NATIVE_AUTHORIZATION_CONNECTOR_PROPERTIES,
@@ -26,6 +36,8 @@ import {
   NATIVE_AUTHORIZATION_IO_PROPERTIES,
   NATIVE_AUTHORIZATION_MITIGATION_PROPERTIES,
   NATIVE_AUTHORIZATION_RESPONSE_PROPERTIES,
+  NATIVE_AUTHORIZATION_RESPONSE_READ_PROPERTIES,
+  NATIVE_AUTHORIZATION_RESPONSE_READ_TIMING_PROPERTIES,
   NATIVE_AUTHORIZATION_TRANSPORT_PROPERTIES,
 } from "@/lib/analytics/native-authorization-diagnostics";
 import { LOCAL_SANDBOX_HEARTBEAT_INTERVAL_MS } from "@/lib/centrifugo/presence";
@@ -1108,6 +1120,100 @@ describe("desktop capability registration", () => {
       }
     },
   );
+
+  it("reports only validated native lifecycle fields and keeps the registration OS shape", async () => {
+    const original = mockInvokeHandler;
+    const valid = {
+      launchId: "0123456789abcdef0123456789abcdef",
+      previousExit: "unclean",
+      previousWebProcessTermination: "memory_limit",
+      pageGeneration: 2,
+      webProcessTermination: "crashed",
+    };
+    let lifecycle: unknown = valid;
+    mockInvokeHandler = async (cmd, args) => {
+      if (cmd === "plugin:app|version") return "0.0.81";
+      if (cmd === "get_desktop_os_info")
+        return {
+          platform: "linux",
+          arch: "x64",
+          release: "6.8.0",
+          hostname: "qa-host",
+          ...(lifecycle === undefined ? {} : { lifecycle }),
+        };
+      return original(cmd, args);
+    };
+    // A fresh bridge per case keeps its relay telemetry's first event immediate.
+    const relayPropertiesAfterStart = async () => {
+      jest.mocked(captureAuthenticatedEvent).mockClear();
+      mockSubscription.on.mockClear();
+      const config = buildConfig();
+      const bridge = new DesktopSandboxBridge(config);
+      try {
+        await bridge.start();
+        // The backend validator accepts exactly these four OS fields.
+        expect(config.connectDesktop).toHaveBeenCalledWith(
+          expect.objectContaining({
+            osInfo: {
+              platform: "linux",
+              arch: "x64",
+              release: "6.8.0",
+              hostname: "qa-host",
+            },
+          }),
+        );
+        getSubscriptionHandler("subscribed")({
+          recovered: false,
+          wasRecovering: false,
+        });
+        const relay = jest
+          .mocked(captureAuthenticatedEvent)
+          .mock.calls.find(
+            ([event, properties]) =>
+              event === "desktop_bridge_relay_state_changed" &&
+              properties?.source === "subscription",
+          );
+        expect(relay).toBeDefined();
+        return relay![1] as Record<string, unknown>;
+      } finally {
+        await bridge.stop();
+      }
+    };
+    try {
+      expect(await relayPropertiesAfterStart()).toEqual(
+        expect.objectContaining({
+          native_launch_id: valid.launchId,
+          native_previous_exit: "unclean",
+          native_previous_web_process_termination: "memory_limit",
+          native_page_generation: 2,
+          native_web_process_termination: "crashed",
+        }),
+      );
+      for (const invalid of [
+        undefined, // older native binaries
+        null,
+        { ...valid, launchId: "/home/user/project" },
+        { ...valid, previousExit: "crash" },
+        { ...valid, previousWebProcessTermination: "/home/user/project" },
+        { ...valid, previousWebProcessTermination: undefined },
+        { ...valid, pageGeneration: -1 },
+        { ...valid, pageGeneration: 1.5 },
+        { ...valid, webProcessTermination: "https://target.example/" },
+      ]) {
+        lifecycle = invalid;
+        const properties = await relayPropertiesAfterStart();
+        expect(
+          Object.keys(properties).filter((key) =>
+            /^native_(launch_id|previous_exit|previous_web_process_termination|page_generation|web_process_termination)$/.test(
+              key,
+            ),
+          ),
+        ).toEqual([]);
+      }
+    } finally {
+      mockInvokeHandler = original;
+    }
+  });
 
   it("records Windows native diagnostics without trusting the browser user agent", async () => {
     const original = mockInvokeHandler;
@@ -5830,6 +5936,231 @@ it.each([
   },
 );
 
+describe("Desktop session challenge", () => {
+  const LAUNCH = "c".repeat(32);
+  const NONCE = "b".repeat(32);
+  const lifecycle = (pageGeneration: number) => ({
+    launchId: LAUNCH,
+    previousExit: "clean",
+    previousWebProcessTermination: "none",
+    pageGeneration,
+    webProcessTermination: "none",
+  });
+  const challenge = (
+    commandIds: string[],
+    targetConnectionId = "conn-123",
+  ) => ({
+    type: "desktop_session_challenge",
+    nonce: NONCE,
+    targetConnectionId,
+    commandIds,
+  });
+  const proofs = () =>
+    mockSubscription.publish.mock.calls
+      .map(([message]) => message)
+      .filter((message) => message?.type === "desktop_session_proof");
+
+  async function startBridge(native: () => unknown) {
+    jest.useFakeTimers();
+    let osReads = 0;
+    let executions = 0;
+    const fallback = mockInvokeHandler;
+    mockInvokeHandler = async (cmd, args) => {
+      if (cmd === "get_desktop_os_info") {
+        osReads++;
+        return native();
+      }
+      // A running command: native execution never completes here.
+      if (cmd === "execute_stream_command") {
+        executions++;
+        return new Promise(() => {});
+      }
+      return fallback(cmd, args);
+    };
+    const bridge = new DesktopSandboxBridge(buildConfig());
+    await bridge.start();
+    return {
+      bridge,
+      osReads: () => osReads,
+      executions: () => executions,
+    };
+  }
+
+  afterEach(() => jest.useRealTimers());
+
+  it("answers with fresh native identity and only the command output it retains, never executing", async () => {
+    let generation = 2;
+    const host = await startBridge(() => ({
+      platform: "darwin",
+      arch: "arm64",
+      release: "qa",
+      hostname: "qa",
+      lifecycle: lifecycle(generation),
+    }));
+    try {
+      const reply = {
+        ...mockSubscription,
+        on: jest.fn(),
+        publish: jest.fn().mockResolvedValue(undefined),
+        unsubscribe: jest.fn(),
+        removeAllListeners: jest.fn(),
+      };
+      mockClient.newSubscription.mockReturnValueOnce(reply);
+      getPublicationHandler()({
+        data: {
+          type: "command",
+          commandId: "running",
+          command: "bounded",
+          timeout: 120_000,
+          outputProtocol: "ack-v1",
+          targetConnectionId: "conn-123",
+          operationChannel: true,
+        },
+      });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(host.executions()).toBe(1);
+      const startupReads = host.osReads();
+
+      getPublicationHandler()({ data: challenge(["running", "unknown"]) });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(host.osReads()).toBe(startupReads + 1);
+      expect(proofs()).toEqual([
+        {
+          type: "desktop_session_proof",
+          nonce: NONCE,
+          connectionId: "conn-123",
+          launchId: LAUNCH,
+          pageGeneration: 2,
+          retainedCommandIds: ["running"],
+        },
+      ]);
+
+      // A later page generation cannot vouch for this page's commands.
+      generation = 3;
+      getPublicationHandler()({ data: challenge(["running"]) });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(proofs().at(-1)).toEqual({
+        type: "desktop_session_proof",
+        nonce: NONCE,
+        connectionId: "conn-123",
+        unavailable: true,
+      });
+
+      // Another connection's challenge is never answered.
+      getPublicationHandler()({ data: challenge([], "conn-other") });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(proofs()).toHaveLength(2);
+      expect(host.executions()).toBe(1);
+    } finally {
+      await host.bridge.stop();
+    }
+  });
+
+  it("never claims a closed output window that remains mapped while native execution is pending", async () => {
+    const host = await startBridge(() => ({
+      platform: "darwin",
+      arch: "arm64",
+      release: "qa",
+      hostname: "qa",
+      lifecycle: lifecycle(2),
+    }));
+    const spies = ["warn", "error"].map((method) =>
+      jest.spyOn(console, method as "warn").mockImplementation(() => {}),
+    );
+    try {
+      const reply = {
+        ...mockSubscription,
+        on: jest.fn(),
+        publish: jest.fn().mockResolvedValue(undefined),
+        unsubscribe: jest.fn(),
+        removeAllListeners: jest.fn(),
+      };
+      mockClient.newSubscription.mockReturnValueOnce(reply);
+      getPublicationHandler()({
+        data: {
+          type: "command",
+          commandId: "overflowed",
+          command: "noisy",
+          timeout: 120_000,
+          outputProtocol: "ack-v1",
+          targetConnectionId: "conn-123",
+          operationChannel: true,
+        },
+      });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(host.executions()).toBe(1);
+      // Unacknowledged, never-combined frames exceed the window: it closes
+      // while the native invocation itself is still running.
+      for (let i = 0; i <= 4096; i++)
+        capturedChannel!.onmessage!({
+          type: i % 2 ? "stderr" : "stdout",
+          data: "x",
+        });
+      await jest.advanceTimersByTimeAsync(0);
+
+      getPublicationHandler()({ data: challenge(["overflowed"]) });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(proofs()).toEqual([
+        expect.objectContaining({
+          launchId: LAUNCH,
+          pageGeneration: 2,
+          retainedCommandIds: [],
+        }),
+      ]);
+      expect(host.executions()).toBe(1);
+    } finally {
+      await host.bridge.stop();
+      spies.forEach((spy) => spy.mockRestore());
+    }
+  });
+
+  it("answers unavailable for a binary without lifecycle, and nothing while its read hangs", async () => {
+    const legacy = await startBridge(() => ({
+      platform: "darwin",
+      arch: "arm64",
+      release: "qa",
+      hostname: "qa",
+    }));
+    try {
+      const startupReads = legacy.osReads();
+      getPublicationHandler()({ data: challenge([]) });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(proofs()).toEqual([
+        expect.objectContaining({ unavailable: true, nonce: NONCE }),
+      ]);
+      // No startup identity: nothing to compare, so no native read either.
+      expect(legacy.osReads()).toBe(startupReads);
+    } finally {
+      await legacy.bridge.stop();
+    }
+
+    // The next bridge registers its own handlers; drop the stopped one's.
+    mockSubscription.publish.mockClear();
+    mockSubscription.on.mockClear();
+    mockClient.on.mockClear();
+    let hang = false;
+    const hung = await startBridge(() =>
+      hang
+        ? new Promise(() => {})
+        : {
+            platform: "darwin",
+            arch: "arm64",
+            release: "qa",
+            hostname: "qa",
+            lifecycle: lifecycle(1),
+          },
+    );
+    try {
+      hang = true;
+      getPublicationHandler()({ data: challenge([]) });
+      await jest.advanceTimersByTimeAsync(5_000);
+      expect(proofs()).toEqual([]);
+    } finally {
+      await hung.bridge.stop();
+    }
+  });
+});
+
 it.each(["ack", "cancel"])(
   "keeps native exit available until %s and never reexecutes",
   async (mode) => {
@@ -6326,7 +6657,13 @@ describe("native authorization send receipt", () => {
       version?: string;
       commandIds?: string[];
       acknowledged?: boolean;
+      /** Extra command fields, such as a private cwd canary. */
+      command?: Record<string, unknown>;
+      afterStart?: (bridge: DesktopSandboxBridge) => void;
       beforeAck?: (bridge: DesktopSandboxBridge) => Promise<void>;
+      /** The native OS, as Rust's `std::env::consts::OS`; the harness
+       * default is otherwise the cached macOS info. */
+      nativeOs?: string;
     } = {},
   ) {
     const {
@@ -6339,6 +6676,13 @@ describe("native authorization send receipt", () => {
     const calls: NativeCall[] = [];
     mockInvokeHandler = async (cmd, args) => {
       if (cmd === "plugin:app|version") return version;
+      if (options.nativeOs && cmd === "get_desktop_os_info")
+        return {
+          platform: options.nativeOs,
+          arch: "x64",
+          release: "10.0.26100",
+          hostname: "qa-host",
+        };
       if (
         cmd === "execute_authorized_stream_command" ||
         cmd === "execute_stream_command"
@@ -6362,6 +6706,7 @@ describe("native authorization send receipt", () => {
     }
     try {
       await bridge.start();
+      options.afterStart?.(bridge);
       mockUseAuthorizedNative = true;
       mockClient.newSubscription.mockImplementation(() => {
         const reply = makeReply();
@@ -6376,6 +6721,7 @@ describe("native authorization send receipt", () => {
             command: "PRIVATE COMMAND",
             authorizationId,
             targetConnectionId: "conn-123",
+            ...options.command,
             ...(acknowledged && {
               outputProtocol: "ack-v1",
               operationChannel: true,
@@ -8826,6 +9172,1124 @@ describe("native authorization send receipt", () => {
         expect(mitigationKeys(byCommand["send-failure"])).toEqual([]);
       });
     });
+
+    describe("JSON read snapshot", () => {
+      const invalidResponse = "Invalid Desktop authorization response";
+      const jsonRejection = {
+        ...rejection,
+        httpStatus: 200,
+        approval: "json_error",
+        requestIdShape: "absent",
+        requestId: null,
+      };
+      const jsonGroup = {
+        ...responseGroup,
+        native_authorization_response_http_status: 200,
+        native_authorization_response_approval: "json_error",
+        native_authorization_response_request_id_shape: "absent",
+        native_authorization_response_request_id: null,
+      };
+      const read = {
+        version: 1,
+        kind: "body_read",
+        sourceDepth: 3,
+        sourceChainTruncated: false,
+      };
+      const readGroup = {
+        native_authorization_response_read_version: 1,
+        native_authorization_response_read_kind: "body_read",
+        native_authorization_response_read_source_depth: 3,
+        native_authorization_response_read_source_chain_truncated: false,
+      };
+      const readKeys = (properties: Record<string, unknown> = {}) =>
+        Object.keys(properties).filter((key) =>
+          NATIVE_AUTHORIZATION_RESPONSE_READ_PROPERTIES.has(key),
+        );
+      const readChannel = (call: NativeCall) =>
+        call.onAuthorizationResponseReadDiagnostic as MockChannel;
+
+      it.each(["before", "after"])(
+        "joins one same-invocation snapshot delivered %s its json_error receipt",
+        async (order) => {
+          const { calls, replies } = await run(async (call) => {
+            if (order === "after")
+              responseChannel(call).onmessage!(jsonRejection);
+            readChannel(call).onmessage!(read);
+            // A duplicate cannot replace the first callback attempt.
+            readChannel(call).onmessage!({
+              ...read,
+              kind: "serde_syntax",
+              sourceDepth: 1,
+            });
+            if (order === "before")
+              responseChannel(call).onmessage!(jsonRejection);
+            return Promise.reject(invalidResponse);
+          });
+
+          expect(calls).toHaveLength(1);
+          const channel = readChannel(calls[0]);
+          expect(channel).toBeDefined();
+          for (const other of [
+            calls[0].onEvent,
+            calls[0].onAuthorizationDiagnostic,
+            calls[0].onAuthorizationCauseDiagnostic,
+            calls[0].onAuthorizationResponseDiagnostic,
+            calls[0].onAuthorizationMitigationDiagnostic,
+            calls[0].onAuthorizationTransportDiagnostic,
+            calls[0].onAuthorizationIoDiagnostic,
+            calls[0].onAuthorizationConnectorDiagnostic,
+          ])
+            expect(channel).not.toBe(other);
+          expect(calls[0]).toMatchObject({
+            cmd: "execute_authorized_stream_command",
+            authorizationId,
+          });
+          expect(Object.keys(calls[0].message as object)).not.toContain(
+            "onAuthorizationResponseReadDiagnostic",
+          );
+          // The product error is the identical single terminal frame.
+          expect(sequencedFrames(replies[0])).toEqual([
+            expect.objectContaining({
+              type: "error",
+              message: invalidResponse,
+              sequence: 0,
+            }),
+          ]);
+          expect(finals()).toHaveLength(1);
+          const final = finals()[0];
+          expect(final.properties).toMatchObject({
+            outcome: "acknowledged",
+            terminalType: "error",
+            telemetry_sample_rate: 1,
+            ...jsonGroup,
+            ...readGroup,
+          });
+          expect(nativeKeys(final.properties)).toEqual([]);
+          for (const event of captures().filter(
+            (event) => event.event !== "desktop_ack_command_settled",
+          ))
+            expect(readKeys(event.properties)).toEqual([]);
+          const enriched = sanitizeDesktopAckEvent({
+            ...final,
+            properties: {
+              ...final.properties,
+              $current_url: "PRIVATE",
+              native_authorization_response_read_message: "PRIVATE",
+            },
+          });
+          // The frozen v1 response group is unchanged beside the new group.
+          expect(responseKeys(enriched.properties)).toHaveLength(7);
+          expect(readKeys(enriched.properties)).toHaveLength(4);
+          expect(enriched.properties).toMatchObject(readGroup);
+          const serialized = JSON.stringify([captures(), enriched]);
+          expect(serialized).not.toContain("PRIVATE");
+          expect(serialized).not.toContain(authorizationId);
+          expect(serialized).not.toContain(invalidResponse);
+        },
+      );
+
+      it("keeps the response receipt unchanged when an older native app sends no snapshot", async () => {
+        const { calls } = await run((call) => {
+          responseChannel(call).onmessage!(jsonRejection);
+          return reject(invalidResponse);
+        });
+        expect(calls[0]).toHaveProperty(
+          "onAuthorizationResponseReadDiagnostic",
+        );
+        expect(finals()[0].properties).toMatchObject(jsonGroup);
+        expect(responseKeys(finals()[0].properties)).toHaveLength(7);
+        // Missing is unknown, never defaulted to a kind.
+        expect(readKeys(finals()[0].properties)).toEqual([]);
+      });
+
+      it.each<[string, (call: NativeCall) => void]>([
+        [
+          "no response receipt",
+          (call) =>
+            (call.onAuthorizationDiagnostic as MockChannel).onmessage!(receipt),
+        ],
+        [
+          "an unread non-2xx receipt",
+          (call) => responseChannel(call).onmessage!(rejection),
+        ],
+        [
+          "a decoded approved_false receipt",
+          (call) =>
+            responseChannel(call).onmessage!({
+              ...jsonRejection,
+              approval: "approved_false",
+            }),
+        ],
+        [
+          "a malformed json_error receipt",
+          (call) =>
+            responseChannel(call).onmessage!({
+              ...jsonRejection,
+              httpStatus: 403,
+            }),
+        ],
+        [
+          "a malformed first receipt followed by a valid one",
+          (call) => {
+            responseChannel(call).onmessage!("PRIVATE");
+            responseChannel(call).onmessage!(jsonRejection);
+          },
+        ],
+      ])("never joins a snapshot to %s", async (_case, respond) => {
+        const { calls, replies } = await run((call) => {
+          readChannel(call).onmessage!(read);
+          respond(call);
+          return reject(invalidResponse);
+        });
+        expect(calls).toHaveLength(1);
+        expect(sequencedFrames(replies[0])).toEqual([
+          expect.objectContaining({ type: "error", message: invalidResponse }),
+        ]);
+        expect(finals()).toHaveLength(1);
+        expect(finals()[0].properties).toMatchObject({ terminalType: "error" });
+        expect(readKeys(finals()[0].properties)).toEqual([]);
+        expect(JSON.stringify(captures())).not.toContain("PRIVATE");
+      });
+
+      it.each<[string, () => unknown]>([
+        ["an extra private field", () => ({ ...read, message: "PRIVATE" })],
+        ["a missing version", () => ({ ...read, version: undefined })],
+        ["another version", () => ({ ...read, version: 2 })],
+        ["a string version", () => ({ ...read, version: "1" })],
+        ["an unknown kind", () => ({ ...read, kind: "PRIVATE" })],
+        ["the outer decode predicate", () => ({ ...read, kind: "decode" })],
+        ["a string depth", () => ({ ...read, sourceDepth: "3" })],
+        ["a negative depth", () => ({ ...read, sourceDepth: -1 })],
+        ["a depth beyond the budget", () => ({ ...read, sourceDepth: 9 })],
+        ["a fractional depth", () => ({ ...read, sourceDepth: 1.5 })],
+        ["a NaN depth", () => ({ ...read, sourceDepth: NaN })],
+        ["an infinite depth", () => ({ ...read, sourceDepth: Infinity })],
+        [
+          "a string truncation",
+          () => ({ ...read, sourceChainTruncated: "false" }),
+        ],
+        [
+          "a truncation below the budget",
+          () => ({ ...read, sourceChainTruncated: true }),
+        ],
+        [
+          "a witnessed kind without a walked link",
+          () => ({ ...read, kind: "serde_eof", sourceDepth: 0 }),
+        ],
+        ["a response receipt on the read channel", () => jsonRejection],
+        ["a raw error string", () => "PRIVATE"],
+        ["null", () => null],
+        [
+          "a class instance",
+          () =>
+            Object.assign(Object.create({ raw: "PRIVATE" }) as object, read),
+        ],
+        [
+          "a throwing getter",
+          () =>
+            Object.defineProperty({ ...read }, "kind", {
+              enumerable: true,
+              get() {
+                throw new Error("PRIVATE");
+              },
+            }),
+        ],
+        [
+          "a throwing proxy",
+          () => {
+            const fail = () => {
+              throw new Error("PRIVATE");
+            };
+            return new Proxy(
+              {},
+              { getPrototypeOf: fail, ownKeys: fail, get: fail },
+            );
+          },
+        ],
+      ])(
+        "drops the snapshot for %s and keeps the response receipt",
+        async (_case, value) => {
+          const { calls, replies } = await run((call) => {
+            readChannel(call).onmessage!(value());
+            // The malformed first attempt closed the snapshot latch.
+            readChannel(call).onmessage!(read);
+            responseChannel(call).onmessage!(jsonRejection);
+            return reject(invalidResponse);
+          });
+          expect(calls).toHaveLength(1);
+          expect(sequencedFrames(replies[0])).toEqual([
+            expect.objectContaining({
+              type: "error",
+              message: invalidResponse,
+            }),
+          ]);
+          expect(finals()).toHaveLength(1);
+          expect(finals()[0].properties).toMatchObject(jsonGroup);
+          expect(readKeys(finals()[0].properties)).toEqual([]);
+          expect(JSON.stringify(captures())).not.toContain("PRIVATE");
+        },
+      );
+
+      it("adds no snapshot to a successful command", async () => {
+        await run(async (call) => {
+          readChannel(call).onmessage!(read);
+          responseChannel(call).onmessage!(jsonRejection);
+          (call.onEvent as MockChannel).onmessage!({
+            type: "exit",
+            exitCode: 0,
+          });
+        });
+        expect(finals()[0].properties).toMatchObject({ terminalType: "exit" });
+        expect(responseKeys(finals()[0].properties)).toEqual([]);
+        expect(readKeys(finals()[0].properties)).toEqual([]);
+      });
+
+      it("drops a snapshot after settlement and releases its callback", async () => {
+        let call!: NativeCall;
+        await run((native) => {
+          call = native;
+          responseChannel(native).onmessage!(jsonRejection);
+          return reject(invalidResponse);
+        });
+        const channel = readChannel(call);
+        expect(channel.cleanupCallback).toHaveBeenCalledTimes(1);
+        channel.onmessage!(read);
+        expect(finals()).toHaveLength(1);
+        expect(finals()[0].properties).toMatchObject(jsonGroup);
+        expect(readKeys(finals()[0].properties)).toEqual([]);
+      });
+
+      it("drops a snapshot observed under another analytics owner", async () => {
+        const identity = jest.mocked(getIdentifiedAnalyticsUserId);
+        try {
+          await run((call) => {
+            responseChannel(call).onmessage!(jsonRejection);
+            identity.mockReturnValue("another-user");
+            readChannel(call).onmessage!(read);
+            // The closed latch keeps it from attaching after the owner returns.
+            identity.mockReturnValue("user-456");
+            readChannel(call).onmessage!(read);
+            return reject(invalidResponse);
+          });
+          expect(finals()[0].properties).toMatchObject(jsonGroup);
+          expect(readKeys(finals()[0].properties)).toEqual([]);
+        } finally {
+          identity.mockReturnValue("user-456");
+        }
+      });
+
+      it("drops a snapshot that arrives after the connection is stopped", async () => {
+        let release!: () => void;
+        const pending = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        await run(
+          async (call) => {
+            await pending;
+            responseChannel(call).onmessage!(jsonRejection);
+            readChannel(call).onmessage!(read);
+            return reject(invalidResponse);
+          },
+          {
+            beforeAck: async (bridge) => {
+              await bridge.stop();
+              release();
+            },
+          },
+        );
+        expect(finals()).toHaveLength(1);
+        expect(finals()[0].properties).toMatchObject({
+          outcome: "incomplete",
+          reason: "stopped",
+        });
+        expect(readKeys(finals()[0].properties)).toEqual([]);
+      });
+
+      // Only the read callback runs under a replaced router or connection;
+      // both are restored before the invocation rejects and settles, so the
+      // base receipt, the terminal frame and the settlement are unaffected.
+      it.each<[string, "operationRouter" | "connectionId" | null]>([
+        ["no swap (control)", null],
+        ["a replaced operation router", "operationRouter"],
+        ["a replaced connection", "connectionId"],
+      ])(
+        "joins a snapshot only when its callback is not fenced by %s",
+        async (_case, field) => {
+          let bridge!: DesktopSandboxBridge;
+          let release!: () => void;
+          const pending = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          let restored = true;
+          const { calls, replies } = await run(
+            async (call) => {
+              await pending;
+              responseChannel(call).onmessage!(jsonRejection);
+              const state = bridge as unknown as Record<string, unknown>;
+              if (field) {
+                const original = state[field];
+                state[field] =
+                  field === "connectionId" ? "conn-replaced" : { replaced: 1 };
+                restored = false;
+                readChannel(call).onmessage!(read);
+                state[field] = original;
+                restored = state[field] === original;
+              } else readChannel(call).onmessage!(read);
+              // The fenced first attempt closed the latch for good.
+              readChannel(call).onmessage!(read);
+              return reject(invalidResponse);
+            },
+            {
+              beforeAck: async (owned) => {
+                bridge = owned;
+                release();
+              },
+            },
+          );
+          expect(restored).toBe(true);
+          expect(calls).toHaveLength(1);
+          expect(sequencedFrames(replies[0])).toEqual([
+            expect.objectContaining({
+              type: "error",
+              message: invalidResponse,
+              sequence: 0,
+            }),
+          ]);
+          expect(finals()).toHaveLength(1);
+          const properties = finals()[0].properties;
+          expect(properties).toMatchObject({
+            outcome: "acknowledged",
+            reason: "terminal_ack",
+            terminalType: "error",
+            ...jsonGroup,
+          });
+          expect(responseKeys(properties)).toHaveLength(7);
+          if (field) expect(readKeys(properties)).toEqual([]);
+          else expect(properties).toMatchObject(readGroup);
+          const enriched = sanitizeDesktopAckEvent({
+            ...finals()[0],
+            properties: { ...properties },
+          });
+          expect(readKeys(enriched.properties)).toHaveLength(field ? 0 : 4);
+          expect(responseKeys(enriched.properties)).toHaveLength(7);
+        },
+      );
+
+      it("keeps every other channel when only the read channel cannot be created", async () => {
+        const { Channel } = await import("@tauri-apps/api/core");
+        const create = jest.mocked(Channel).getMockImplementation()!;
+        const mocked = jest.mocked(Channel);
+        for (let index = 0; index < 7; index++)
+          mocked.mockImplementationOnce(create);
+        mocked.mockImplementationOnce(() => {
+          throw new Error("channel unavailable");
+        });
+        const { calls, replies } = await run((call) => {
+          responseChannel(call).onmessage!(jsonRejection);
+          return reject(invalidResponse);
+        });
+        expect(calls).toHaveLength(1);
+        for (const key of [
+          "onEvent",
+          "onAuthorizationDiagnostic",
+          "onAuthorizationCauseDiagnostic",
+          "onAuthorizationResponseDiagnostic",
+          "onAuthorizationMitigationDiagnostic",
+          "onAuthorizationTransportDiagnostic",
+          "onAuthorizationIoDiagnostic",
+          "onAuthorizationConnectorDiagnostic",
+        ])
+          expect(calls[0]).toHaveProperty(key);
+        expect(calls[0]).not.toHaveProperty(
+          "onAuthorizationResponseReadDiagnostic",
+        );
+        // The timing channel is never offered without the read channel.
+        expect(calls[0]).not.toHaveProperty(
+          "onAuthorizationResponseReadTimingDiagnostic",
+        );
+        expect(sequencedFrames(replies[0])).toEqual([
+          expect.objectContaining({ type: "error", message: invalidResponse }),
+        ]);
+        expect(finals()[0].properties).toMatchObject(jsonGroup);
+        expect(readKeys(finals()[0].properties)).toEqual([]);
+      });
+
+      it("never requests a snapshot without the response channel", async () => {
+        const { Channel } = await import("@tauri-apps/api/core");
+        const create = jest.mocked(Channel).getMockImplementation()!;
+        jest
+          .mocked(Channel)
+          .mockImplementationOnce(create)
+          .mockImplementationOnce(create)
+          .mockImplementationOnce(() => {
+            throw new Error("channel unavailable");
+          });
+        const { calls, replies } = await run(() => reject(invalidResponse));
+        expect(calls[0]).not.toHaveProperty(
+          "onAuthorizationResponseDiagnostic",
+        );
+        expect(calls[0]).not.toHaveProperty(
+          "onAuthorizationResponseReadDiagnostic",
+        );
+        expect(calls[0]).not.toHaveProperty(
+          "onAuthorizationResponseReadTimingDiagnostic",
+        );
+        expect(sequencedFrames(replies[0])).toEqual([
+          expect.objectContaining({ type: "error", message: invalidResponse }),
+        ]);
+      });
+
+      it("keeps interleaved invocations' snapshots separate", async () => {
+        let arrived = 0;
+        let release!: () => void;
+        const all = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        await run(
+          async (call) => {
+            const commandId = (call.message as { commandId: string }).commandId;
+            // This snapshot arrives first, long before its own receipt.
+            if (commandId === "early-read")
+              readChannel(call).onmessage!({
+                ...read,
+                kind: "timeout",
+                sourceDepth: 2,
+              });
+            if (++arrived === 3) release();
+            await all;
+            if (commandId === "forbidden") {
+              responseChannel(call).onmessage!(rejection);
+              readChannel(call).onmessage!(read);
+            } else responseChannel(call).onmessage!(jsonRejection);
+            return reject(invalidResponse);
+          },
+          { commandIds: ["early-read", "forbidden", "no-read"] },
+        );
+        const byCommand = Object.fromEntries(
+          finals().map((event) => [
+            event.properties!.commandId,
+            event.properties,
+          ]),
+        );
+        expect(byCommand["early-read"]).toMatchObject({
+          ...jsonGroup,
+          native_authorization_response_read_kind: "timeout",
+          native_authorization_response_read_source_depth: 2,
+        });
+        expect(byCommand.forbidden).toMatchObject(responseGroup);
+        expect(readKeys(byCommand.forbidden)).toEqual([]);
+        expect(byCommand["no-read"]).toMatchObject(jsonGroup);
+        expect(readKeys(byCommand["no-read"])).toEqual([]);
+      });
+
+      describe("read timeout timing", () => {
+        const timeoutRead = { ...read, kind: "timeout", sourceDepth: 2 };
+        const timeoutGroup = {
+          ...readGroup,
+          native_authorization_response_read_kind: "timeout",
+          native_authorization_response_read_source_depth: 2,
+        };
+        const timing = {
+          version: 1,
+          headersElapsedMs: 7480,
+          readElapsedMs: 512,
+        };
+        const timingGroup = {
+          native_authorization_response_read_timing_version: 1,
+          native_authorization_response_read_timing_headers_elapsed_ms: 7480,
+          native_authorization_response_read_timing_read_elapsed_ms: 512,
+        };
+        const timingKeys = (properties: Record<string, unknown> = {}) =>
+          Object.keys(properties).filter((key) =>
+            NATIVE_AUTHORIZATION_RESPONSE_READ_TIMING_PROPERTIES.has(key),
+          );
+        const timingChannel = (call: NativeCall) =>
+          call.onAuthorizationResponseReadTimingDiagnostic as MockChannel;
+
+        it.each(["before", "after"])(
+          "joins one same-invocation timing delivered %s its timeout snapshot",
+          async (order) => {
+            const { calls, replies } = await run(async (call) => {
+              if (order === "before") timingChannel(call).onmessage!(timing);
+              responseChannel(call).onmessage!(jsonRejection);
+              readChannel(call).onmessage!(timeoutRead);
+              if (order === "after") timingChannel(call).onmessage!(timing);
+              // A duplicate cannot replace the first callback attempt.
+              timingChannel(call).onmessage!({
+                ...timing,
+                headersElapsedMs: 1,
+              });
+              return Promise.reject(invalidResponse);
+            });
+
+            expect(calls).toHaveLength(1);
+            const channel = timingChannel(calls[0]);
+            expect(channel).toBeDefined();
+            for (const other of [
+              calls[0].onEvent,
+              calls[0].onAuthorizationDiagnostic,
+              calls[0].onAuthorizationCauseDiagnostic,
+              calls[0].onAuthorizationResponseDiagnostic,
+              calls[0].onAuthorizationMitigationDiagnostic,
+              calls[0].onAuthorizationTransportDiagnostic,
+              calls[0].onAuthorizationIoDiagnostic,
+              calls[0].onAuthorizationConnectorDiagnostic,
+              calls[0].onAuthorizationResponseReadDiagnostic,
+            ])
+              expect(channel).not.toBe(other);
+            expect(Object.keys(calls[0].message as object)).not.toContain(
+              "onAuthorizationResponseReadTimingDiagnostic",
+            );
+            // The product error is the identical single terminal frame.
+            expect(sequencedFrames(replies[0])).toEqual([
+              expect.objectContaining({
+                type: "error",
+                message: invalidResponse,
+                sequence: 0,
+              }),
+            ]);
+            expect(finals()).toHaveLength(1);
+            const final = finals()[0];
+            expect(final.properties).toMatchObject({
+              outcome: "acknowledged",
+              terminalType: "error",
+              telemetry_sample_rate: 1,
+              desktop_terminal_error_kind: "invocation_rejected",
+              desktop_invocation_rejection_reason:
+                "authorization_response_invalid",
+              ...jsonGroup,
+              ...timeoutGroup,
+              ...timingGroup,
+            });
+            expect(timingKeys(final.properties)).toHaveLength(3);
+            for (const event of captures().filter(
+              (event) => event.event !== "desktop_ack_command_settled",
+            ))
+              expect(timingKeys(event.properties)).toEqual([]);
+            const enriched = sanitizeDesktopAckEvent({
+              ...final,
+              properties: {
+                ...final.properties,
+                $current_url: "PRIVATE",
+                native_authorization_response_read_timing_deadline_ms:
+                  "PRIVATE",
+              },
+            });
+            // The frozen response and read groups are unchanged beside it.
+            expect(responseKeys(enriched.properties)).toHaveLength(7);
+            expect(readKeys(enriched.properties)).toHaveLength(4);
+            expect(timingKeys(enriched.properties)).toHaveLength(3);
+            expect(enriched.properties).toMatchObject(timingGroup);
+            const serialized = JSON.stringify([captures(), enriched]);
+            expect(serialized).not.toContain("PRIVATE");
+            expect(serialized).not.toContain(authorizationId);
+            expect(serialized).not.toContain(invalidResponse);
+          },
+        );
+
+        it("keeps the timeout snapshot unchanged when an older native app sends no timing", async () => {
+          const { calls } = await run((call) => {
+            responseChannel(call).onmessage!(jsonRejection);
+            readChannel(call).onmessage!(timeoutRead);
+            return reject(invalidResponse);
+          });
+          expect(calls[0]).toHaveProperty(
+            "onAuthorizationResponseReadTimingDiagnostic",
+          );
+          expect(finals()[0].properties).toMatchObject({
+            ...jsonGroup,
+            ...timeoutGroup,
+          });
+          expect(readKeys(finals()[0].properties)).toHaveLength(4);
+          expect(timingKeys(finals()[0].properties)).toEqual([]);
+        });
+
+        it.each<[string, (call: NativeCall) => void, string]>([
+          [
+            "a non-timeout snapshot",
+            (call) => {
+              responseChannel(call).onmessage!(jsonRejection);
+              readChannel(call).onmessage!(read);
+            },
+            invalidResponse,
+          ],
+          [
+            "no snapshot",
+            (call) => responseChannel(call).onmessage!(jsonRejection),
+            invalidResponse,
+          ],
+          [
+            "no response receipt",
+            (call) => readChannel(call).onmessage!(timeoutRead),
+            invalidResponse,
+          ],
+          [
+            "an approved_false receipt",
+            (call) => {
+              responseChannel(call).onmessage!({
+                ...jsonRejection,
+                approval: "approved_false",
+              });
+              readChannel(call).onmessage!(timeoutRead);
+            },
+            invalidResponse,
+          ],
+          [
+            "an unread non-2xx receipt",
+            (call) => {
+              responseChannel(call).onmessage!(rejection);
+              readChannel(call).onmessage!(timeoutRead);
+            },
+            invalidResponse,
+          ],
+          [
+            "another rejection class",
+            (call) => {
+              responseChannel(call).onmessage!(jsonRejection);
+              readChannel(call).onmessage!(timeoutRead);
+            },
+            "Desktop operation was not authorized",
+          ],
+        ])("never joins a timing to %s", async (_case, respond, message) => {
+          const { calls, replies } = await run((call) => {
+            timingChannel(call).onmessage!(timing);
+            respond(call);
+            return reject(message);
+          });
+          expect(calls).toHaveLength(1);
+          expect(sequencedFrames(replies[0])).toEqual([
+            expect.objectContaining({ type: "error", message }),
+          ]);
+          expect(finals()).toHaveLength(1);
+          expect(finals()[0].properties).toMatchObject({
+            terminalType: "error",
+          });
+          expect(timingKeys(finals()[0].properties)).toEqual([]);
+        });
+
+        it("adds no timing to a successful command", async () => {
+          await run(async (call) => {
+            responseChannel(call).onmessage!(jsonRejection);
+            readChannel(call).onmessage!(timeoutRead);
+            timingChannel(call).onmessage!(timing);
+            (call.onEvent as MockChannel).onmessage!({
+              type: "exit",
+              exitCode: 0,
+            });
+          });
+          expect(finals()[0].properties).toMatchObject({
+            terminalType: "exit",
+          });
+          expect(readKeys(finals()[0].properties)).toEqual([]);
+          expect(timingKeys(finals()[0].properties)).toEqual([]);
+        });
+
+        it.each<[string, () => unknown]>([
+          ["an extra private field", () => ({ ...timing, message: "PRIVATE" })],
+          [
+            "an internal deadline field",
+            () => ({ ...timing, deadlineMs: 8000 }),
+          ],
+          ["a missing version", () => ({ ...timing, version: undefined })],
+          ["another version", () => ({ ...timing, version: 2 })],
+          [
+            "a missing read duration",
+            () => ({ version: 1, headersElapsedMs: 7480 }),
+          ],
+          ["a string duration", () => ({ ...timing, readElapsedMs: "512" })],
+          ["a negative duration", () => ({ ...timing, headersElapsedMs: -1 })],
+          [
+            "a duration beyond the bound",
+            () => ({ ...timing, readElapsedMs: 60_001 }),
+          ],
+          [
+            "a fractional duration",
+            () => ({ ...timing, headersElapsedMs: 1.5 }),
+          ],
+          ["a NaN duration", () => ({ ...timing, readElapsedMs: NaN })],
+          [
+            "an infinite duration",
+            () => ({ ...timing, headersElapsedMs: Infinity }),
+          ],
+          ["a null duration", () => ({ ...timing, readElapsedMs: null })],
+          ["a read snapshot on the timing channel", () => timeoutRead],
+          ["a raw error string", () => "PRIVATE"],
+          ["null", () => null],
+          [
+            "a class instance",
+            () =>
+              Object.assign(
+                Object.create({ raw: "PRIVATE" }) as object,
+                timing,
+              ),
+          ],
+          [
+            "a throwing getter",
+            () =>
+              Object.defineProperty({ ...timing }, "readElapsedMs", {
+                enumerable: true,
+                get() {
+                  throw new Error("PRIVATE");
+                },
+              }),
+          ],
+          [
+            "a throwing proxy",
+            () => {
+              const fail = () => {
+                throw new Error("PRIVATE");
+              };
+              return new Proxy(
+                {},
+                { getPrototypeOf: fail, ownKeys: fail, get: fail },
+              );
+            },
+          ],
+        ])(
+          "drops the timing for %s and keeps the response and read groups",
+          async (_case, value) => {
+            const { calls, replies } = await run((call) => {
+              timingChannel(call).onmessage!(value());
+              // The malformed first attempt closed the timing latch.
+              timingChannel(call).onmessage!(timing);
+              responseChannel(call).onmessage!(jsonRejection);
+              readChannel(call).onmessage!(timeoutRead);
+              return reject(invalidResponse);
+            });
+            expect(calls).toHaveLength(1);
+            expect(sequencedFrames(replies[0])).toEqual([
+              expect.objectContaining({
+                type: "error",
+                message: invalidResponse,
+              }),
+            ]);
+            expect(finals()).toHaveLength(1);
+            expect(finals()[0].properties).toMatchObject({
+              ...jsonGroup,
+              ...timeoutGroup,
+            });
+            expect(timingKeys(finals()[0].properties)).toEqual([]);
+            expect(JSON.stringify(captures())).not.toContain("PRIVATE");
+          },
+        );
+
+        it("drops a timing after settlement and releases its callback", async () => {
+          let call!: NativeCall;
+          await run((native) => {
+            call = native;
+            responseChannel(native).onmessage!(jsonRejection);
+            readChannel(native).onmessage!(timeoutRead);
+            return reject(invalidResponse);
+          });
+          const channel = timingChannel(call);
+          expect(channel.cleanupCallback).toHaveBeenCalledTimes(1);
+          channel.onmessage!(timing);
+          expect(finals()).toHaveLength(1);
+          expect(finals()[0].properties).toMatchObject(timeoutGroup);
+          expect(timingKeys(finals()[0].properties)).toEqual([]);
+        });
+
+        it("drops a timing observed under another analytics owner", async () => {
+          const identity = jest.mocked(getIdentifiedAnalyticsUserId);
+          try {
+            await run((call) => {
+              responseChannel(call).onmessage!(jsonRejection);
+              readChannel(call).onmessage!(timeoutRead);
+              identity.mockReturnValue("another-user");
+              timingChannel(call).onmessage!(timing);
+              // The closed latch keeps it from attaching after the owner returns.
+              identity.mockReturnValue("user-456");
+              timingChannel(call).onmessage!(timing);
+              return reject(invalidResponse);
+            });
+            expect(finals()[0].properties).toMatchObject(timeoutGroup);
+            expect(timingKeys(finals()[0].properties)).toEqual([]);
+          } finally {
+            identity.mockReturnValue("user-456");
+          }
+        });
+
+        it("keeps every other channel when only the timing channel cannot be created", async () => {
+          const { Channel } = await import("@tauri-apps/api/core");
+          const create = jest.mocked(Channel).getMockImplementation()!;
+          const mocked = jest.mocked(Channel);
+          for (let index = 0; index < 8; index++)
+            mocked.mockImplementationOnce(create);
+          mocked.mockImplementationOnce(() => {
+            throw new Error("channel unavailable");
+          });
+          const { calls, replies } = await run((call) => {
+            responseChannel(call).onmessage!(jsonRejection);
+            readChannel(call).onmessage!(timeoutRead);
+            return reject(invalidResponse);
+          });
+          expect(calls).toHaveLength(1);
+          for (const key of [
+            "onEvent",
+            "onAuthorizationResponseDiagnostic",
+            "onAuthorizationResponseReadDiagnostic",
+          ])
+            expect(calls[0]).toHaveProperty(key);
+          expect(calls[0]).not.toHaveProperty(
+            "onAuthorizationResponseReadTimingDiagnostic",
+          );
+          expect(sequencedFrames(replies[0])).toEqual([
+            expect.objectContaining({
+              type: "error",
+              message: invalidResponse,
+            }),
+          ]);
+          expect(finals()[0].properties).toMatchObject({
+            ...jsonGroup,
+            ...timeoutGroup,
+          });
+          expect(timingKeys(finals()[0].properties)).toEqual([]);
+        });
+
+        describe("connector at the response headers", () => {
+          const connector = {
+            version: 1,
+            phase: "connected",
+            attempts: 1,
+            elapsedMs: 6900,
+          };
+          const connectorGroup = {
+            native_authorization_response_read_timing_connector_version: 1,
+            native_authorization_response_read_timing_connector_phase:
+              "connected",
+            native_authorization_response_read_timing_connector_attempts: 1,
+            native_authorization_response_read_timing_connector_elapsed_ms: 6900,
+          };
+          const withConnector = (value: unknown) => ({
+            ...timing,
+            connector: value,
+          });
+          const sendConnectorKeys = (
+            properties: Record<string, unknown> = {},
+          ) =>
+            Object.keys(properties).filter((key) =>
+              NATIVE_AUTHORIZATION_CONNECTOR_PROPERTIES.has(key),
+            );
+          /** A classified read timeout whose timing is `value`. */
+          const timedOut = (value: unknown) => (call: NativeCall) => {
+            timingChannel(call).onmessage!(value);
+            responseChannel(call).onmessage!(jsonRejection);
+            readChannel(call).onmessage!(timeoutRead);
+            return reject(invalidResponse);
+          };
+
+          it.each<[string, object, object]>([
+            ["one connection", connector, connectorGroup],
+            [
+              "one connection as long as the headers",
+              { ...connector, elapsedMs: 7480 },
+              {
+                ...connectorGroup,
+                native_authorization_response_read_timing_connector_elapsed_ms: 7480,
+              },
+            ],
+            [
+              "several connector calls",
+              { ...connector, phase: "multiple", attempts: 8, elapsedMs: null },
+              {
+                ...connectorGroup,
+                native_authorization_response_read_timing_connector_phase:
+                  "multiple",
+                native_authorization_response_read_timing_connector_attempts: 8,
+                native_authorization_response_read_timing_connector_elapsed_ms:
+                  null,
+              },
+            ],
+          ])(
+            "offers the refinement and joins the validated snapshot for %s",
+            async (_case, value, group) => {
+              const { calls, replies } = await run(
+                timedOut(withConnector({ ...value })),
+              );
+              expect(calls).toHaveLength(1);
+              // Outside the signed message, beside both channels it joins.
+              expect(calls[0].includeResponseReadTimingConnector).toBe(true);
+              for (const key of [
+                "onAuthorizationConnectorDiagnostic",
+                "onAuthorizationResponseReadTimingDiagnostic",
+              ])
+                expect(calls[0]).toHaveProperty(key);
+              expect(Object.keys(calls[0].message as object)).not.toContain(
+                "includeResponseReadTimingConnector",
+              );
+              expect(sequencedFrames(replies[0])).toEqual([
+                expect.objectContaining({
+                  type: "error",
+                  message: invalidResponse,
+                  sequence: 0,
+                }),
+              ]);
+              expect(finals()).toHaveLength(1);
+              const final = finals()[0];
+              expect(final.properties).toMatchObject({
+                ...jsonGroup,
+                ...timeoutGroup,
+                ...timingGroup,
+                ...group,
+              });
+              expect(timingKeys(final.properties)).toHaveLength(7);
+              // The send-failure connector group is never reused for it.
+              expect(sendConnectorKeys(final.properties)).toEqual([]);
+              const enriched = sanitizeDesktopAckEvent({
+                ...final,
+                properties: {
+                  ...final.properties,
+                  $current_url: "PRIVATE",
+                  native_authorization_response_read_timing_connector_address:
+                    "PRIVATE",
+                },
+              });
+              expect(enriched.properties).toMatchObject({
+                ...timingGroup,
+                ...group,
+              });
+              expect(timingKeys(enriched.properties)).toHaveLength(7);
+              expect(responseKeys(enriched.properties)).toHaveLength(7);
+              expect(readKeys(enriched.properties)).toHaveLength(4);
+              const serialized = JSON.stringify([captures(), enriched]);
+              expect(serialized).not.toContain("PRIVATE");
+              expect(serialized).not.toContain(authorizationId);
+            },
+          );
+
+          it.each<[string, unknown]>([
+            [
+              "a pending call",
+              withConnector({ ...connector, phase: "pending" }),
+            ],
+            ["a failed call", withConnector({ ...connector, phase: "failed" })],
+            [
+              "no connector call",
+              withConnector({
+                ...connector,
+                phase: "not_started",
+                attempts: 0,
+                elapsedMs: null,
+              }),
+            ],
+            [
+              "a connection longer than the headers",
+              withConnector({ ...connector, elapsedMs: 7481 }),
+            ],
+            [
+              "a connection without a time",
+              withConnector({ ...connector, elapsedMs: null }),
+            ],
+            [
+              "several calls with one time",
+              withConnector({ ...connector, phase: "multiple", attempts: 2 }),
+            ],
+            [
+              "more calls than the bound",
+              withConnector({
+                ...connector,
+                phase: "multiple",
+                attempts: 9,
+                elapsedMs: null,
+              }),
+            ],
+            ["another version", withConnector({ ...connector, version: 2 })],
+            [
+              "an extra nested field",
+              withConnector({ ...connector, address: "PRIVATE" }),
+            ],
+            [
+              "a nested identifier",
+              withConnector({
+                ...connector,
+                requestId: "iad1::abcde-1700000000000-0123456789ab",
+                authorizationId,
+              }),
+            ],
+            [
+              "a missing nested field",
+              withConnector({ version: 1, phase: "connected", attempts: 1 }),
+            ],
+            ["a raw string", withConnector("PRIVATE")],
+            ["null", withConnector(null)],
+            [
+              "a class instance",
+              withConnector(
+                Object.assign(
+                  Object.create({ raw: "PRIVATE" }) as object,
+                  connector,
+                ),
+              ),
+            ],
+            [
+              "an extra top-level field",
+              { ...withConnector(connector), message: "PRIVATE" },
+            ],
+          ])(
+            "drops the whole timing for %s and keeps the other groups",
+            async (_case, value) => {
+              const { calls, replies } = await run(timedOut(value));
+              expect(calls[0].includeResponseReadTimingConnector).toBe(true);
+              expect(sequencedFrames(replies[0])).toEqual([
+                expect.objectContaining({
+                  type: "error",
+                  message: invalidResponse,
+                }),
+              ]);
+              expect(finals()[0].properties).toMatchObject({
+                ...jsonGroup,
+                ...timeoutGroup,
+              });
+              expect(timingKeys(finals()[0].properties)).toEqual([]);
+              const serialized = JSON.stringify(captures());
+              expect(serialized).not.toContain("PRIVATE");
+              expect(serialized).not.toContain(authorizationId);
+            },
+          );
+
+          it("neither offers nor accepts the connector member without the connector channel", async () => {
+            const { Channel } = await import("@tauri-apps/api/core");
+            const create = jest.mocked(Channel).getMockImplementation()!;
+            const mocked = jest.mocked(Channel);
+            for (let index = 0; index < 6; index++)
+              mocked.mockImplementationOnce(create);
+            mocked.mockImplementationOnce(() => {
+              throw new Error("channel unavailable");
+            });
+            const { calls } = await run(timedOut(withConnector(connector)));
+            expect(calls[0]).not.toHaveProperty(
+              "onAuthorizationConnectorDiagnostic",
+            );
+            expect(calls[0]).toHaveProperty(
+              "onAuthorizationResponseReadTimingDiagnostic",
+            );
+            expect(calls[0]).not.toHaveProperty(
+              "includeResponseReadTimingConnector",
+            );
+            // An unoffered member is unexpected, so the whole timing drops.
+            expect(finals()[0].properties).toMatchObject(timeoutGroup);
+            expect(timingKeys(finals()[0].properties)).toEqual([]);
+          });
+
+          it("adds nothing to a successful command, even with a connector timing", async () => {
+            const { calls } = await run(async (call) => {
+              timingChannel(call).onmessage!(withConnector(connector));
+              responseChannel(call).onmessage!(jsonRejection);
+              readChannel(call).onmessage!(timeoutRead);
+              (call.onEvent as MockChannel).onmessage!({
+                type: "exit",
+                exitCode: 0,
+              });
+            });
+            expect(calls[0].includeResponseReadTimingConnector).toBe(true);
+            expect(finals()[0].properties).toMatchObject({
+              terminalType: "exit",
+            });
+            expect(timingKeys(finals()[0].properties)).toEqual([]);
+          });
+        });
+      });
+    });
   });
 
   describe("first terminal error kind", () => {
@@ -9035,6 +10499,2935 @@ describe("native authorization send receipt", () => {
     });
   });
 
+  describe("invocation rejection message class", () => {
+    const spawn = "Failed to spawn: PRIVATE (os error 2)";
+    const timeout = "Command timed out after 30000ms";
+    const emit = (call: NativeCall, chunk: Record<string, unknown>) =>
+      (call.onEvent as MockChannel).onmessage!(chunk);
+    const running = "Command is already running";
+    // stream_lifecycle.rs admission denials, verbatim.
+    const pageReplaced =
+      "Desktop page was replaced before this command started";
+    const priorCleanup =
+      "Desktop is still stopping commands from a previous page. Retry shortly.";
+    const stopUnconfirmed =
+      "Desktop could not confirm an earlier command stopped. New commands are blocked for this session. Close and reopen Desktop before running more commands.";
+    const groupKeys = (properties: Record<string, unknown> = {}) =>
+      Object.keys(properties).filter(
+        (key) =>
+          DESKTOP_INVOCATION_REJECTION_PROPERTIES.has(key) ||
+          DESKTOP_INVOCATION_ADMISSION_PROPERTIES.has(key) ||
+          DESKTOP_INVOCATION_SPAWN_HINT_PROPERTIES.has(key) ||
+          DESKTOP_INVOCATION_UNKNOWN_PROPERTIES.has(key) ||
+          DESKTOP_TERMINAL_ERROR_PROPERTIES.has(key),
+      );
+    const unknownOf = (properties: Record<string, unknown> = {}) =>
+      Object.keys(properties).some((key) =>
+        DESKTOP_INVOCATION_UNKNOWN_PROPERTIES.has(key),
+      )
+        ? {
+            version: properties.desktop_invocation_unknown_version,
+            class: properties.desktop_invocation_unknown_class,
+          }
+        : null;
+    const spawnHintOf = (properties: Record<string, unknown> = {}) =>
+      Object.keys(properties).some((key) =>
+        DESKTOP_INVOCATION_SPAWN_HINT_PROPERTIES.has(key),
+      )
+        ? {
+            version: properties.desktop_invocation_spawn_hint_version,
+            hint: properties.desktop_invocation_spawn_os_code_hint,
+          }
+        : null;
+    const rejectionOf = (properties: Record<string, unknown> = {}) =>
+      Object.keys(properties).some((key) =>
+        DESKTOP_INVOCATION_REJECTION_PROPERTIES.has(key),
+      )
+        ? {
+            version: properties.desktop_invocation_rejection_version,
+            reason: properties.desktop_invocation_rejection_reason,
+            adapter: properties.desktop_invocation_rejection_adapter,
+          }
+        : null;
+    const admissionOf = (properties: Record<string, unknown> = {}) =>
+      Object.keys(properties).some((key) =>
+        DESKTOP_INVOCATION_ADMISSION_PROPERTIES.has(key),
+      )
+        ? {
+            version: properties.desktop_invocation_admission_version,
+            reason: properties.desktop_invocation_admission_reason,
+          }
+        : null;
+
+    // Every row names its hint and unknown class: a shorter row would make
+    // Jest pass `done`.
+    it.each<
+      [
+        string,
+        string,
+        unknown,
+        string,
+        string,
+        string | null,
+        string | null,
+        string | null,
+      ]
+    >([
+      [
+        "a reported 0.0.73 approval rejection",
+        "0.0.73",
+        "Desktop operation was not authorized",
+        "authorization_not_approved",
+        "authorized_native",
+        null,
+        null,
+        null,
+      ],
+      [
+        "a reported 0.0.74 authorization ID rejection",
+        "0.0.74",
+        "Invalid Desktop operation authorization",
+        "authorization_id_invalid",
+        "authorized_native",
+        null,
+        null,
+        null,
+      ],
+      [
+        "a current spawn failure",
+        "0.0.80",
+        spawn,
+        "spawn_failed",
+        "authorized_native",
+        null,
+        "code_2",
+        null,
+      ],
+      [
+        "a spawn failure with an unlisted OS code",
+        "0.0.80",
+        "Failed to spawn: PRIVATE (os error 4)",
+        "spawn_failed",
+        "authorized_native",
+        null,
+        "unrecognized",
+        null,
+      ],
+      [
+        "a spawn failure without an OS code",
+        "0.0.80",
+        new Error("Failed to spawn: PRIVATE"),
+        "spawn_failed",
+        "authorized_native",
+        null,
+        "unrecognized",
+        null,
+      ],
+      [
+        "an unlisted rejection",
+        "0.0.80",
+        "PRIVATE rejection",
+        "unknown",
+        "authorized_native",
+        null,
+        null,
+        "other_string",
+      ],
+      [
+        "a published legacy spawn failure",
+        "0.0.72",
+        "Failed to spawn: PRIVATE (os error 193)",
+        "spawn_failed",
+        "published_legacy_native",
+        null,
+        "code_193",
+        null,
+      ],
+      // The six fixed execution admission templates, as Tauri rejects them.
+      [
+        "an update state rejection",
+        "0.0.80",
+        "Desktop update state unavailable",
+        "execution_admission",
+        "authorized_native",
+        "update_state_unavailable",
+        null,
+        null,
+      ],
+      [
+        "an update installing rejection",
+        "0.0.80",
+        "Desktop is installing an update. Reopen the app before retrying.",
+        "execution_admission",
+        "authorized_native",
+        "update_installing",
+        null,
+        null,
+      ],
+      [
+        "a stdin limit rejection",
+        "0.0.80",
+        "Command stdin exceeds limit",
+        "execution_admission",
+        "authorized_native",
+        "stdin_size_limit",
+        null,
+        null,
+      ],
+      [
+        "a stdin encoding rejection",
+        "0.0.80",
+        "Invalid command stdin encoding",
+        "execution_admission",
+        "authorized_native",
+        "stdin_encoding_invalid",
+        null,
+        null,
+      ],
+      [
+        "a poisoned command state rejection",
+        "0.0.80",
+        "stream command state lock poisoned",
+        "execution_admission",
+        "authorized_native",
+        "command_state_lock_poisoned",
+        null,
+        null,
+      ],
+      [
+        "a duplicate command rejection",
+        "0.0.80",
+        running,
+        "execution_admission",
+        "authorized_native",
+        "command_already_running",
+        null,
+        null,
+      ],
+      [
+        "a published legacy Error admission rejection",
+        "0.0.72",
+        new Error("Command stdin exceeds limit"),
+        "execution_admission",
+        "published_legacy_native",
+        "stdin_size_limit",
+        null,
+        null,
+      ],
+      [
+        "a changed admission template",
+        "0.0.80",
+        "Command is already running: PRIVATE",
+        "unknown",
+        "authorized_native",
+        null,
+        null,
+        "other_string",
+      ],
+      // The three stream_lifecycle.rs denials, as Tauri rejects them. A
+      // reported version never gates the class: the same text classifies
+      // alike under any authorized native app.
+      [
+        "a page replacement denial",
+        "0.0.82",
+        pageReplaced,
+        "unknown",
+        "authorized_native",
+        null,
+        null,
+        "lifecycle_page_replaced",
+      ],
+      [
+        "a prior cleanup denial",
+        "0.0.82",
+        priorCleanup,
+        "unknown",
+        "authorized_native",
+        null,
+        null,
+        "lifecycle_prior_cleanup_pending",
+      ],
+      [
+        "an unconfirmed stop denial",
+        "0.0.82",
+        stopUnconfirmed,
+        "unknown",
+        "authorized_native",
+        null,
+        null,
+        "lifecycle_stop_unconfirmed",
+      ],
+      [
+        "an unconfirmed stop denial from another reported version",
+        "0.0.80",
+        stopUnconfirmed,
+        "unknown",
+        "authorized_native",
+        null,
+        null,
+        "lifecycle_stop_unconfirmed",
+      ],
+      [
+        "an Error page replacement denial",
+        "0.0.82",
+        new Error(pageReplaced),
+        "unknown",
+        "authorized_native",
+        null,
+        null,
+        "lifecycle_page_replaced",
+      ],
+      [
+        "an unlisted Error rejection",
+        "0.0.82",
+        new Error("PRIVATE Error rejection"),
+        "unknown",
+        "authorized_native",
+        null,
+        null,
+        "other_error_message",
+      ],
+      [
+        "an over-long rejection",
+        "0.0.82",
+        `${stopUnconfirmed}${" PRIVATE".repeat(200)}`,
+        "unknown",
+        "authorized_native",
+        null,
+        null,
+        "message_over_limit",
+      ],
+      [
+        "an unreadable rejection",
+        "0.0.82",
+        { message: pageReplaced },
+        "unknown",
+        "authorized_native",
+        null,
+        null,
+        "message_unavailable",
+      ],
+      // A legacy command set never carries the unknown class.
+      [
+        "a published legacy lifecycle-text rejection",
+        "0.0.72",
+        stopUnconfirmed,
+        "unknown",
+        "published_legacy_native",
+        null,
+        null,
+        null,
+      ],
+    ])(
+      "classifies %s without changing the product frame",
+      async (
+        _case,
+        version,
+        rejection,
+        reason,
+        adapter,
+        admission,
+        hint,
+        unknownClass,
+      ) => {
+        const message =
+          rejection instanceof Error ? rejection.message : String(rejection);
+        const { calls, replies } = await run(() => Promise.reject(rejection), {
+          version,
+        });
+        // The selected command set is unchanged: no downgrade or retry.
+        expect(calls.map((call) => call.cmd)).toEqual([
+          adapter === "published_legacy_native"
+            ? "execute_stream_command"
+            : "execute_authorized_stream_command",
+        ]);
+        expect(sequencedFrames(replies[0])).toEqual([
+          {
+            type: "error",
+            message,
+            commandId: "auth-send",
+            sequence: 0,
+            outputProtocol: "ack-v1",
+          },
+        ]);
+        expect(finals()).toHaveLength(1);
+        const final = finals()[0];
+        expect(final.properties).toMatchObject({
+          terminalType: "error",
+          desktop_terminal_error_kind: "invocation_rejected",
+        });
+        expect(rejectionOf(final.properties)).toEqual({
+          version: 1,
+          reason,
+          adapter,
+        });
+        expect(admissionOf(final.properties)).toEqual(
+          admission && { version: 1, reason: admission },
+        );
+        expect(spawnHintOf(final.properties)).toEqual(
+          hint ? { version: 1, hint } : null,
+        );
+        expect(unknownOf(final.properties)).toEqual(
+          unknownClass ? { version: 1, class: unknownClass } : null,
+        );
+        const enriched = sanitizeDesktopAckEvent({
+          ...final,
+          properties: { ...final.properties, $current_url: "PRIVATE" },
+        });
+        expect(rejectionOf(enriched.properties)).toEqual(
+          rejectionOf(final.properties),
+        );
+        expect(admissionOf(enriched.properties)).toEqual(
+          admissionOf(final.properties),
+        );
+        expect(spawnHintOf(enriched.properties)).toEqual(
+          spawnHintOf(final.properties),
+        );
+        expect(unknownOf(enriched.properties)).toEqual(
+          unknownOf(final.properties),
+        );
+        const serialized = JSON.stringify([captures(), enriched]);
+        expect(serialized).not.toContain("PRIVATE");
+        expect(serialized).not.toContain(message);
+      },
+    );
+
+    it.each<[string, string, object | null, object | null, object | null]>([
+      [
+        "Invalid command stdin encoding",
+        "execution_admission",
+        { version: 1, reason: "stdin_encoding_invalid" },
+        null,
+        null,
+      ],
+      [
+        "Failed to spawn: PRIVATE (os error 267)",
+        "spawn_failed",
+        null,
+        { version: 1, hint: "code_267" },
+        null,
+      ],
+      [
+        priorCleanup,
+        "unknown",
+        null,
+        null,
+        { version: 1, class: "lifecycle_prior_cleanup_pending" },
+      ],
+    ])(
+      "reads the rejection's own message %p once for every class",
+      async (message, reason, admission, hint, unknownClass) => {
+        let descriptorReads = 0;
+        const rejection = new Proxy(new Error(message), {
+          getOwnPropertyDescriptor(target, key) {
+            if (key === "message") descriptorReads++;
+            return Reflect.getOwnPropertyDescriptor(target, key);
+          },
+        });
+        const { replies } = await run(() => Promise.reject(rejection));
+        // The product frame still takes the existing message read.
+        expect(sequencedFrames(replies[0])).toEqual([
+          expect.objectContaining({ type: "error", message }),
+        ]);
+        expect(descriptorReads).toBe(1);
+        expect(rejectionOf(finals()[0].properties)).toEqual({
+          version: 1,
+          reason,
+          adapter: "authorized_native",
+        });
+        expect(admissionOf(finals()[0].properties)).toEqual(admission);
+        expect(spawnHintOf(finals()[0].properties)).toEqual(hint);
+        expect(unknownOf(finals()[0].properties)).toEqual(unknownClass);
+      },
+    );
+
+    it("delivers the unknown pair from one rejection without private command content", async () => {
+      const cwd = "/Users/PRIVATE-CWD/project";
+      const canary = "PRIVATE-CANARY https://PRIVATE.example/x";
+      const host = window as unknown as Record<string, unknown>;
+      const previous = {
+        internals: host.__TAURI_INTERNALS__,
+        os: host.__TAURI_OS_PLUGIN_INTERNALS__,
+      };
+      const { calls, replies } = await run(() => Promise.reject(canary), {
+        version: "0.0.82",
+        command: { cwd },
+      });
+      // One selected authorized invocation, the original product frame.
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toMatchObject({
+        cmd: "execute_authorized_stream_command",
+        authorizationId,
+        message: expect.objectContaining({ cwd }),
+      });
+      expect(sequencedFrames(replies[0])).toEqual([
+        {
+          type: "error",
+          message: canary,
+          commandId: "auth-send",
+          sequence: 0,
+          outputProtocol: "ack-v1",
+        },
+      ]);
+      expect(finals()).toHaveLength(1);
+      const final = finals()[0];
+      expect(final.properties).toMatchObject({
+        outcome: "acknowledged",
+        terminalType: "error",
+        telemetry_sample_rate: 1,
+        desktop_terminal_error_kind: "invocation_rejected",
+        desktop_invocation_rejection_reason: "unknown",
+        desktop_invocation_rejection_adapter: "authorized_native",
+      });
+      expect(unknownOf(final.properties)).toEqual({
+        version: 1,
+        class: "other_string",
+      });
+      // The SDK before_send order: privacy projection, then measured identity.
+      try {
+        host.__TAURI_INTERNALS__ = {};
+        host.__TAURI_OS_PLUGIN_INTERNALS__ = { platform: "windows" };
+        await startDesktopRuntimeIdentityLookup();
+        const sent = applyDesktopRuntimeIdentity(
+          sanitizeDesktopAckEvent({
+            ...final,
+            properties: {
+              ...final.properties,
+              $current_url: "https://PRIVATE.example/chat",
+              cwd,
+              command: "PRIVATE COMMAND",
+              authorizationId,
+            },
+            $set: { email: "PRIVATE" },
+          }),
+        );
+        expect(sent.properties).toMatchObject({
+          native_platform: "windows",
+          desktop_invocation_rejection_reason: "unknown",
+          desktop_invocation_unknown_version: 1,
+          desktop_invocation_unknown_class: "other_string",
+        });
+        for (const serialized of [
+          JSON.stringify(captures()),
+          JSON.stringify(sent),
+        ]) {
+          expect(serialized).not.toContain("PRIVATE");
+          expect(serialized).not.toContain(authorizationId);
+          expect(serialized).not.toContain("https://");
+        }
+      } finally {
+        host.__TAURI_INTERNALS__ = previous.internals;
+        host.__TAURI_OS_PLUGIN_INTERNALS__ = previous.os;
+      }
+    });
+
+    it("keeps an unsampled first lifecycle rejection at the diagnostic rate", async () => {
+      jest.mocked(sampleDiagnosticOperation).mockReturnValue(false);
+      try {
+        await run(() => reject(stopUnconfirmed));
+      } finally {
+        jest.mocked(sampleDiagnosticOperation).mockReturnValue(true);
+      }
+      expect(
+        captures().filter(
+          (event) => event.event === "desktop_ack_command_started",
+        ),
+      ).toEqual([]);
+      expect(finals()).toHaveLength(1);
+      expect(finals()[0]).toMatchObject({
+        dedupeKey: JSON.stringify(["conn-123", "auth-send"]),
+        properties: { telemetry_sampled: false, telemetry_sample_rate: 1 },
+      });
+      expect(unknownOf(finals()[0].properties)).toEqual({
+        version: 1,
+        class: "lifecycle_stop_unconfirmed",
+      });
+    });
+
+    it("reports no unknown class when only the legacy command rejects with a lifecycle message", async () => {
+      const { calls } = await run(async (call) => {
+        if (call.cmd === "execute_authorized_stream_command")
+          throw "Command execute_authorized_stream_command not found";
+        return reject(pageReplaced);
+      });
+      expect(calls.map((call) => call.cmd)).toEqual([
+        "execute_authorized_stream_command",
+        "execute_stream_command",
+      ]);
+      expect(rejectionOf(finals()[0].properties)).toEqual({
+        version: 1,
+        reason: "unknown",
+        adapter: "compatibility_native",
+      });
+      expect(unknownOf(finals()[0].properties)).toBeNull();
+    });
+
+    it("keeps an unsampled first spawn rejection at the diagnostic rate", async () => {
+      jest.mocked(sampleDiagnosticOperation).mockReturnValue(false);
+      try {
+        await run(() => reject(spawn));
+      } finally {
+        jest.mocked(sampleDiagnosticOperation).mockReturnValue(true);
+      }
+      expect(
+        captures().filter(
+          (event) => event.event === "desktop_ack_command_started",
+        ),
+      ).toEqual([]);
+      expect(finals()).toHaveLength(1);
+      expect(finals()[0]).toMatchObject({
+        dedupeKey: JSON.stringify(["conn-123", "auth-send"]),
+        properties: { telemetry_sampled: false, telemetry_sample_rate: 1 },
+      });
+      expect(spawnHintOf(finals()[0].properties)).toEqual({
+        version: 1,
+        hint: "code_2",
+      });
+    });
+
+    it.each<[string, string, object | null, object | null]>([
+      [
+        running,
+        "execution_admission",
+        { version: 1, reason: "command_already_running" },
+        null,
+      ],
+      [spawn, "spawn_failed", null, { version: 1, hint: "code_2" }],
+    ])(
+      "reports the compatibility command set when only the legacy command rejects with %p",
+      async (message, reason, admission, hint) => {
+        const { calls } = await run(async (call) => {
+          if (call.cmd === "execute_authorized_stream_command")
+            throw "Command execute_authorized_stream_command not found";
+          return reject(message);
+        });
+        expect(calls.map((call) => call.cmd)).toEqual([
+          "execute_authorized_stream_command",
+          "execute_stream_command",
+        ]);
+        expect(rejectionOf(finals()[0].properties)).toEqual({
+          version: 1,
+          reason,
+          adapter: "compatibility_native",
+        });
+        expect(admissionOf(finals()[0].properties)).toEqual(admission);
+        expect(spawnHintOf(finals()[0].properties)).toEqual(hint);
+      },
+    );
+
+    it.each([running, spawn, stopUnconfirmed])(
+      "never reads a refinement of %p before a command set is selected",
+      async (message) => {
+        const { calls, replies } = await run(
+          async () => {
+            throw new Error("native command must not be invoked");
+          },
+          {
+            afterStart: (bridge) =>
+              Object.defineProperty(bridge, "nativeVersionLookup", {
+                configurable: true,
+                get() {
+                  throw new Error(message);
+                },
+              }),
+          },
+        );
+        expect(calls).toEqual([]);
+        expect(sequencedFrames(replies[0])).toEqual([
+          expect.objectContaining({ type: "error", message }),
+        ]);
+        expect(rejectionOf(finals()[0].properties)).toEqual({
+          version: 1,
+          reason: "unknown",
+          adapter: "not_selected",
+        });
+        expect(admissionOf(finals()[0].properties)).toBeNull();
+        expect(spawnHintOf(finals()[0].properties)).toBeNull();
+        expect(unknownOf(finals()[0].properties)).toBeNull();
+      },
+    );
+
+    it("reports unknown and not_selected when the helper fails before selecting a command set", async () => {
+      const lookupFailure = "PRIVATE pre-selection failure";
+      const { calls, replies } = await run(
+        async () => {
+          throw new Error("native command must not be invoked");
+        },
+        {
+          // The helper reads the cached version lookup into its trace just
+          // before selecting a command set; failing that read rejects the
+          // invocation with no adapter assigned.
+          afterStart: (bridge) =>
+            Object.defineProperty(bridge, "nativeVersionLookup", {
+              configurable: true,
+              get() {
+                throw new Error(lookupFailure);
+              },
+            }),
+        },
+      );
+      expect(calls).toEqual([]);
+      // The product frame keeps the existing raw message unchanged.
+      expect(sequencedFrames(replies[0])).toEqual([
+        expect.objectContaining({ type: "error", message: lookupFailure }),
+      ]);
+      expect(finals()).toHaveLength(1);
+      const final = finals()[0];
+      expect(final.properties).toMatchObject({
+        terminalType: "error",
+        desktop_terminal_error_kind: "invocation_rejected",
+      });
+      expect(rejectionOf(final.properties)).toEqual({
+        version: 1,
+        reason: "unknown",
+        adapter: "not_selected",
+      });
+      const enriched = sanitizeDesktopAckEvent({
+        ...final,
+        properties: { ...final.properties, $current_url: "PRIVATE" },
+      });
+      expect(rejectionOf(enriched.properties)).toEqual(
+        rejectionOf(final.properties),
+      );
+      expect(JSON.stringify([captures(), enriched])).not.toContain("PRIVATE");
+    });
+
+    it("drops an authorization class the selected legacy command cannot emit", async () => {
+      await run(() => reject("Desktop operation was not authorized"), {
+        version: "0.0.72",
+      });
+      expect(finals()[0].properties).toMatchObject({
+        desktop_terminal_error_kind: "invocation_rejected",
+      });
+      expect(rejectionOf(finals()[0].properties)).toBeNull();
+    });
+
+    it.each<[string, string, string | null]>([
+      [unavailable, "authorization_unavailable", null],
+      [
+        "Command stdin exceeds limit",
+        "execution_admission",
+        "stdin_size_limit",
+      ],
+    ])(
+      "keeps the existing send receipt group beside the %s class",
+      async (message, reason, admission) => {
+        await run(async (call) => {
+          (call.onAuthorizationDiagnostic as MockChannel).onmessage!(receipt);
+          return reject(message);
+        });
+        const properties = finals()[0].properties;
+        expect(properties).toMatchObject({
+          native_authorization_diagnostic_version: 1,
+          native_authorization_send_connect: true,
+          native_app_version: "0.0.80",
+          desktop_invocation_rejection_reason: reason,
+          desktop_invocation_rejection_adapter: "authorized_native",
+        });
+        expect(admissionOf(properties)).toEqual(
+          admission && { version: 1, reason: admission },
+        );
+        const enriched = sanitizeDesktopAckEvent({
+          ...finals()[0],
+          properties: { ...properties, $current_url: "PRIVATE" },
+        }).properties;
+        expect(enriched).toMatchObject({
+          native_authorization_diagnostic_version: 1,
+          desktop_invocation_rejection_reason: reason,
+        });
+        expect(admissionOf(enriched)).toEqual(admissionOf(properties));
+      },
+    );
+
+    it.each<
+      [string, (call: NativeCall) => void, string, Record<string, unknown>]
+    >([
+      [
+        "a native exit",
+        (call) => emit(call, { type: "exit", exitCode: 0 }),
+        running,
+        { terminalType: "exit", terminalExitCode: 0 },
+      ],
+      [
+        "a native timeout event",
+        (call) => emit(call, { type: "error", message: timeout }),
+        running,
+        {
+          terminalType: "error",
+          desktop_terminal_error_kind: "native_command_timeout",
+        },
+      ],
+      // A missing command still spawns its shell, which exits nonzero.
+      [
+        "a nonzero native exit",
+        (call) => emit(call, { type: "exit", exitCode: 127 }),
+        spawn,
+        { terminalType: "exit", terminalExitCode: 127 },
+      ],
+      [
+        "a native process error",
+        (call) => emit(call, { type: "error", message: "Process error: x" }),
+        spawn,
+        {
+          terminalType: "error",
+          desktop_terminal_error_kind: "native_process_error",
+        },
+      ],
+      [
+        "a native exit before a lifecycle denial",
+        (call) => emit(call, { type: "exit", exitCode: 0 }),
+        stopUnconfirmed,
+        { terminalType: "exit", terminalExitCode: 0 },
+      ],
+      [
+        "a native timeout before a lifecycle denial",
+        (call) => emit(call, { type: "error", message: timeout }),
+        pageReplaced,
+        {
+          terminalType: "error",
+          desktop_terminal_error_kind: "native_command_timeout",
+        },
+      ],
+    ])(
+      "never attaches a rejection that follows %s",
+      async (_case, first, message, expected) => {
+        // An attachable class and refinement, were it the first terminal.
+        const { replies } = await run(async (call) => {
+          first(call);
+          return reject(message);
+        });
+        // The first terminal alone reaches the product wire.
+        expect(sequencedFrames(replies[0])).toHaveLength(1);
+        expect(finals()).toHaveLength(1);
+        expect(finals()[0].properties).toMatchObject(expected);
+        expect(rejectionOf(finals()[0].properties)).toBeNull();
+        expect(admissionOf(finals()[0].properties)).toBeNull();
+        expect(spawnHintOf(finals()[0].properties)).toBeNull();
+        expect(unknownOf(finals()[0].properties)).toBeNull();
+      },
+    );
+
+    it.each<[string, string | null]>([
+      [running, "another-user"],
+      [spawn, "another-user"],
+      [stopUnconfirmed, "another-user"],
+      // Consent withdrawn while the invocation rejects.
+      [pageReplaced, null],
+    ])(
+      "drops a rejection %p observed under analytics owner %p",
+      async (message, owner) => {
+        const identity = jest.mocked(getIdentifiedAnalyticsUserId);
+        try {
+          await run(
+            async () => {
+              identity.mockReturnValue(owner);
+              return reject(message);
+            },
+            {
+              beforeAck: async () => {
+                identity.mockReturnValue("user-456");
+              },
+            },
+          );
+          // The existing ACK owner gate still emits the original owner's final.
+          expect(finals()).toHaveLength(1);
+          expect(finals()[0].properties).toMatchObject({
+            terminalType: "error",
+          });
+          expect(groupKeys(finals()[0].properties)).toEqual([]);
+        } finally {
+          identity.mockReturnValue("user-456");
+        }
+      },
+    );
+
+    it.each<[string, string]>([
+      ["bridge stop", running],
+      ["bridge stop", spawn],
+      ["transport disconnect", spawn],
+      ["replacement connection", spawn],
+      ["bridge stop", stopUnconfirmed],
+      ["transport disconnect", priorCleanup],
+      ["replacement connection", pageReplaced],
+    ])(
+      "never attaches a rejection that arrives after %s (%p)",
+      async (mode, message) => {
+        let release!: () => void;
+        const pending = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        await run(
+          async () => {
+            await pending;
+            return reject(message);
+          },
+          {
+            beforeAck: async (bridge) => {
+              if (mode === "transport disconnect")
+                getClientHandler("disconnected")({ code: 1, reason: "closed" });
+              else await bridge.stop();
+              if (mode === "replacement connection") await bridge.start();
+              release();
+              await jest.advanceTimersByTimeAsync(0);
+            },
+          },
+        );
+        expect(finals()).toHaveLength(1);
+        expect(finals()[0].properties).toMatchObject({
+          outcome: "incomplete",
+          reason: "stopped",
+        });
+        expect(groupKeys(finals()[0].properties)).toEqual([]);
+      },
+    );
+  });
+
+  describe("stream fence origin", () => {
+    const stopUnconfirmed =
+      "Desktop could not confirm an earlier command stopped. New commands are blocked for this session. Close and reopen Desktop before running more commands.";
+    const pageReplaced =
+      "Desktop page was replaced before this command started";
+    const priorCleanup =
+      "Desktop is still stopping commands from a previous page. Retry shortly.";
+    const fence = { version: 1, origin: "cancel_wait_timeout" };
+    const fenceGroup = {
+      desktop_stream_fence_version: 1,
+      desktop_stream_fence_origin: "cancel_wait_timeout",
+    };
+    // The opted-in native rejection: the exact public message beside the
+    // closed origin, as Tauri delivers the command's JSON error.
+    const fenced = (streamFence: unknown = fence) => ({
+      message: stopUnconfirmed,
+      streamFence,
+    });
+    const fenceKeys = (properties: Record<string, unknown> = {}) =>
+      Object.keys(properties).filter((key) =>
+        key.startsWith("desktop_stream_fence"),
+      );
+
+    it("unwraps an opted-in fence rejection to the exact message and joins only its origin", async () => {
+      const cwd = "/Users/PRIVATE-CWD/project";
+      const { calls, replies } = await run(() => Promise.reject(fenced()), {
+        version: "0.0.83",
+        command: { cwd },
+      });
+
+      // One authorized invocation, never retried, offered the opt-in outside
+      // the unchanged signed message.
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toMatchObject({
+        cmd: "execute_authorized_stream_command",
+        authorizationId,
+        message: expect.objectContaining({ cwd }),
+        includeStreamFenceOrigin: true,
+        includeStreamFenceCleanup: true,
+        includeStreamFenceWindowsTaskkill: true,
+        includeStreamFenceWindowsTaskkillRootReport: true,
+      });
+      for (const optIn of [
+        "includeStreamFenceOrigin",
+        "includeStreamFenceCleanup",
+        "includeStreamFenceWindowsTaskkill",
+        "includeStreamFenceWindowsTaskkillRootReport",
+      ])
+        expect(Object.keys(calls[0].message as object)).not.toContain(optIn);
+      // The product error is the exact original string, as one terminal.
+      expect(sequencedFrames(replies[0])).toEqual([
+        {
+          type: "error",
+          message: stopUnconfirmed,
+          commandId: "auth-send",
+          sequence: 0,
+          outputProtocol: "ack-v1",
+        },
+      ]);
+
+      expect(finals()).toHaveLength(1);
+      const final = finals()[0];
+      expect(final.properties).toMatchObject({
+        outcome: "acknowledged",
+        terminalType: "error",
+        telemetry_sample_rate: 1,
+        desktop_terminal_error_kind: "invocation_rejected",
+        desktop_invocation_rejection_reason: "unknown",
+        desktop_invocation_rejection_adapter: "authorized_native",
+        desktop_invocation_unknown_class: "lifecycle_stop_unconfirmed",
+        ...fenceGroup,
+      });
+      expect(fenceKeys(final.properties)).toHaveLength(2);
+      const started = captures().find(
+        (event) => event.event === "desktop_ack_command_started",
+      );
+      expect(fenceKeys(started?.properties)).toEqual([]);
+      const enriched = sanitizeDesktopAckEvent({
+        ...final,
+        properties: {
+          ...final.properties,
+          $current_url: "PRIVATE",
+          cwd,
+          command: "PRIVATE COMMAND",
+        },
+        $set: { email: "PRIVATE" },
+      });
+      expect(enriched.properties).toMatchObject(fenceGroup);
+      expect(fenceKeys(enriched.properties)).toHaveLength(2);
+      const serialized = JSON.stringify([captures(), enriched]);
+      expect(serialized).not.toContain("PRIVATE");
+      expect(serialized).not.toContain(authorizationId);
+      expect(serialized).not.toContain(stopUnconfirmed);
+      expect(serialized).not.toContain("streamFence");
+    });
+
+    const getter = (key: string) => {
+      const hostile = { ...fence } as Record<string, unknown>;
+      Object.defineProperty(hostile, key, {
+        enumerable: true,
+        get() {
+          throw new Error("PRIVATE");
+        },
+      });
+      return hostile;
+    };
+    const fail = () => {
+      throw new Error("PRIVATE");
+    };
+    // [case, native, product message (null for an exit), unknown class]
+    it.each<
+      [
+        string,
+        (call: NativeCall) => Promise<unknown>,
+        string | null,
+        string | null,
+      ]
+    >([
+      [
+        "an older native app's exact string",
+        () => reject(stopUnconfirmed),
+        stopUnconfirmed,
+        "lifecycle_stop_unconfirmed",
+      ],
+      [
+        "an Error with the exact message",
+        () => Promise.reject(new Error(stopUnconfirmed)),
+        stopUnconfirmed,
+        "lifecycle_stop_unconfirmed",
+      ],
+      // A malformed origin keeps only the exact public message.
+      ...(
+        [
+          ["an unlisted origin", { ...fence, origin: "PRIVATE" }],
+          ["a numeric origin", { ...fence, origin: 5 }],
+          ["an unsupported version", { ...fence, version: 2 }],
+          ["a string version", { ...fence, version: "1" }],
+          ["a missing version", { origin: fence.origin }],
+          ["an extra private field", { ...fence, pid: 4242 }],
+          ["an inherited origin", Object.create(fence)],
+          ["an origin getter", getter("origin")],
+          [
+            "a throwing proxy",
+            new Proxy(
+              { ...fence },
+              { getPrototypeOf: fail, ownKeys: fail, get: fail },
+            ),
+          ],
+          ["a string", "cancel_wait_timeout"],
+        ] as const
+      ).map(
+        ([name, streamFence]) =>
+          [
+            `${name} beside the exact message`,
+            () => Promise.reject(fenced(streamFence)),
+            stopUnconfirmed,
+            "lifecycle_stop_unconfirmed",
+          ] as [string, (call: NativeCall) => Promise<unknown>, string, string],
+      ),
+      // Any other object is never unwrapped or read as a message.
+      [
+        "another lifecycle message",
+        () => Promise.reject({ message: pageReplaced, streamFence: fence }),
+        "[object Object]",
+        "message_unavailable",
+      ],
+      [
+        "an over-long message quoting the fence message",
+        () =>
+          Promise.reject({
+            message: `${stopUnconfirmed}${" PRIVATE".repeat(200)}`,
+            streamFence: fence,
+          }),
+        "[object Object]",
+        "message_unavailable",
+      ],
+      [
+        "a missing origin",
+        () => Promise.reject({ message: stopUnconfirmed }),
+        "[object Object]",
+        "message_unavailable",
+      ],
+      [
+        "an extra private field",
+        () => Promise.reject({ ...fenced(), pid: 4242 }),
+        "[object Object]",
+        "message_unavailable",
+      ],
+      [
+        "a message getter",
+        () => {
+          const hostile = { streamFence: fence } as Record<string, unknown>;
+          Object.defineProperty(hostile, "message", {
+            enumerable: true,
+            get() {
+              throw new Error("PRIVATE");
+            },
+          });
+          return Promise.reject(hostile);
+        },
+        "[object Object]",
+        "message_unavailable",
+      ],
+      [
+        "an inherited rejection",
+        () => Promise.reject(Object.create(fenced())),
+        "[object Object]",
+        "message_unavailable",
+      ],
+      [
+        "a page replacement string",
+        () => reject(pageReplaced),
+        pageReplaced,
+        "lifecycle_page_replaced",
+      ],
+      [
+        "a prior cleanup string",
+        () => reject(priorCleanup),
+        priorCleanup,
+        "lifecycle_prior_cleanup_pending",
+      ],
+      // Only the first terminal is attached; a later rejection is not.
+      [
+        "a native exit before the fence rejection",
+        async (call) => {
+          (call.onEvent as MockChannel).onmessage!({
+            type: "exit",
+            exitCode: 0,
+          });
+          return Promise.reject(fenced());
+        },
+        null,
+        null,
+      ],
+    ])(
+      "keeps the exact product message and adds no origin for %s",
+      async (_case, native, message, unknownClass) => {
+        const { calls, replies } = await run(native);
+        expect(calls).toHaveLength(1);
+        expect(calls[0]).toMatchObject({
+          includeStreamFenceOrigin: true,
+          includeStreamFenceCleanup: true,
+        });
+        expect(sequencedFrames(replies[0])).toEqual([
+          expect.objectContaining(
+            message === null
+              ? { type: "exit", exitCode: 0, sequence: 0 }
+              : { type: "error", message, sequence: 0 },
+          ),
+        ]);
+        expect(finals()).toHaveLength(1);
+        const properties = finals()[0].properties;
+        if (unknownClass)
+          expect(properties).toMatchObject({
+            desktop_invocation_rejection_adapter: "authorized_native",
+            desktop_invocation_unknown_class: unknownClass,
+          });
+        expect(fenceKeys(properties)).toEqual([]);
+        const enriched = sanitizeDesktopAckEvent({
+          ...finals()[0],
+          properties: { ...properties },
+        });
+        expect(fenceKeys(enriched.properties)).toEqual([]);
+        const serialized = JSON.stringify([captures(), enriched]);
+        expect(serialized).not.toContain("PRIVATE");
+        expect(serialized).not.toContain("streamFence");
+      },
+    );
+
+    it("never offers or unwraps the opt-in through the compatibility command", async () => {
+      const { calls, replies } = await run(
+        async (call) => {
+          if (call.cmd === "execute_authorized_stream_command")
+            throw "Command execute_authorized_stream_command not found";
+          return Promise.reject(fenced());
+        },
+        { nativeOs: "windows" },
+      );
+      expect(calls.map((call) => call.cmd)).toEqual([
+        "execute_authorized_stream_command",
+        "execute_stream_command",
+      ]);
+      expect(calls[0]).toMatchObject({
+        includeStreamFenceOrigin: true,
+        includeStreamFenceCleanup: true,
+        includeStreamFenceCancelWaitOwnerPhase: true,
+        includeStreamFenceStopRequestSource: true,
+      });
+      expect(calls[1]).not.toHaveProperty("includeStreamFenceOrigin");
+      expect(calls[1]).not.toHaveProperty("includeStreamFenceCleanup");
+      expect(calls[1]).not.toHaveProperty("includeStreamFenceWindowsTaskkill");
+      expect(calls[1]).not.toHaveProperty(
+        "includeStreamFenceWindowsTaskkillRootReport",
+      );
+      expect(calls[1]).not.toHaveProperty(
+        "includeStreamFenceCancelWaitOwnerPhase",
+      );
+      expect(calls[1]).not.toHaveProperty(
+        "includeStreamFenceStopRequestSource",
+      );
+      expect(sequencedFrames(replies[0])).toEqual([
+        expect.objectContaining({ type: "error", message: "[object Object]" }),
+      ]);
+      expect(finals()[0].properties).toMatchObject({
+        desktop_invocation_rejection_adapter: "compatibility_native",
+      });
+      expect(fenceKeys(finals()[0].properties)).toEqual([]);
+    });
+
+    it("never offers or unwraps the opt-in for a published legacy native app", async () => {
+      const { calls, replies } = await run(() => Promise.reject(fenced()), {
+        version: "0.0.72",
+      });
+      expect(calls.map((call) => call.cmd)).toEqual(["execute_stream_command"]);
+      expect(calls[0]).not.toHaveProperty("includeStreamFenceOrigin");
+      expect(calls[0]).not.toHaveProperty("includeStreamFenceCleanup");
+      expect(calls[0]).not.toHaveProperty("includeStreamFenceWindowsTaskkill");
+      expect(calls[0]).not.toHaveProperty(
+        "includeStreamFenceWindowsTaskkillRootReport",
+      );
+      expect(sequencedFrames(replies[0])).toEqual([
+        expect.objectContaining({ type: "error", message: "[object Object]" }),
+      ]);
+      expect(fenceKeys(finals()[0].properties)).toEqual([]);
+    });
+
+    it("never offers the opt-in without an identified analytics owner", async () => {
+      const identity = jest.mocked(getIdentifiedAnalyticsUserId);
+      identity.mockReturnValue(null);
+      try {
+        const { calls, replies } = await run(() => reject(stopUnconfirmed), {
+          nativeOs: "windows",
+        });
+        expect(calls).toHaveLength(1);
+        expect(calls[0]).not.toHaveProperty("includeStreamFenceOrigin");
+        expect(calls[0]).not.toHaveProperty("includeStreamFenceCleanup");
+        expect(calls[0]).not.toHaveProperty(
+          "includeStreamFenceWindowsTaskkill",
+        );
+        expect(calls[0]).not.toHaveProperty(
+          "includeStreamFenceWindowsTaskkillRootReport",
+        );
+        expect(calls[0]).not.toHaveProperty(
+          "includeStreamFenceCancelWaitOwnerPhase",
+        );
+        expect(calls[0]).not.toHaveProperty(
+          "includeStreamFenceStopRequestSource",
+        );
+        expect(sequencedFrames(replies[0])).toEqual([
+          expect.objectContaining({ type: "error", message: stopUnconfirmed }),
+        ]);
+        expect(finals()).toHaveLength(0);
+      } finally {
+        identity.mockReturnValue("user-456");
+      }
+    });
+
+    it("keeps the exact message but drops an origin observed under another analytics owner", async () => {
+      const identity = jest.mocked(getIdentifiedAnalyticsUserId);
+      try {
+        const { replies } = await run(
+          async () => {
+            identity.mockReturnValue("another-user");
+            return Promise.reject(fenced());
+          },
+          {
+            beforeAck: async () => {
+              identity.mockReturnValue("user-456");
+            },
+          },
+        );
+        expect(sequencedFrames(replies[0])).toEqual([
+          expect.objectContaining({ type: "error", message: stopUnconfirmed }),
+        ]);
+        expect(finals()).toHaveLength(1);
+        expect(finals()[0].properties).toMatchObject({ terminalType: "error" });
+        expect(fenceKeys(finals()[0].properties)).toEqual([]);
+      } finally {
+        identity.mockReturnValue("user-456");
+      }
+    });
+
+    it("drops an origin whose rejection arrives after the connection is stopped", async () => {
+      let release!: () => void;
+      const pending = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      await run(
+        async () => {
+          await pending;
+          return Promise.reject(fenced());
+        },
+        {
+          beforeAck: async (bridge) => {
+            await bridge.stop();
+            release();
+          },
+        },
+      );
+      expect(finals()).toHaveLength(1);
+      expect(finals()[0].properties).toMatchObject({
+        outcome: "incomplete",
+        reason: "stopped",
+      });
+      expect(fenceKeys(finals()[0].properties)).toEqual([]);
+    });
+
+    it("keeps interleaved invocations' origins separate", async () => {
+      await run(
+        async (call) => {
+          const commandId = (call.message as { commandId: string }).commandId;
+          if (commandId === "owner")
+            return Promise.reject(
+              fenced({ version: 1, origin: "owner_outcome_missing" }),
+            );
+          if (commandId === "cancel") return Promise.reject(fenced());
+          return reject(stopUnconfirmed);
+        },
+        { commandIds: ["owner", "cancel", "none"] },
+      );
+      const byCommand = Object.fromEntries(
+        finals().map((event) => [
+          event.properties!.commandId,
+          event.properties,
+        ]),
+      );
+      expect(byCommand.owner).toMatchObject({
+        desktop_stream_fence_origin: "owner_outcome_missing",
+      });
+      expect(byCommand.cancel).toMatchObject(fenceGroup);
+      expect(fenceKeys(byCommand.none)).toEqual([]);
+    });
+
+    describe("stop cleanup failure", () => {
+      const stop = { version: 1, origin: "owner_stop_requested" };
+      const stopGroup = {
+        desktop_stream_fence_version: 1,
+        desktop_stream_fence_origin: "owner_stop_requested",
+      };
+      // The opted-in sibling shape: the exact message, the stop origin and
+      // the closed cleanup failure, as Tauri delivers the command's JSON error.
+      const withCleanup = (
+        streamFenceCleanup: unknown,
+        streamFence: unknown = stop,
+      ) => ({ message: stopUnconfirmed, streamFence, streamFenceCleanup });
+
+      it.each([
+        "tree_unconfirmed",
+        "leader_wait_timed_out",
+        "leader_wait_failed",
+        "tree_and_leader_wait_timed_out",
+        "tree_and_leader_wait_failed",
+      ])(
+        "unwraps the exact message and joins the %s failure to its stop origin",
+        async (failure) => {
+          const cwd = "/Users/PRIVATE-CWD/project";
+          const { calls, replies } = await run(
+            () => Promise.reject(withCleanup({ version: 1, failure })),
+            { version: "0.0.84", command: { cwd } },
+          );
+          expect(calls).toHaveLength(1);
+          expect(calls[0]).toMatchObject({
+            cmd: "execute_authorized_stream_command",
+            includeStreamFenceOrigin: true,
+            includeStreamFenceCleanup: true,
+          });
+          // The product error is the exact original string, as one terminal.
+          expect(sequencedFrames(replies[0])).toEqual([
+            {
+              type: "error",
+              message: stopUnconfirmed,
+              commandId: "auth-send",
+              sequence: 0,
+              outputProtocol: "ack-v1",
+            },
+          ]);
+          const cleanupGroup = {
+            desktop_stream_fence_cleanup_version: 1,
+            desktop_stream_fence_cleanup_failure: failure,
+          };
+          expect(finals()).toHaveLength(1);
+          const final = finals()[0];
+          expect(final.properties).toMatchObject({
+            outcome: "acknowledged",
+            terminalType: "error",
+            terminalAcknowledged: true,
+            telemetry_sample_rate: 1,
+            desktop_invocation_unknown_class: "lifecycle_stop_unconfirmed",
+            ...stopGroup,
+            ...cleanupGroup,
+          });
+          expect(fenceKeys(final.properties)).toHaveLength(4);
+          const enriched = sanitizeDesktopAckEvent({
+            ...final,
+            properties: {
+              ...final.properties,
+              $current_url: "PRIVATE",
+              cwd,
+              command: "PRIVATE COMMAND",
+            },
+            $set: { email: "PRIVATE" },
+          });
+          expect(enriched.properties).toMatchObject({
+            ...stopGroup,
+            ...cleanupGroup,
+          });
+          expect(fenceKeys(enriched.properties)).toHaveLength(4);
+          const serialized = JSON.stringify([captures(), enriched]);
+          expect(serialized).not.toContain("PRIVATE");
+          expect(serialized).not.toContain(authorizationId);
+          expect(serialized).not.toContain(stopUnconfirmed);
+          expect(serialized).not.toContain("streamFence");
+        },
+      );
+
+      // [case, native rejection, expected fence group]
+      it.each<[string, () => unknown, Record<string, unknown>]>([
+        ["an older native app's exact v1 shape", () => fenced(stop), stopGroup],
+        [
+          "an unlisted failure",
+          () => withCleanup({ version: 1, failure: "PRIVATE" }),
+          stopGroup,
+        ],
+        [
+          "an unsupported version",
+          () => withCleanup({ version: 2, failure: "tree_unconfirmed" }),
+          stopGroup,
+        ],
+        [
+          "an extra private field",
+          () =>
+            withCleanup({ version: 1, failure: "tree_unconfirmed", pid: 4242 }),
+          stopGroup,
+        ],
+        [
+          "a failure getter",
+          () =>
+            withCleanup(
+              Object.defineProperty({ version: 1 }, "failure", {
+                enumerable: true,
+                get: fail,
+              }),
+            ),
+          stopGroup,
+        ],
+        [
+          "a throwing proxy",
+          () =>
+            withCleanup(
+              new Proxy(
+                { version: 1, failure: "tree_unconfirmed" },
+                { getPrototypeOf: fail, ownKeys: fail, get: fail },
+              ),
+            ),
+          stopGroup,
+        ],
+        ["a string", () => withCleanup("tree_unconfirmed"), stopGroup],
+        [
+          "a sibling beside another origin",
+          () => withCleanup({ version: 1, failure: "tree_unconfirmed" }, fence),
+          fenceGroup,
+        ],
+      ])(
+        "keeps the exact message and only the origin for %s",
+        async (_case, native, expected) => {
+          const { replies } = await run(() => Promise.reject(native()));
+          expect(sequencedFrames(replies[0])).toEqual([
+            expect.objectContaining({
+              type: "error",
+              message: stopUnconfirmed,
+              sequence: 0,
+            }),
+          ]);
+          expect(finals()).toHaveLength(1);
+          const properties = finals()[0].properties;
+          expect(properties).toMatchObject(expected);
+          expect(fenceKeys(properties)).toEqual(Object.keys(expected));
+          const enriched = sanitizeDesktopAckEvent({
+            ...finals()[0],
+            properties: { ...properties },
+          });
+          expect(fenceKeys(enriched.properties)).toEqual(Object.keys(expected));
+          const serialized = JSON.stringify([captures(), enriched]);
+          expect(serialized).not.toContain("PRIVATE");
+          expect(serialized).not.toContain("streamFence");
+          expect(serialized).not.toContain("desktop_stream_fence_cleanup");
+        },
+      );
+
+      it("never unwraps the sibling through the compatibility command", async () => {
+        const { replies } = await run(async (call) => {
+          if (call.cmd === "execute_authorized_stream_command")
+            throw "Command execute_authorized_stream_command not found";
+          return Promise.reject(
+            withCleanup({ version: 1, failure: "tree_unconfirmed" }),
+          );
+        });
+        expect(sequencedFrames(replies[0])).toEqual([
+          expect.objectContaining({
+            type: "error",
+            message: "[object Object]",
+          }),
+        ]);
+        expect(fenceKeys(finals()[0].properties)).toEqual([]);
+      });
+
+      it("drops both groups when the rejection arrives after the connection is stopped", async () => {
+        let release!: () => void;
+        const pending = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        await run(
+          async () => {
+            await pending;
+            return Promise.reject(
+              withCleanup({ version: 1, failure: "leader_wait_failed" }),
+            );
+          },
+          {
+            beforeAck: async (bridge) => {
+              await bridge.stop();
+              release();
+            },
+          },
+        );
+        expect(finals()).toHaveLength(1);
+        expect(finals()[0].properties).toMatchObject({
+          outcome: "incomplete",
+          reason: "stopped",
+        });
+        expect(fenceKeys(finals()[0].properties)).toEqual([]);
+      });
+
+      it("keeps the cleanup failure with its own invocation only", async () => {
+        await run(
+          async (call) => {
+            const commandId = (call.message as { commandId: string }).commandId;
+            if (commandId === "stop")
+              return Promise.reject(
+                withCleanup({ version: 1, failure: "tree_unconfirmed" }),
+              );
+            if (commandId === "older") return Promise.reject(fenced(stop));
+            return Promise.reject(fenced());
+          },
+          { commandIds: ["stop", "older", "cancel"] },
+        );
+        const byCommand = Object.fromEntries(
+          finals().map((event) => [
+            event.properties!.commandId,
+            event.properties,
+          ]),
+        );
+        expect(byCommand.stop).toMatchObject({
+          ...stopGroup,
+          desktop_stream_fence_cleanup_failure: "tree_unconfirmed",
+        });
+        expect(fenceKeys(byCommand.older)).toEqual(Object.keys(stopGroup));
+        expect(fenceKeys(byCommand.cancel)).toEqual(Object.keys(fenceGroup));
+      });
+
+      describe("Windows taskkill receipt", () => {
+        const tree = { version: 1, failure: "tree_unconfirmed" };
+        const treeGroup = {
+          ...stopGroup,
+          desktop_stream_fence_cleanup_version: 1,
+          desktop_stream_fence_cleanup_failure: "tree_unconfirmed",
+        };
+        // The opted-in shape: the tree_unconfirmed sibling beside the closed
+        // taskkill receipt, as Tauri delivers the command's JSON error.
+        const withTaskkill = (
+          streamFenceWindowsTaskkill: unknown,
+          cleanup: unknown = tree,
+        ) => ({ ...withCleanup(cleanup), streamFenceWindowsTaskkill });
+
+        it.each<[unknown, Record<string, unknown>]>([
+          [
+            { version: 1, outcome: "nonzero_exit", exitCode: 128 },
+            {
+              desktop_stream_fence_windows_taskkill_version: 1,
+              desktop_stream_fence_windows_taskkill_outcome: "nonzero_exit",
+              desktop_stream_fence_windows_taskkill_exit_code: 128,
+            },
+          ],
+          [
+            { version: 1, outcome: "output_error" },
+            {
+              desktop_stream_fence_windows_taskkill_version: 1,
+              desktop_stream_fence_windows_taskkill_outcome: "output_error",
+            },
+          ],
+          // A current native app's v2 receipt adds only the root report pair
+          // beside the unchanged v1 group.
+          [
+            {
+              version: 2,
+              outcome: "nonzero_exit",
+              exitCode: 128,
+              rootReport: "requested_pid_not_found",
+            },
+            {
+              desktop_stream_fence_windows_taskkill_version: 1,
+              desktop_stream_fence_windows_taskkill_outcome: "nonzero_exit",
+              desktop_stream_fence_windows_taskkill_exit_code: 128,
+              desktop_stream_fence_windows_taskkill_root_report_version: 1,
+              desktop_stream_fence_windows_taskkill_root_report:
+                "requested_pid_not_found",
+            },
+          ],
+          [
+            {
+              version: 2,
+              outcome: "nonzero_exit",
+              exitCode: 255,
+              rootReport: "unclassified",
+            },
+            {
+              desktop_stream_fence_windows_taskkill_version: 1,
+              desktop_stream_fence_windows_taskkill_outcome: "nonzero_exit",
+              desktop_stream_fence_windows_taskkill_exit_code: 255,
+              desktop_stream_fence_windows_taskkill_root_report_version: 1,
+              desktop_stream_fence_windows_taskkill_root_report: "unclassified",
+            },
+          ],
+        ])(
+          "unwraps the exact message and joins %j to its tree_unconfirmed stop",
+          async (receipt, taskkillGroup) => {
+            const cwd = "/Users/PRIVATE-CWD/project";
+            const { calls, replies } = await run(
+              () => Promise.reject(withTaskkill(receipt)),
+              { version: "0.0.85", command: { cwd } },
+            );
+            expect(calls).toHaveLength(1);
+            expect(calls[0]).toMatchObject({
+              cmd: "execute_authorized_stream_command",
+              includeStreamFenceOrigin: true,
+              includeStreamFenceCleanup: true,
+              includeStreamFenceWindowsTaskkill: true,
+              includeStreamFenceWindowsTaskkillRootReport: true,
+            });
+            expect(sequencedFrames(replies[0])).toEqual([
+              {
+                type: "error",
+                message: stopUnconfirmed,
+                commandId: "auth-send",
+                sequence: 0,
+                outputProtocol: "ack-v1",
+              },
+            ]);
+            const expected = { ...treeGroup, ...taskkillGroup };
+            expect(finals()).toHaveLength(1);
+            const final = finals()[0];
+            expect(final.properties).toMatchObject({
+              outcome: "acknowledged",
+              terminalAcknowledged: true,
+              telemetry_sample_rate: 1,
+              desktop_invocation_unknown_class: "lifecycle_stop_unconfirmed",
+              ...expected,
+            });
+            expect(fenceKeys(final.properties)).toEqual(Object.keys(expected));
+            const enriched = sanitizeDesktopAckEvent({
+              ...final,
+              properties: {
+                ...final.properties,
+                $current_url: "PRIVATE",
+                cwd,
+                command: "PRIVATE COMMAND",
+                pid: 4242,
+              },
+              $set: { email: "PRIVATE" },
+            });
+            expect(enriched.properties).toMatchObject(expected);
+            expect(fenceKeys(enriched.properties)).toEqual(
+              Object.keys(expected),
+            );
+            expect(enriched.properties).not.toHaveProperty("pid");
+            const serialized = JSON.stringify([captures(), enriched]);
+            expect(serialized).not.toContain("PRIVATE");
+            expect(serialized).not.toContain(authorizationId);
+            expect(serialized).not.toContain(stopUnconfirmed);
+            expect(serialized).not.toContain("streamFence");
+          },
+        );
+
+        // [case, native rejection, expected fence groups]
+        it.each<[string, () => unknown, Record<string, unknown>]>([
+          [
+            "the prior tree_unconfirmed shape",
+            () => withCleanup(tree),
+            treeGroup,
+          ],
+          [
+            "a zero code",
+            () =>
+              withTaskkill({
+                version: 1,
+                outcome: "nonzero_exit",
+                exitCode: 0,
+              }),
+            treeGroup,
+          ],
+          [
+            "a code beside output_error",
+            () =>
+              withTaskkill({
+                version: 1,
+                outcome: "output_error",
+                exitCode: 1,
+              }),
+            treeGroup,
+          ],
+          [
+            "an extra private field",
+            () =>
+              withTaskkill({
+                version: 1,
+                outcome: "output_error",
+                stderr: "PRIVATE",
+              }),
+            treeGroup,
+          ],
+          [
+            "an unsupported version",
+            () => withTaskkill({ version: 2, outcome: "output_error" }),
+            treeGroup,
+          ],
+          [
+            "a not-found report beside exit 255",
+            () =>
+              withTaskkill({
+                version: 2,
+                outcome: "nonzero_exit",
+                exitCode: 255,
+                rootReport: "requested_pid_not_found",
+              }),
+            treeGroup,
+          ],
+          [
+            "a raw taskkill line as the report",
+            () =>
+              withTaskkill({
+                version: 2,
+                outcome: "nonzero_exit",
+                exitCode: 128,
+                rootReport: 'ERROR: The process "PRIVATE" not found.',
+              }),
+            treeGroup,
+          ],
+          [
+            "a v1 receipt carrying a report",
+            () =>
+              withTaskkill({
+                version: 1,
+                outcome: "nonzero_exit",
+                exitCode: 128,
+                rootReport: "requested_pid_not_found",
+              }),
+            treeGroup,
+          ],
+          [
+            "a receipt beside another cleanup failure",
+            () =>
+              withTaskkill(
+                { version: 1, outcome: "output_error" },
+                { version: 1, failure: "leader_wait_timed_out" },
+              ),
+            {
+              ...stopGroup,
+              desktop_stream_fence_cleanup_version: 1,
+              desktop_stream_fence_cleanup_failure: "leader_wait_timed_out",
+            },
+          ],
+        ])(
+          "keeps the exact message and only the prior groups for %s",
+          async (_case, native, expected) => {
+            const { replies } = await run(() => Promise.reject(native()));
+            expect(sequencedFrames(replies[0])).toEqual([
+              expect.objectContaining({
+                type: "error",
+                message: stopUnconfirmed,
+                sequence: 0,
+              }),
+            ]);
+            expect(finals()).toHaveLength(1);
+            const properties = finals()[0].properties;
+            expect(properties).toMatchObject(expected);
+            expect(fenceKeys(properties)).toEqual(Object.keys(expected));
+            const enriched = sanitizeDesktopAckEvent({
+              ...finals()[0],
+              properties: { ...properties },
+            });
+            expect(fenceKeys(enriched.properties)).toEqual(
+              Object.keys(expected),
+            );
+            const serialized = JSON.stringify([captures(), enriched]);
+            expect(serialized).not.toContain("PRIVATE");
+            expect(serialized).not.toContain("streamFence");
+            expect(serialized).not.toContain(
+              "desktop_stream_fence_windows_taskkill",
+            );
+          },
+        );
+
+        describe("first stop request source", () => {
+          const notFound = {
+            version: 2,
+            outcome: "nonzero_exit",
+            exitCode: 128,
+            rootReport: "requested_pid_not_found",
+          };
+          const notFoundGroup = {
+            ...treeGroup,
+            desktop_stream_fence_windows_taskkill_version: 1,
+            desktop_stream_fence_windows_taskkill_outcome: "nonzero_exit",
+            desktop_stream_fence_windows_taskkill_exit_code: 128,
+            desktop_stream_fence_windows_taskkill_root_report_version: 1,
+            desktop_stream_fence_windows_taskkill_root_report:
+              "requested_pid_not_found",
+          };
+          // The opted-in shape: the v2 not-found receipt beside the closed
+          // first source, as Tauri delivers the command's JSON error.
+          const withSource = (
+            streamFenceStopRequestSource: unknown,
+            receipt: unknown = notFound,
+          ) => ({ ...withTaskkill(receipt), streamFenceStopRequestSource });
+          const sanitized = (properties: Record<string, unknown>) =>
+            sanitizeDesktopAckEvent({
+              ...finals()[0],
+              properties: { ...properties },
+            });
+
+          // Taskkill's same not-found exit code, with an unclassified report.
+          const unclassified128 = { ...notFound, rootReport: "unclassified" };
+          const unclassifiedGroup = {
+            ...notFoundGroup,
+            desktop_stream_fence_windows_taskkill_root_report: "unclassified",
+          };
+          // Which renderer cancel IPC attempts preceded the first terminal.
+          const attemptPair = (attempt: string) => ({
+            desktop_stream_fence_renderer_cancel_attempt_version: 1,
+            desktop_stream_fence_renderer_cancel_attempt: attempt,
+          });
+
+          it.each(
+            ["cancel_ipc", "document_invalidation", "application_exit"].flatMap(
+              (source) => [
+                [source, "requested_pid_not_found", notFound, notFoundGroup],
+                [source, "unclassified", unclassified128, unclassifiedGroup],
+              ],
+            ),
+          )(
+            "offers Windows Desktop the opt-in and joins the %s source to its exit 128 %s report",
+            async (source, _class, receipt, group) => {
+              const cwd = "C:\\Users\\PRIVATE-CWD\\project";
+              const { calls, replies } = await run(
+                () =>
+                  Promise.reject(withSource({ version: 1, source }, receipt)),
+                { version: "0.0.88", nativeOs: "windows", command: { cwd } },
+              );
+              expect(calls).toHaveLength(1);
+              expect(calls[0]).toMatchObject({
+                cmd: "execute_authorized_stream_command",
+                includeStreamFenceOrigin: true,
+                includeStreamFenceCleanup: true,
+                includeStreamFenceWindowsTaskkill: true,
+                includeStreamFenceWindowsTaskkillRootReport: true,
+                includeStreamFenceStopRequestSource: true,
+              });
+              expect(Object.keys(calls[0].message as object)).not.toContain(
+                "includeStreamFenceStopRequestSource",
+              );
+              // The product error is the exact original string, as one
+              // terminal.
+              expect(sequencedFrames(replies[0])).toEqual([
+                {
+                  type: "error",
+                  message: stopUnconfirmed,
+                  commandId: "auth-send",
+                  sequence: 0,
+                  outputProtocol: "ack-v1",
+                },
+              ]);
+              const expected = {
+                ...(group as Record<string, unknown>),
+                desktop_stream_fence_stop_request_source_version: 1,
+                desktop_stream_fence_stop_request_source: source,
+                // This runless command had no renderer cancel attempt.
+                ...(source === "cancel_ipc" && attemptPair("unobserved")),
+              };
+              expect(finals()).toHaveLength(1);
+              const final = finals()[0];
+              expect(final.properties).toMatchObject({
+                outcome: "acknowledged",
+                terminalAcknowledged: true,
+                desktop_invocation_unknown_class: "lifecycle_stop_unconfirmed",
+                ...expected,
+              });
+              expect(fenceKeys(final.properties)).toEqual(
+                Object.keys(expected),
+              );
+              const enriched = sanitizeDesktopAckEvent({
+                ...final,
+                properties: {
+                  ...final.properties,
+                  $current_url: "PRIVATE",
+                  cwd,
+                  command: "PRIVATE COMMAND",
+                  pid: 4242,
+                },
+                $set: { email: "PRIVATE" },
+              });
+              expect(enriched.properties).toMatchObject(expected);
+              expect(fenceKeys(enriched.properties)).toEqual(
+                Object.keys(expected),
+              );
+              expect(enriched.properties).not.toHaveProperty("pid");
+              const serialized = JSON.stringify([captures(), enriched]);
+              expect(serialized).not.toContain("PRIVATE");
+              expect(serialized).not.toContain("4242");
+              expect(serialized).not.toContain(authorizationId);
+              expect(serialized).not.toContain(stopUnconfirmed);
+              expect(serialized).not.toContain("streamFence");
+            },
+          );
+
+          it.each(["macos", "linux"])(
+            "never offers %s Desktop the opt-in or keeps a source it never requested",
+            async (nativeOs) => {
+              const native = withSource({ version: 1, source: "cancel_ipc" });
+              const { calls } = await run(() => Promise.reject(native), {
+                nativeOs,
+              });
+              expect(calls).toHaveLength(1);
+              // The existing opt-ins are unchanged.
+              expect(calls[0]).toMatchObject({
+                includeStreamFenceOrigin: true,
+                includeStreamFenceCleanup: true,
+                includeStreamFenceWindowsTaskkill: true,
+                includeStreamFenceWindowsTaskkillRootReport: true,
+              });
+              expect(calls[0]).not.toHaveProperty(
+                "includeStreamFenceStopRequestSource",
+              );
+              expect(finals()).toHaveLength(1);
+              const properties = finals()[0].properties;
+              expect(properties).toMatchObject(notFoundGroup);
+              expect(fenceKeys(properties)).toEqual(Object.keys(notFoundGroup));
+              const enriched = sanitized(properties);
+              expect(fenceKeys(enriched.properties)).toEqual(
+                Object.keys(notFoundGroup),
+              );
+              const serialized = JSON.stringify([captures(), enriched]);
+              expect(serialized).not.toContain("stop_request_source");
+              expect(serialized).not.toContain("cancel_ipc");
+            },
+          );
+
+          const sourceGetter = () =>
+            Object.defineProperty({ version: 1 }, "source", {
+              enumerable: true,
+              get: fail,
+            });
+          const unclassified255Group = {
+            ...unclassifiedGroup,
+            desktop_stream_fence_windows_taskkill_exit_code: 255,
+          };
+          const v1Group = Object.fromEntries(
+            Object.entries(notFoundGroup).filter(
+              ([key]) => !key.includes("root_report"),
+            ),
+          );
+          // [case, native rejection, expected fence groups]
+          it.each<[string, () => unknown, Record<string, unknown>]>([
+            // A current frontend beside a native app without the sibling.
+            [
+              "an older native app's v2 receipt alone",
+              () => withTaskkill(notFound),
+              notFoundGroup,
+            ],
+            [
+              "a human action",
+              () => withSource({ version: 1, source: "user_clicked_stop" }),
+              notFoundGroup,
+            ],
+            [
+              "an unlisted source",
+              () => withSource({ version: 1, source: "PRIVATE" }),
+              notFoundGroup,
+            ],
+            [
+              "an extra PID",
+              () => withSource({ version: 1, source: "cancel_ipc", pid: 4242 }),
+              notFoundGroup,
+            ],
+            [
+              "an extra path",
+              () =>
+                withSource({
+                  version: 1,
+                  source: "cancel_ipc",
+                  cwd: "C:\\PRIVATE",
+                }),
+              notFoundGroup,
+            ],
+            [
+              "an unsupported version",
+              () => withSource({ version: 2, source: "cancel_ipc" }),
+              notFoundGroup,
+            ],
+            [
+              "a source getter",
+              () => withSource(sourceGetter()),
+              notFoundGroup,
+            ],
+            [
+              "an older native app's unclassified exit 128 receipt alone",
+              () => withTaskkill(unclassified128),
+              unclassifiedGroup,
+            ],
+            [
+              "an unlisted source beside an unclassified exit 128 report",
+              () =>
+                withSource({ version: 1, source: "PRIVATE" }, unclassified128),
+              unclassifiedGroup,
+            ],
+            [
+              "a source getter beside an unclassified exit 128 report",
+              () => withSource(sourceGetter(), unclassified128),
+              unclassifiedGroup,
+            ],
+            [
+              "a source beside an unclassified exit 255 report",
+              () =>
+                withSource(
+                  { version: 1, source: "cancel_ipc" },
+                  { ...unclassified128, exitCode: 255 },
+                ),
+              unclassified255Group,
+            ],
+            [
+              "a source beside a v1 receipt",
+              () =>
+                withSource(
+                  { version: 1, source: "cancel_ipc" },
+                  { version: 1, outcome: "nonzero_exit", exitCode: 128 },
+                ),
+              v1Group,
+            ],
+          ])(
+            "keeps the exact message and every earlier group for %s on Windows",
+            async (_case, native, expected) => {
+              const { calls, replies } = await run(
+                () => Promise.reject(native()),
+                { nativeOs: "windows" },
+              );
+              expect(calls[0]).toMatchObject({
+                includeStreamFenceWindowsTaskkillRootReport: true,
+                includeStreamFenceStopRequestSource: true,
+              });
+              expect(sequencedFrames(replies[0])).toEqual([
+                expect.objectContaining({
+                  type: "error",
+                  message: stopUnconfirmed,
+                  sequence: 0,
+                }),
+              ]);
+              expect(finals()).toHaveLength(1);
+              const properties = finals()[0].properties;
+              expect(properties).toMatchObject(expected);
+              expect(fenceKeys(properties)).toEqual(Object.keys(expected));
+              const enriched = sanitized(properties);
+              expect(fenceKeys(enriched.properties)).toEqual(
+                Object.keys(expected),
+              );
+              const serialized = JSON.stringify([captures(), enriched]);
+              expect(serialized).not.toContain("PRIVATE");
+              expect(serialized).not.toContain("streamFence");
+              expect(serialized).not.toContain("stop_request_source");
+            },
+          );
+
+          it("drops every group when the rejection arrives after the connection is stopped", async () => {
+            let release!: () => void;
+            const pending = new Promise<void>((resolve) => {
+              release = resolve;
+            });
+            await run(
+              async () => {
+                await pending;
+                return Promise.reject(
+                  withSource({ version: 1, source: "cancel_ipc" }),
+                );
+              },
+              {
+                nativeOs: "windows",
+                beforeAck: async (bridge) => {
+                  await bridge.stop();
+                  release();
+                },
+              },
+            );
+            expect(finals()).toHaveLength(1);
+            expect(finals()[0].properties).toMatchObject({
+              outcome: "incomplete",
+              reason: "stopped",
+            });
+            expect(fenceKeys(finals()[0].properties)).toEqual([]);
+          });
+
+          describe("renderer cancel attempts before the first terminal", () => {
+            const sourcePair = {
+              desktop_stream_fence_stop_request_source_version: 1,
+              desktop_stream_fence_stop_request_source: "cancel_ipc",
+            };
+            type Route = { on: jest.Mock; publish: jest.Mock };
+            type Internals = { activeCommands: Set<string> };
+            // The command's operation route, as the relay delivers to it.
+            const route = () =>
+              mockClient.newSubscription.mock.results.at(-1)!.value as Route;
+            const deliver = (data: Record<string, unknown>) => {
+              const [, publication] = route().on.mock.calls.find(
+                ([event]) => event === "publication",
+              )!;
+              publication({
+                data: {
+                  commandId: "auth-send",
+                  targetConnectionId: "conn-123",
+                  ...data,
+                },
+              });
+            };
+            let cancels: string[];
+            let stopAfter: number;
+            let rejectNative: (error: unknown) => void;
+            let base: typeof mockInvokeHandler;
+            const pendingNative = () =>
+              new Promise<never>((_, reject) => {
+                rejectNative = reject;
+              });
+            beforeEach(() => {
+              cancels = [];
+              stopAfter = 1;
+              rejectNative = () => {};
+              base = mockInvokeHandler;
+              // Native reports its cancel IPC as the first stop source only
+              // after that IPC; it never confirms the stop.
+              mockInvokeHandler = async (cmd, args) => {
+                if (cmd !== "cancel_stream_command") return base(cmd, args);
+                cancels.push(args?.commandId as string);
+                if (cancels.length === stopAfter)
+                  rejectNative(
+                    withSource({ version: 1, source: "cancel_ipc" }),
+                  );
+                return false;
+              };
+            });
+            afterEach(() => {
+              mockInvokeHandler = base;
+            });
+            /** The final's fence groups, then as before_send enriches them. */
+            const expectAttempt = (attempt: string | null) => {
+              const expected = {
+                ...notFoundGroup,
+                ...sourcePair,
+                ...(attempt && attemptPair(attempt)),
+              };
+              expect(finals()).toHaveLength(1);
+              const properties = finals()[0].properties;
+              expect(properties).toMatchObject({
+                outcome: "acknowledged",
+                terminalAcknowledged: true,
+                ...expected,
+              });
+              expect(fenceKeys(properties)).toEqual(Object.keys(expected));
+              const enriched = sanitized({
+                ...properties,
+                $current_url: "PRIVATE",
+                command: "PRIVATE COMMAND",
+                pid: 4242,
+              });
+              expect(enriched.properties).toMatchObject(expected);
+              expect(fenceKeys(enriched.properties)).toEqual(
+                Object.keys(expected),
+              );
+              const serialized = JSON.stringify([captures(), enriched]);
+              expect(serialized).not.toContain("PRIVATE");
+              expect(serialized).not.toContain("4242");
+              expect(serialized).not.toContain(stopUnconfirmed);
+              expect(serialized).not.toContain("streamFence");
+            };
+
+            it("reports a received relay command_cancel invoked before the terminal", async () => {
+              const { replies } = await run(pendingNative, {
+                nativeOs: "windows",
+                beforeAck: async () => {
+                  deliver({ type: "command_cancel" });
+                  await jest.advanceTimersByTimeAsync(0);
+                },
+              });
+              expect(cancels).toEqual(["auth-send"]);
+              // The cancel result and the exact single terminal are unchanged.
+              expect(replies[0].publish).toHaveBeenCalledWith(
+                expect.objectContaining({
+                  type: "command_cancel_result",
+                  commandId: "auth-send",
+                  canceled: false,
+                }),
+              );
+              expect(sequencedFrames(replies[0])).toEqual([
+                expect.objectContaining({
+                  type: "error",
+                  message: stopUnconfirmed,
+                  sequence: 0,
+                }),
+              ]);
+              expectAttempt("relay_command_cancel");
+            });
+
+            it.each<[string, number, boolean]>([
+              ["output_overflow", 1, false],
+              ["both", 2, true],
+            ])(
+              "reports %s from the router's overflow cleanup",
+              async (attempt, stops, relay) => {
+                stopAfter = stops;
+                let output!: MockChannel;
+                await run(
+                  (call) => {
+                    output = call.onEvent as MockChannel;
+                    return pendingNative();
+                  },
+                  {
+                    nativeOs: "windows",
+                    beforeAck: async () => {
+                      // A slow relay keeps the failed route until its
+                      // failure notice settles, so this harness can still
+                      // acknowledge the terminal sequence on it.
+                      route().publish.mockImplementation(
+                        (frame: { type?: string; sequence?: number }) =>
+                          frame.type === "error" && frame.sequence === undefined
+                            ? new Promise(() => {})
+                            : Promise.resolve(),
+                      );
+                      // One native read over the relay queue's byte budget.
+                      output.onmessage!({
+                        type: "stdout",
+                        data: "x".repeat(4 * 1024 * 1024 + 1),
+                      });
+                      await jest.advanceTimersByTimeAsync(0);
+                      if (relay) {
+                        deliver({ type: "command_cancel" });
+                        await jest.advanceTimersByTimeAsync(0);
+                      }
+                      // The terminal follows the overflowed stdout frame.
+                      deliver({ type: "command_output_ack", sequence: 1 });
+                      await jest.advanceTimersByTimeAsync(0);
+                    },
+                  },
+                );
+                expect(cancels).toEqual(
+                  relay ? ["auth-send", "auth-send"] : ["auth-send"],
+                );
+                expectAttempt(attempt);
+              },
+            );
+
+            it("never reports a cancel invoked after the first terminal", async () => {
+              await run(
+                () =>
+                  Promise.reject(
+                    withSource({ version: 1, source: "cancel_ipc" }),
+                  ),
+                {
+                  nativeOs: "windows",
+                  beforeAck: async (bridge) => {
+                    // A relay cancel that passed the active check before the
+                    // terminal, but whose IPC call follows it.
+                    const internals = bridge as unknown as Internals;
+                    internals.activeCommands.add("auth-send");
+                    deliver({ type: "command_cancel" });
+                    await jest.advanceTimersByTimeAsync(0);
+                  },
+                },
+              );
+              expect(cancels).toEqual(["auth-send"]);
+              expectAttempt("unobserved");
+            });
+
+            it("never redirects a cancel captured for one invocation to its replacement", async () => {
+              let replacement: Record<string, unknown> | undefined;
+              await run(pendingNative, {
+                nativeOs: "windows",
+                beforeAck: async (bridge) => {
+                  const internals = bridge as unknown as Internals & {
+                    operationRouter: unknown;
+                    rendererCancelAttempts: Map<string, unknown>;
+                  };
+                  // The handler captures its owner synchronously; the same
+                  // command ID then names another open entry of the same
+                  // router before the IPC module loads.
+                  deliver({ type: "command_cancel" });
+                  replacement = {
+                    router: internals.operationRouter,
+                    open: true,
+                    relay_command_cancel: false,
+                    output_overflow: false,
+                  };
+                  internals.rendererCancelAttempts.set(
+                    "auth-send",
+                    replacement,
+                  );
+                  await jest.advanceTimersByTimeAsync(0);
+                },
+              });
+              // The product cancel still runs unchanged.
+              expect(cancels).toEqual(["auth-send"]);
+              expect(replacement).toMatchObject({
+                relay_command_cancel: false,
+                output_overflow: false,
+              });
+              expectAttempt("unobserved");
+            });
+
+            it.each(["run-1", "", null])(
+              "never reports attempts beside a %p Trigger run ID",
+              async (triggerRunId) => {
+                await run(pendingNative, {
+                  nativeOs: "windows",
+                  command: { chatId: "chat-1", triggerRunId },
+                  beforeAck: async () => {
+                    deliver({ type: "command_cancel" });
+                    await jest.advanceTimersByTimeAsync(0);
+                  },
+                });
+                expect(cancels).toEqual(["auth-send"]);
+                expectAttempt(null);
+              },
+            );
+
+            describe("original command cancel nonconfirmation", () => {
+              const uuid = "0193a5b2-7c41-7a10-8f00-333333333333";
+              const nonconfirmations = () =>
+                jest
+                  .mocked(captureAuthenticatedEvent)
+                  .mock.calls.filter(
+                    ([event]) =>
+                      event === "desktop_stream_cancel_nonconfirmation",
+                  )
+                  .map(([, properties]) => properties);
+              const cancelResults = (reply: { publish: jest.Mock }) =>
+                reply.publish.mock.calls
+                  .map(([frame]) => frame)
+                  .filter((frame) => frame.type === "command_cancel_result");
+              beforeEach(() => {
+                jest
+                  .mocked(getPermittedAnalyticsUserId)
+                  .mockReturnValue("user-456");
+                jest
+                  .mocked(getIdentifiedAnalyticsUserId)
+                  .mockReturnValue("user-456");
+              });
+
+              /** Overflow cleanup, then two relay cancels, all unconfirmed. */
+              const overflowThenRelayTwice = async (
+                commandId: string,
+                nativeOs?: string,
+                afterRegistration?: () => void,
+              ) => {
+                stopAfter = 3;
+                let output!: MockChannel;
+                await run(
+                  (call) => {
+                    output = call.onEvent as MockChannel;
+                    return pendingNative();
+                  },
+                  {
+                    nativeOs,
+                    commandIds: [commandId],
+                    beforeAck: async () => {
+                      afterRegistration?.();
+                      route().publish.mockImplementation(
+                        (frame: { type?: string; sequence?: number }) =>
+                          frame.type === "error" && frame.sequence === undefined
+                            ? new Promise(() => {})
+                            : Promise.resolve(),
+                      );
+                      output.onmessage!({
+                        type: "stdout",
+                        data: "x".repeat(4 * 1024 * 1024 + 1),
+                      });
+                      await jest.advanceTimersByTimeAsync(0);
+                      for (let i = 0; i < 2; i++) {
+                        deliver({ type: "command_cancel", commandId });
+                        await jest.advanceTimersByTimeAsync(0);
+                      }
+                      deliver({
+                        type: "command_output_ack",
+                        commandId,
+                        sequence: 1,
+                      });
+                      await jest.advanceTimersByTimeAsync(0);
+                    },
+                  },
+                );
+              };
+
+              it("reports each caller once for the original Windows command", async () => {
+                await overflowThenRelayTwice(uuid, "windows");
+                // No extra native invocation.
+                expect(cancels).toEqual([uuid, uuid, uuid]);
+                expect(nonconfirmations()).toEqual([
+                  {
+                    version: 1,
+                    command_id: uuid,
+                    caller: "output_overflow",
+                    outcome: "returned_false",
+                  },
+                  {
+                    version: 1,
+                    command_id: uuid,
+                    caller: "relay_command_cancel",
+                    outcome: "returned_false",
+                  },
+                ]);
+              });
+
+              it.each<[string, string | undefined, string]>([
+                ["a macOS command", undefined, uuid],
+                ["a non-UUID Windows command", "windows", "auth-send"],
+              ])("never reports %s", async (_, nativeOs, commandId) => {
+                await overflowThenRelayTwice(commandId, nativeOs);
+                expect(cancels).toEqual([commandId, commandId, commandId]);
+                expect(nonconfirmations()).toEqual([]);
+              });
+
+              it("never reports for an owner identified only after the command started", async () => {
+                jest.mocked(getIdentifiedAnalyticsUserId).mockReturnValue(null);
+                // Identified before the cancels; registration captured none.
+                await overflowThenRelayTwice(uuid, "windows", () =>
+                  jest
+                    .mocked(getIdentifiedAnalyticsUserId)
+                    .mockReturnValue("user-456"),
+                );
+                expect(cancels).toHaveLength(3);
+                expect(nonconfirmations()).toEqual([]);
+              });
+
+              it("reports a rejected relay cancel without its error and publishes false", async () => {
+                mockInvokeHandler = async (cmd, args) => {
+                  if (cmd !== "cancel_stream_command") return base(cmd, args);
+                  cancels.push(args?.commandId as string);
+                  rejectNative(
+                    withSource({ version: 1, source: "cancel_ipc" }),
+                  );
+                  throw new Error("PRIVATE C:\\Users\\me pid 4242");
+                };
+                const { replies } = await run(pendingNative, {
+                  nativeOs: "windows",
+                  commandIds: [uuid],
+                  beforeAck: async () => {
+                    deliver({ type: "command_cancel", commandId: uuid });
+                    await jest.advanceTimersByTimeAsync(0);
+                  },
+                });
+                expect(cancels).toEqual([uuid]);
+                expect(cancelResults(replies[0])).toEqual([
+                  expect.objectContaining({ commandId: uuid, canceled: false }),
+                ]);
+                expect(nonconfirmations()).toEqual([
+                  {
+                    version: 1,
+                    command_id: uuid,
+                    caller: "relay_command_cancel",
+                    outcome: "invoke_rejected",
+                  },
+                ]);
+                const serialized = JSON.stringify(nonconfirmations());
+                expect(serialized).not.toContain("PRIVATE");
+                expect(serialized).not.toContain("4242");
+              });
+            });
+          });
+        });
+      });
+
+      describe("Darwin stop source and final group probe", () => {
+        const tree = { version: 1, failure: "tree_unconfirmed" };
+        const treeGroup = {
+          ...stopGroup,
+          desktop_stream_fence_cleanup_version: 1,
+          desktop_stream_fence_cleanup_failure: "tree_unconfirmed",
+        };
+        // The opted-in shape: the tree_unconfirmed sibling beside the closed
+        // Darwin stop receipt, as Tauri delivers the command's JSON error.
+        const withDarwin = (
+          streamFenceDarwinStop: unknown,
+          cleanup: unknown = tree,
+        ) => ({ ...withCleanup(cleanup), streamFenceDarwinStop });
+        const visible = {
+          version: 1,
+          source: "cancel_ipc",
+          groupProbe: "group_visible",
+        };
+        const sanitized = (properties: Record<string, unknown>) =>
+          sanitizeDesktopAckEvent({
+            ...finals()[0],
+            properties: { ...properties },
+          });
+
+        it.each([
+          ["cancel_ipc", "group_visible"],
+          ["document_invalidation", "probe_denied"],
+          ["application_exit", "probe_failed"],
+        ])(
+          "offers Darwin Desktop the opt-in and joins the %s source and %s probe to its tree_unconfirmed stop",
+          async (source, groupProbe) => {
+            const cwd = "/Users/PRIVATE-CWD/project";
+            const { calls, replies } = await run(
+              () =>
+                Promise.reject(withDarwin({ version: 1, source, groupProbe })),
+              { version: "0.0.94", command: { cwd } },
+            );
+            expect(calls).toHaveLength(1);
+            expect(calls[0]).toMatchObject({
+              cmd: "execute_authorized_stream_command",
+              includeStreamFenceOrigin: true,
+              includeStreamFenceCleanup: true,
+              includeStreamFenceWindowsTaskkill: true,
+              includeStreamFenceWindowsTaskkillRootReport: true,
+              includeStreamFenceDarwinStop: true,
+            });
+            // Windows' own opt-ins are never offered to Darwin.
+            expect(calls[0]).not.toHaveProperty(
+              "includeStreamFenceStopRequestSource",
+            );
+            expect(calls[0]).not.toHaveProperty(
+              "includeStreamFenceCancelWaitOwnerPhase",
+            );
+            expect(Object.keys(calls[0].message as object)).not.toContain(
+              "includeStreamFenceDarwinStop",
+            );
+            // The product error is the exact original string, as one terminal.
+            expect(sequencedFrames(replies[0])).toEqual([
+              {
+                type: "error",
+                message: stopUnconfirmed,
+                commandId: "auth-send",
+                sequence: 0,
+                outputProtocol: "ack-v1",
+              },
+            ]);
+            const expected = {
+              ...treeGroup,
+              desktop_stream_fence_darwin_stop_version: 1,
+              desktop_stream_fence_darwin_stop_source: source,
+              desktop_stream_fence_darwin_stop_group_probe: groupProbe,
+            };
+            expect(finals()).toHaveLength(1);
+            const final = finals()[0];
+            expect(final.properties).toMatchObject({
+              outcome: "acknowledged",
+              terminalAcknowledged: true,
+              telemetry_sample_rate: 1,
+              desktop_invocation_unknown_class: "lifecycle_stop_unconfirmed",
+              ...expected,
+            });
+            expect(fenceKeys(final.properties)).toEqual(Object.keys(expected));
+            const enriched = sanitizeDesktopAckEvent({
+              ...final,
+              properties: {
+                ...final.properties,
+                $current_url: "PRIVATE",
+                cwd,
+                command: "PRIVATE COMMAND",
+                pid: 4242,
+              },
+              $set: { email: "PRIVATE" },
+            });
+            expect(enriched.properties).toMatchObject(expected);
+            expect(fenceKeys(enriched.properties)).toEqual(
+              Object.keys(expected),
+            );
+            const serialized = JSON.stringify([captures(), enriched]);
+            expect(serialized).not.toContain("PRIVATE");
+            expect(serialized).not.toContain("4242");
+            expect(serialized).not.toContain(authorizationId);
+            expect(serialized).not.toContain(stopUnconfirmed);
+            expect(serialized).not.toContain("streamFence");
+          },
+        );
+
+        it.each(["windows", "linux"])(
+          "never offers %s Desktop the opt-in or keeps a group it never requested",
+          async (nativeOs) => {
+            const { calls } = await run(
+              () => Promise.reject(withDarwin(visible)),
+              { nativeOs },
+            );
+            expect(calls).toHaveLength(1);
+            expect(calls[0]).toMatchObject({
+              includeStreamFenceOrigin: true,
+              includeStreamFenceCleanup: true,
+            });
+            expect(calls[0]).not.toHaveProperty("includeStreamFenceDarwinStop");
+            expect(finals()).toHaveLength(1);
+            const properties = finals()[0].properties;
+            expect(properties).toMatchObject(treeGroup);
+            expect(fenceKeys(properties)).toEqual(Object.keys(treeGroup));
+            const enriched = sanitized(properties);
+            expect(fenceKeys(enriched.properties)).toEqual(
+              Object.keys(treeGroup),
+            );
+            expect(JSON.stringify([captures(), enriched])).not.toContain(
+              "darwin_stop",
+            );
+          },
+        );
+
+        // [case, native rejection, expected fence groups]
+        it.each<[string, () => unknown, Record<string, unknown>]>([
+          [
+            "an older native app's tree_unconfirmed cleanup alone",
+            () => withCleanup(tree),
+            treeGroup,
+          ],
+          [
+            "an extra PID",
+            () => withDarwin({ ...visible, pid: 4242 }),
+            treeGroup,
+          ],
+          [
+            "an extra errno",
+            () => withDarwin({ ...visible, errno: 1 }),
+            treeGroup,
+          ],
+          [
+            "an unlisted probe",
+            () => withDarwin({ ...visible, groupProbe: "PRIVATE" }),
+            treeGroup,
+          ],
+          [
+            "a human action",
+            () => withDarwin({ ...visible, source: "user_clicked_stop" }),
+            treeGroup,
+          ],
+          [
+            "an unsupported version",
+            () => withDarwin({ ...visible, version: 2 }),
+            treeGroup,
+          ],
+          [
+            "a probe getter",
+            () =>
+              withDarwin(
+                Object.defineProperty(
+                  { version: 1, source: "cancel_ipc" },
+                  "groupProbe",
+                  { enumerable: true, get: fail },
+                ),
+              ),
+            treeGroup,
+          ],
+          [
+            "a receipt beside a combined leg",
+            () =>
+              withDarwin(visible, {
+                version: 1,
+                failure: "tree_and_leader_wait_timed_out",
+              }),
+            {
+              ...stopGroup,
+              desktop_stream_fence_cleanup_version: 1,
+              desktop_stream_fence_cleanup_failure:
+                "tree_and_leader_wait_timed_out",
+            },
+          ],
+          [
+            "a receipt beside a Windows taskkill receipt",
+            () => ({
+              ...withDarwin(visible),
+              streamFenceWindowsTaskkill: {
+                version: 1,
+                outcome: "output_error",
+              },
+            }),
+            {
+              ...treeGroup,
+              desktop_stream_fence_windows_taskkill_version: 1,
+              desktop_stream_fence_windows_taskkill_outcome: "output_error",
+            },
+          ],
+        ])(
+          "keeps the exact message and every earlier group for %s on Darwin",
+          async (_case, native, expected) => {
+            const { calls, replies } = await run(() =>
+              Promise.reject(native()),
+            );
+            expect(calls[0]).toMatchObject({
+              includeStreamFenceDarwinStop: true,
+            });
+            expect(sequencedFrames(replies[0])).toEqual([
+              expect.objectContaining({
+                type: "error",
+                message: stopUnconfirmed,
+                sequence: 0,
+              }),
+            ]);
+            expect(finals()).toHaveLength(1);
+            const properties = finals()[0].properties;
+            expect(properties).toMatchObject(expected);
+            expect(fenceKeys(properties)).toEqual(Object.keys(expected));
+            const enriched = sanitized(properties);
+            expect(fenceKeys(enriched.properties)).toEqual(
+              Object.keys(expected),
+            );
+            const serialized = JSON.stringify([captures(), enriched]);
+            expect(serialized).not.toContain("PRIVATE");
+            expect(serialized).not.toContain("streamFence");
+            expect(serialized).not.toContain("darwin_stop");
+          },
+        );
+
+        it("never offers or unwraps it through the compatibility command", async () => {
+          const { calls } = await run(async (call) => {
+            if (call.cmd === "execute_authorized_stream_command")
+              throw "Command execute_authorized_stream_command not found";
+            return Promise.reject(withDarwin(visible));
+          });
+          expect(calls[0]).toMatchObject({
+            includeStreamFenceDarwinStop: true,
+          });
+          expect(calls[1]).not.toHaveProperty("includeStreamFenceDarwinStop");
+          expect(fenceKeys(finals()[0].properties)).toEqual([]);
+        });
+
+        it("never offers it to a published legacy native app", async () => {
+          const { calls } = await run(
+            () => Promise.reject(withDarwin(visible)),
+            { version: "0.0.72" },
+          );
+          expect(calls.map((call) => call.cmd)).toEqual([
+            "execute_stream_command",
+          ]);
+          expect(calls[0]).not.toHaveProperty("includeStreamFenceDarwinStop");
+          expect(fenceKeys(finals()[0].properties)).toEqual([]);
+        });
+
+        it("never offers it without an identified analytics owner", async () => {
+          const identity = jest.mocked(getIdentifiedAnalyticsUserId);
+          identity.mockReturnValue(null);
+          try {
+            const { calls } = await run(() => Promise.reject(stopUnconfirmed));
+            expect(calls).toHaveLength(1);
+            expect(calls[0]).not.toHaveProperty("includeStreamFenceDarwinStop");
+            expect(finals()).toHaveLength(0);
+          } finally {
+            identity.mockReturnValue("user-456");
+          }
+        });
+      });
+    });
+
+    describe("cancel wait owner phase", () => {
+      const ownerPhase = { version: 1, phase: "stop_cleanup_tree_pending" };
+      const withPhase = (
+        streamFenceCancelWaitOwnerPhase: unknown,
+        streamFence: unknown = fence,
+      ) => ({ ...fenced(streamFence), streamFenceCancelWaitOwnerPhase });
+      const phaseGroup = {
+        desktop_stream_fence_cancel_wait_owner_phase_version: 1,
+        desktop_stream_fence_cancel_wait_owner_phase:
+          "stop_cleanup_tree_pending",
+      };
+      // The final as the analytics client would enrich and then sanitize it.
+      const sanitized = (properties: Record<string, unknown>) =>
+        sanitizeDesktopAckEvent({
+          ...finals()[0],
+          properties: { ...properties },
+        });
+
+      it("offers Windows Desktop the opt-in and joins its phase to the timeout origin", async () => {
+        const cwd = "C:\\Users\\PRIVATE-CWD\\project";
+        const { calls, replies } = await run(
+          () => Promise.reject(withPhase(ownerPhase)),
+          { version: "0.0.86", nativeOs: "windows", command: { cwd } },
+        );
+        expect(calls).toHaveLength(1);
+        expect(calls[0]).toMatchObject({
+          cmd: "execute_authorized_stream_command",
+          includeStreamFenceOrigin: true,
+          includeStreamFenceCancelWaitOwnerPhase: true,
+        });
+        expect(Object.keys(calls[0].message as object)).not.toContain(
+          "includeStreamFenceCancelWaitOwnerPhase",
+        );
+        // The product error is the exact original string, as one terminal.
+        expect(sequencedFrames(replies[0])).toEqual([
+          {
+            type: "error",
+            message: stopUnconfirmed,
+            commandId: "auth-send",
+            sequence: 0,
+            outputProtocol: "ack-v1",
+          },
+        ]);
+        const expected = { ...fenceGroup, ...phaseGroup };
+        expect(finals()).toHaveLength(1);
+        const final = finals()[0];
+        expect(final.properties).toMatchObject({
+          outcome: "acknowledged",
+          terminalAcknowledged: true,
+          desktop_invocation_unknown_class: "lifecycle_stop_unconfirmed",
+          ...expected,
+        });
+        expect(fenceKeys(final.properties)).toEqual(Object.keys(expected));
+        const enriched = sanitizeDesktopAckEvent({
+          ...final,
+          properties: {
+            ...final.properties,
+            $current_url: "PRIVATE",
+            cwd,
+            command: "PRIVATE COMMAND",
+            pid: 4242,
+          },
+          $set: { email: "PRIVATE" },
+        });
+        expect(enriched.properties).toMatchObject(expected);
+        expect(fenceKeys(enriched.properties)).toEqual(Object.keys(expected));
+        expect(enriched.properties).not.toHaveProperty("pid");
+        const serialized = JSON.stringify([captures(), enriched]);
+        expect(serialized).not.toContain("PRIVATE");
+        expect(serialized).not.toContain(authorizationId);
+        expect(serialized).not.toContain(stopUnconfirmed);
+        expect(serialized).not.toContain("streamFence");
+      });
+
+      it.each(["macos", "linux"])(
+        "never offers %s Desktop the opt-in or keeps a phase it never requested",
+        async (nativeOs) => {
+          const { calls, replies } = await run(
+            () => Promise.reject(withPhase(ownerPhase)),
+            { nativeOs },
+          );
+          expect(calls).toHaveLength(1);
+          // The existing opt-ins are unchanged.
+          expect(calls[0]).toMatchObject({
+            includeStreamFenceOrigin: true,
+            includeStreamFenceCleanup: true,
+            includeStreamFenceWindowsTaskkill: true,
+            includeStreamFenceWindowsTaskkillRootReport: true,
+          });
+          expect(calls[0]).not.toHaveProperty(
+            "includeStreamFenceCancelWaitOwnerPhase",
+          );
+          expect(sequencedFrames(replies[0])).toEqual([
+            expect.objectContaining({
+              type: "error",
+              message: stopUnconfirmed,
+              sequence: 0,
+            }),
+          ]);
+          expect(finals()).toHaveLength(1);
+          const properties = finals()[0].properties;
+          expect(properties).toMatchObject(fenceGroup);
+          expect(fenceKeys(properties)).toEqual(Object.keys(fenceGroup));
+          const enriched = sanitized(properties);
+          expect(fenceKeys(enriched.properties)).toEqual(
+            Object.keys(fenceGroup),
+          );
+          const serialized = JSON.stringify([captures(), enriched]);
+          expect(serialized).not.toContain("cancel_wait_owner_phase");
+          expect(serialized).not.toContain("streamFence");
+        },
+      );
+
+      const phaseGetter = () => {
+        const hostile = { version: 1 } as Record<string, unknown>;
+        Object.defineProperty(hostile, "phase", {
+          enumerable: true,
+          get() {
+            throw new Error("PRIVATE");
+          },
+        });
+        return hostile;
+      };
+      // [case, native rejection, expected fence groups]
+      it.each<[string, () => unknown, Record<string, unknown>]>([
+        // A current frontend beside a native app without the sibling.
+        ["an older native app's origin alone", () => fenced(), fenceGroup],
+        [
+          "an unlisted phase",
+          () => withPhase({ version: 1, phase: "PRIVATE" }),
+          fenceGroup,
+        ],
+        [
+          "an extra duration",
+          () => withPhase({ ...ownerPhase, elapsedMs: 15_000 }),
+          fenceGroup,
+        ],
+        [
+          "an extra private field",
+          () => withPhase({ ...ownerPhase, pid: "PRIVATE" }),
+          fenceGroup,
+        ],
+        [
+          "an unsupported version",
+          () => withPhase({ ...ownerPhase, version: 2 }),
+          fenceGroup,
+        ],
+        ["a phase getter", () => withPhase(phaseGetter()), fenceGroup],
+        [
+          "a phase beside another origin",
+          () => withPhase(ownerPhase, { version: 1, origin: "owner_timeout" }),
+          { ...fenceGroup, desktop_stream_fence_origin: "owner_timeout" },
+        ],
+      ])(
+        "keeps the exact message and only the origin for %s on Windows",
+        async (_case, native, expected) => {
+          const { calls, replies } = await run(() => Promise.reject(native()), {
+            nativeOs: "windows",
+          });
+          expect(calls[0]).toMatchObject({
+            includeStreamFenceOrigin: true,
+            includeStreamFenceCancelWaitOwnerPhase: true,
+          });
+          expect(sequencedFrames(replies[0])).toEqual([
+            expect.objectContaining({
+              type: "error",
+              message: stopUnconfirmed,
+              sequence: 0,
+            }),
+          ]);
+          expect(finals()).toHaveLength(1);
+          const properties = finals()[0].properties;
+          expect(properties).toMatchObject(expected);
+          expect(fenceKeys(properties)).toEqual(Object.keys(expected));
+          const enriched = sanitized(properties);
+          expect(fenceKeys(enriched.properties)).toEqual(Object.keys(expected));
+          const serialized = JSON.stringify([captures(), enriched]);
+          expect(serialized).not.toContain("PRIVATE");
+          expect(serialized).not.toContain("streamFence");
+          expect(serialized).not.toContain("cancel_wait_owner_phase");
+        },
+      );
+    });
+  });
+
   it.each<
     [string, Parameters<typeof run>[1], (call: NativeCall) => Promise<unknown>]
   >([
@@ -9067,10 +13460,11 @@ describe("native authorization send receipt", () => {
       const { Channel } = await import("@tauri-apps/api/core");
       const { calls } = await run(native, options);
       // Only a possible authorized acknowledged invocation constructs the
-      // optional receipt, cause, response, mitigation, transport, IO and
-      // connector channels besides the output one.
+      // optional receipt, cause, response, mitigation, transport, IO,
+      // connector, response-read and read timing channels besides the output
+      // one, or offers the stream fence opt-in.
       expect(jest.mocked(Channel)).toHaveBeenCalledTimes(
-        options?.version || options?.acknowledged === false ? 1 : 8,
+        options?.version || options?.acknowledged === false ? 1 : 10,
       );
       const optional = [
         "onAuthorizationDiagnostic",
@@ -9080,6 +13474,14 @@ describe("native authorization send receipt", () => {
         "onAuthorizationTransportDiagnostic",
         "onAuthorizationIoDiagnostic",
         "onAuthorizationConnectorDiagnostic",
+        "onAuthorizationResponseReadDiagnostic",
+        "onAuthorizationResponseReadTimingDiagnostic",
+        "includeStreamFenceOrigin",
+        "includeStreamFenceCleanup",
+        "includeStreamFenceWindowsTaskkill",
+        "includeStreamFenceWindowsTaskkillRootReport",
+        "includeStreamFenceCancelWaitOwnerPhase",
+        "includeStreamFenceStopRequestSource",
       ];
       const legacy = calls.filter(
         (call) => call.cmd === "execute_stream_command",

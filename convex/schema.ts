@@ -7,7 +7,6 @@ import {
 } from "./lib/settlementReceiptValidators";
 import { goalFields } from "./lib/goalValidators";
 import { networkPolicy } from "./cloudNetworkValidators";
-import { scopeRule, scopePolicy } from "./engagementScopeValidators";
 import {
   findingRevisionValidator,
   findingFeedbackValidator,
@@ -325,34 +324,6 @@ export default defineSchema({
 
   agent_goals: defineTable(goalFields).index("by_chatId", ["chatId"]),
 
-  // Deprecated scope data stays schema-compatible; runtime no longer reads or writes it.
-  // Normal chat/account deletion still cleans these records. No bulk migration.
-  engagement_scopes: defineTable({
-    chat_id: v.string(),
-    user_id: v.string(),
-    active: v.boolean(),
-    revision: v.number(),
-    rules: v.array(scopeRule),
-    restrictions: v.array(v.string()),
-    status: v.union(
-      v.literal("ready"),
-      v.literal("processing"),
-      v.literal("unavailable"),
-      v.literal("ambiguous"),
-    ),
-    clarification: v.string(),
-    clarificationRequested: v.boolean(),
-    source_id: v.string(),
-  }).index("by_chat_id", ["chat_id"]),
-  engagement_scope_events: defineTable({
-    chat_id: v.string(),
-    source_id: v.string(),
-    source_text: v.string(),
-    source_kind: v.union(v.literal("user_message"), v.literal("user_edit")),
-    status: v.union(v.literal("pending"), v.literal("applied")),
-    revision: v.number(),
-    policy: v.optional(scopePolicy),
-  }).index("by_chat_source", ["chat_id", "source_id"]),
   chat_history_access: defineTable({
     chat_id: v.string(),
     user_id: v.string(),
@@ -364,11 +335,23 @@ export default defineSchema({
     engagement_scope_expected: v.optional(v.boolean()),
     id: v.string(),
     title: v.string(),
+    // Set only by the owner's rename; generated titles must not replace it.
+    title_manually_edited: v.optional(v.boolean()),
     user_id: v.string(),
     finish_reason: v.optional(v.string()),
     last_run_finished_at: v.optional(v.number()),
     active_stream_id: v.optional(v.string()),
     active_trigger_run_id: v.optional(v.string()),
+    // Private. Completed top-level Agent compactions since tracking began;
+    // absent means never tracked, not zero. `runId`/`runCount` hold the
+    // latest run's absolute snapshot so repeated reports apply only a delta.
+    agent_compaction_tally: v.optional(
+      v.object({
+        total: v.number(),
+        runId: v.string(),
+        runCount: v.number(),
+      }),
+    ),
     // Legacy checkpoint data remains readable until existing rows are migrated.
     objective_checkpoint: v.optional(v.string()),
     active_agent_approval_session_id: v.optional(v.string()),
@@ -448,40 +431,6 @@ export default defineSchema({
       filterFields: ["user_id"],
     }),
 
-  // Historical provider expense audit for the retired CAPTCHA solver, not a
-  // customer wallet ledger. Retained for audit and account deletion;
-  // no new attempts are admitted. No URLs, widget keys, cookies, API
-  // credentials or solutions are retained here.
-  captcha_attempts: defineTable({
-    user_id: v.string(),
-    chat_id: v.string(),
-    run_id: v.string(),
-    kind: v.union(
-      v.literal("recaptcha_v2"),
-      v.literal("hcaptcha"),
-      v.literal("turnstile"),
-    ),
-    state: v.union(
-      v.literal("creating"),
-      v.literal("processing"),
-      v.literal("ready"),
-      v.literal("unsolvable"),
-      v.literal("unknown"),
-    ),
-    task_id: v.optional(v.number()),
-    cost_dollars: v.optional(v.number()),
-    created_at: v.number(),
-    updated_at: v.number(),
-    reconciliation_polls: v.number(),
-  })
-    .index("by_run_id", ["run_id"])
-    .index("by_user_id", ["user_id"]),
-  captcha_daily_limits: defineTable({
-    bucket: v.string(),
-    day: v.string(),
-    attempts: v.number(),
-  }).index("by_bucket_and_day", ["bucket", "day"]),
-
   // One private cloud Chromium owner per Agent tool factory. Browser paths and
   // sandbox identifiers are returned only to service-authenticated functions.
   browser_handoffs: defineTable({
@@ -510,6 +459,8 @@ export default defineSchema({
     input_expires_at: v.optional(v.number()),
     exit_note_ids: v.optional(v.array(v.string())),
     exposed_at: v.optional(v.number()),
+    // Receipt that the owning parent run stopped for an abandoned handoff.
+    abandoned_at: v.optional(v.number()),
     expires_at: v.number(),
     updated_at: v.number(),
   })
@@ -1341,9 +1292,71 @@ export default defineSchema({
     updated_at: v.number(),
   })
     .index("by_user_created_at", ["user_id", "created_at"])
+    // Bounded per-offer reads for the monthly bundle cap; excludes top-ups.
+    .index("by_user_bundle_created_at", ["user_id", "bundle_id", "created_at"])
     .index("by_stripe_checkout_session_id", ["stripe_checkout_session_id"])
     .index("by_stripe_payment_intent_id", ["stripe_payment_intent_id"])
     .index("by_stripe_invoice_id", ["stripe_invoice_id"]),
+
+  // Monthly discounted-bundle allowance holds. A row is reserved atomically
+  // before Stripe Checkout is created and keeps its UTC creation month through
+  // fulfillment. Only Stripe-confirmed outcomes release it; paid sessions are
+  // always consumed even if that exceeds the cap.
+  extra_usage_bundle_reservations: defineTable({
+    user_id: v.string(),
+    period_month: v.string(),
+    policy_version: v.string(),
+    checkout_attempt_id: v.string(),
+    bundle_id: v.string(),
+    credit_dollars: v.number(),
+    paid_dollars: v.number(),
+    status: v.union(
+      v.literal("reserved"),
+      v.literal("consumed"),
+      v.literal("released"),
+    ),
+    stripe_customer_id: v.string(),
+    stripe_checkout_session_id: v.optional(v.string()),
+    // Inputs replayed with the reservation's Stripe idempotency key.
+    application_origin: v.string(),
+    return_path: v.optional(v.string()),
+    resume_after_purchase: v.optional(v.boolean()),
+    enable_extra_usage_after_purchase: v.optional(v.boolean()),
+    // Stripe create calls made with this reservation's key. Only a failure of
+    // the first call can prove no session exists for the key.
+    create_attempts: v.number(),
+    release_reason: v.optional(v.string()),
+    consumed_after_release: v.optional(v.boolean()),
+    // Set once on a released hold when a retry of an attempt that resolved to
+    // it creates or joins a replacement. Every attempt mapped to this hold
+    // follows the link, so a lost response recovers the replacement.
+    replacement_reservation_id: v.optional(
+      v.id("extra_usage_bundle_reservations"),
+    ),
+    // Never updated: bounds replay of the Stripe idempotency key (~24h).
+    created_at: v.number(),
+    updated_at: v.number(),
+  })
+    .index("by_user_period_status_bundle", [
+      "user_id",
+      "period_month",
+      "status",
+      "bundle_id",
+    ])
+    .index("by_user_attempt", ["user_id", "checkout_attempt_id"])
+    .index("by_stripe_checkout_session_id", ["stripe_checkout_session_id"]),
+
+  // One row per client checkout attempt, pointing at the reservation that
+  // attempt resolved to. A retry whose earlier response was lost recovers the
+  // same (possibly paid or previous-month) checkout instead of starting another.
+  extra_usage_bundle_attempts: defineTable({
+    user_id: v.string(),
+    checkout_attempt_id: v.string(),
+    bundle_id: v.string(),
+    reservation_id: v.id("extra_usage_bundle_reservations"),
+    created_at: v.number(),
+    updated_at: v.number(),
+  }).index("by_user_attempt", ["user_id", "checkout_attempt_id"]),
 
   // Team-shared extra usage pool. Admin funds it; any member of the org draws
   // from it for overflow once the team subscription bucket is exhausted.

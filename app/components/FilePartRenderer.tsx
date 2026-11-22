@@ -15,10 +15,12 @@ import { ImageViewer } from "./ImageViewer";
 import { LocalFilePreviewCard } from "./LocalFilePreviewCard";
 import { AlertCircle, File, Download, Loader2 } from "lucide-react";
 import { FilePart, FilePartRendererProps } from "@/types/file";
+import { canPreviewImageInline } from "@/lib/utils/file-utils";
 import { toast } from "sonner";
 import { useFileUrlCacheContext } from "../contexts/FileUrlCacheContext";
 import { useAttachmentDownload } from "../hooks/useAttachmentDownload";
 import { useS3ActionDiagnostics } from "../hooks/useS3ActionDiagnostics";
+import { isAbortError } from "../hooks/useFileUrlCache";
 
 const FilePartRendererComponent = ({
   part,
@@ -35,6 +37,8 @@ const FilePartRendererComponent = ({
   // This prevents re-renders from triggering URL refetches
   const fileUrlCacheRef = useRef(fileUrlCache);
   fileUrlCacheRef.current = fileUrlCache;
+  // Changes when authentication does, so a waiting image loads again.
+  const loadImageUrl = fileUrlCache?.loadImageUrl;
 
   const [selectedImage, setSelectedImage] = useState<{
     src: string;
@@ -44,44 +48,25 @@ const FilePartRendererComponent = ({
     useAttachmentDownload();
   // Initialize fileUrl from cache or part.url to prevent flash on remount
   const [fileUrl, setFileUrl] = useState<string | null>(() => {
-    // First check cache for S3 files
-    if (part.fileId && fileUrlCache) {
-      const cachedUrl = fileUrlCache.getCachedUrl(part.fileId);
-      if (cachedUrl) return cachedUrl;
-    }
-    // Fallback to part.url if available
+    // Stored files use a URL resolved for this session, never part.url.
+    if (part.fileId) return fileUrlCache?.getCachedUrl(part.fileId) ?? null;
     return part.url || null;
   });
   const [urlError, setUrlError] = useState<string | null>(null);
 
-  // Track the last fetched identifiers to avoid unnecessary refetches
-  const lastFetchedRef = useRef<{
-    fileId?: string;
-    url?: string;
-  }>({});
+  const fileName = part.name || part.filename;
+  const showsInlineImage = canPreviewImageInline(part.mediaType, fileName);
 
-  // Fetch URL ONLY for images (inline display) - non-images are fetched lazily on click
+  // Fetch URL ONLY for images (inline display) - non-images are fetched lazily
+  // on click. Dependencies stay stable while a reply streams; a new file,
+  // authentication state or remount loads again, from the cache when fresh.
   useEffect(() => {
-    const isImage = part.mediaType?.startsWith("image/");
-    if (!isImage) {
+    if (!showsInlineImage) {
       return;
     }
 
-    // Check if we already fetched for these same identifiers
-    const sameIdentifiers =
-      lastFetchedRef.current.fileId === part.fileId &&
-      lastFetchedRef.current.url === part.url;
-
-    // If identifiers haven't changed and we have a URL, skip refetch
-    if (sameIdentifiers && fileUrl) {
-      return;
-    }
-
-    // Update tracking ref
-    lastFetchedRef.current = {
-      fileId: part.fileId,
-      url: part.url,
-    };
+    // A changed file, authentication or unmount supersedes this request.
+    let current = true;
 
     async function fetchUrl() {
       const cache = fileUrlCacheRef.current;
@@ -101,7 +86,11 @@ const FilePartRendererComponent = ({
         // Don't reset to null - keep showing previous image while fetching
         setUrlError(null);
         try {
-          const url = await getFileUrlAction({ fileId: part.fileId });
+          // The shared loader caches what it fetches.
+          const url = loadImageUrl
+            ? await loadImageUrl(part.fileId)
+            : await getFileUrlAction({ fileId: part.fileId });
+          if (!current) return;
           if (!url) {
             setFileUrl(null);
             setUrlError("File not available");
@@ -109,11 +98,16 @@ const FilePartRendererComponent = ({
           }
 
           setFileUrl(url);
-          // Cache the fetched URL
-          if (cache) {
+          if (!loadImageUrl && cache) {
             cache.setCachedUrl(part.fileId, url);
           }
         } catch (error) {
+          if (!current) return;
+          if (isAbortError(error)) {
+            // Signed for a previous session; loads again once it is ready.
+            setFileUrl(null);
+            return;
+          }
           console.error("Failed to fetch file URL:", error);
           const errorMessage =
             error instanceof ConvexError
@@ -137,10 +131,11 @@ const FilePartRendererComponent = ({
     }
 
     fetchUrl();
-    // Note: fileUrl is intentionally not in deps - we check it inside the effect
+    return () => {
+      current = false;
+    };
     // fileUrlCacheRef is a ref, so it doesn't need to be in deps
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [part.url, part.fileId, part.mediaType, getFileUrlAction]);
+  }, [part.url, part.fileId, showsInlineImage, getFileUrlAction, loadImageUrl]);
 
   // Non-images are fetched lazily on click through the shared download owner.
   const handleNonImageFileClick = useCallback(
@@ -238,8 +233,11 @@ const FilePartRendererComponent = ({
         );
       }
 
-      // Use the fetched URL or the URL from props
-      const actualUrl = fileUrl || part.url;
+      // Use the fetched URL or the URL from props. A stored image shows only
+      // its resolved URL; part.url may be stale or no longer authorized.
+      const actualUrl =
+        (showsInlineImage && part.fileId ? fileUrl : fileUrl || part.url) ||
+        undefined;
 
       if (part.storage === "local-desktop") {
         return (
@@ -264,7 +262,7 @@ const FilePartRendererComponent = ({
       }
 
       // Handle image files - resolve fetchable URLs before showing a real error
-      if (part.mediaType?.startsWith("image/")) {
+      if (showsInlineImage) {
         if (!actualUrl) {
           if (part.fileId) {
             const isMultipleImages = totalFileParts > 1;
@@ -391,6 +389,7 @@ const FilePartRendererComponent = ({
     part.fileId,
     fileUrl,
     urlError,
+    showsInlineImage,
     FilePreviewCard,
   ]);
 

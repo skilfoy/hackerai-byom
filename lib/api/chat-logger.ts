@@ -7,17 +7,16 @@ import {
   PAID_DEEPSEEK_1017_KEY,
   PAID_MODEL_OUTCOME_EVENT,
 } from "@/lib/experiments/paid-deepseek-1017";
-import { agentRunEventUuid } from "@/lib/analytics/agent-run-reporting";
+import {
+  agentRunEventUuid,
+  modelRecoveryAnalyticsProperties,
+} from "@/lib/analytics/agent-run-reporting";
 import { localStopAnalyticsProperties } from "@/lib/chat/local-connection-stop";
 import {
   FREE_ASK_DEEPSEEK_1017_KEY,
   FREE_ASK_MODEL_OUTCOME_EVENT,
 } from "@/lib/experiments/free-ask-deepseek-1017";
 import { parseCloudAcquisitionStage } from "@/lib/ai/tools/utils/cloud-acquisition-budget";
-import {
-  regionalFreeLimitsProperties,
-  type RegionalFreeLimitsPolicy,
-} from "@/lib/rate-limit/regional-free-limits";
 /**
  * Chat Handler Wide Event Logger
  *
@@ -1342,6 +1341,8 @@ export type AgentAbortSource =
   | "elapsed_timeout"
   | "user_wait_timeout"
   | "user_wait_failed"
+  | "approval_timeout"
+  | "browser_handoff_abandoned"
   | "user_stop"
   | "request_cancel"
   | "unknown";
@@ -1364,11 +1365,14 @@ export function resolveAgentAbortSource({
   stopSource?: import("@/lib/chat/agent-stop-signal").AgentStopSignalSource;
 }): AgentAbortSource | undefined {
   if (outcome !== "aborted") return undefined;
+  if (stopSource === "browser_handoff_abandoned")
+    return "browser_handoff_abandoned";
   if (stoppedDueToBudgetExhaustion) return "budget_exhausted";
   if (stoppedDueToAgentRunSpendCap) return "agent_spend_cap";
   if (stoppedDueToElapsedTimeout) return "elapsed_timeout";
   if (stopSource === "wait_for_user_timeout") return "user_wait_timeout";
   if (stopSource === "wait_for_user") return "user_wait_failed";
+  if (stopSource === "approval_timeout") return "approval_timeout";
   if (userStopRequested) return "user_stop";
   if (requestCancelled) return "request_cancel";
   return "unknown";
@@ -1443,6 +1447,8 @@ type AgentCompletionAnalyticsArgs = {
   providerRecoverySucceeded?: boolean;
   /** First abort reason; only a constructed error contributes closed fields. */
   localConnectionLostError?: unknown;
+  /** Added by run reporting; only its own history contributes closed fields. */
+  modelRecoveryHistory?: unknown;
 };
 
 export function captureAgentRun({
@@ -1505,6 +1511,7 @@ export function captureAgentRun({
   providerRecoveryModels,
   providerRecoverySucceeded,
   localConnectionLostError,
+  modelRecoveryHistory,
 }: Omit<
   AgentCompletionAnalyticsArgs,
   | "endpoint"
@@ -1817,6 +1824,7 @@ export function captureAgentRun({
         budget_abort_mid_stream: budgetAbortDetails.midStream,
       }),
       ...localStopAnalyticsProperties(localConnectionLostError),
+      ...modelRecoveryAnalyticsProperties(modelRecoveryHistory, outcome),
       ...getExperimentAnalyticsProperties(experiment),
     },
   });
@@ -2048,6 +2056,7 @@ export function captureAgentCompletionAnalytics(
     providerRecoveryModels: args.providerRecoveryModels,
     providerRecoverySucceeded: args.providerRecoverySucceeded,
     localConnectionLostError: args.localConnectionLostError,
+    modelRecoveryHistory: args.modelRecoveryHistory,
   });
 }
 
@@ -2079,7 +2088,6 @@ export function captureUsageCost({
   analyticsRequestContext,
   fallbackServed,
   experiment,
-  regionalFreeLimits,
   triggerRunId,
   usageSettlementId,
   usageLog,
@@ -2115,7 +2123,6 @@ export function captureUsageCost({
   analyticsRequestContext?: AnalyticsRequestContext;
   fallbackServed?: boolean;
   experiment?: ExperimentAnalyticsContext;
-  regionalFreeLimits?: RegionalFreeLimitsPolicy;
   triggerRunId?: string;
   /** Present for every tier, including Free and allowance rescue. */
   usageSettlementId?: string;
@@ -2246,7 +2253,6 @@ export function captureUsageCost({
           paidDailyFreeAllowance.resetTimestamp,
       }),
       ...getExperimentAnalyticsProperties(experiment),
-      ...regionalFreeLimitsProperties(regionalFreeLimits),
     },
   });
 }

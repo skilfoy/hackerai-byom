@@ -688,6 +688,39 @@ function seedTables(userId = "user_123", otherUserId = "user_other"): Tables {
         source: "subscription",
       },
     ],
+    extra_usage_bundle_reservations: [
+      {
+        _id: "bundle-reservation-user",
+        user_id: userId,
+        credit_dollars: 1000,
+        paid_dollars: 700,
+        stripe_checkout_session_id: "cs_bundle_user",
+        return_path: "/c/private-chat",
+        status: "consumed",
+      },
+      {
+        _id: "bundle-reservation-other",
+        user_id: otherUserId,
+        return_path: "/c/other-chat",
+        status: "reserved",
+      },
+    ],
+    extra_usage_bundle_attempts: [
+      {
+        _id: "bundle-attempt-user",
+        user_id: userId,
+        checkout_attempt_id: "attempt-user",
+        bundle_id: "usage-1000-v1",
+        reservation_id: "bundle-reservation-user",
+      },
+      {
+        _id: "bundle-attempt-other",
+        user_id: otherUserId,
+        checkout_attempt_id: "attempt-other",
+        bundle_id: "usage-1000-v1",
+        reservation_id: "bundle-reservation-other",
+      },
+    ],
     extra_usage_purchases: [
       {
         _id: "purchase-user",
@@ -885,39 +918,6 @@ describe("userDeletion", () => {
       USER_DELETION_TABLE_POLICY,
     } = await import("../userDeletion");
     const tables = seedTables();
-    tables.captcha_attempts = [
-      {
-        _id: "captcha-user",
-        user_id: "user_123",
-        chat_id: "private-chat",
-        run_id: "private-run",
-        task_id: 123,
-        state: "processing",
-      },
-      {
-        _id: "captcha-other",
-        user_id: "user_other",
-        chat_id: "other-chat",
-        run_id: "other-run",
-        task_id: 456,
-        state: "ready",
-        cost_dollars: 0.003,
-      },
-    ];
-    tables.captcha_daily_limits = [
-      {
-        _id: "captcha-limit-user",
-        bucket: "user:user_123",
-        day: "2026-11-05",
-        attempts: 1,
-      },
-      {
-        _id: "captcha-limit-global",
-        bucket: "global",
-        day: "2026-11-05",
-        attempts: 2,
-      },
-    ];
     const { ctx, scheduler, deletedIds } = createMockCtx(tables);
 
     await deleteAllUserDataByService.handler(ctx as any, {
@@ -933,23 +933,6 @@ describe("userDeletion", () => {
       ).toBe(false);
     }
 
-    expect(row(tables, "captcha_attempts", "captcha-user")).toMatchObject({
-      user_id: DELETED_USER_ID,
-      chat_id: "",
-      run_id: "deleted:captcha-user",
-      task_id: 123,
-      state: "processing",
-    });
-    expect(row(tables, "captcha_attempts", "captcha-other")).toMatchObject({
-      user_id: "user_other",
-      cost_dollars: 0.003,
-    });
-    expect(
-      row(tables, "captcha_daily_limits", "captcha-limit-user"),
-    ).toBeUndefined();
-    expect(
-      row(tables, "captcha_daily_limits", "captcha-limit-global"),
-    ).toMatchObject({ attempts: 2 });
     expect(row(tables, "chats", "chat-other")).toBeTruthy();
     expect(
       row(tables, "finding_variant_hunts", "variant-hunt-user"),
@@ -1086,6 +1069,36 @@ describe("userDeletion", () => {
     ).toMatchObject({
       user_id: "user_other",
     });
+    expect(
+      row(tables, "extra_usage_bundle_reservations", "bundle-reservation-user"),
+    ).toMatchObject({
+      user_id: DELETED_USER_ID,
+      credit_dollars: 1000,
+      paid_dollars: 700,
+      stripe_checkout_session_id: "cs_bundle_user",
+      status: "consumed",
+    });
+    expect(
+      row(tables, "extra_usage_bundle_reservations", "bundle-reservation-user")
+        ?.return_path,
+    ).toBeUndefined();
+    expect(
+      row(
+        tables,
+        "extra_usage_bundle_reservations",
+        "bundle-reservation-other",
+      ),
+    ).toMatchObject({ user_id: "user_other", return_path: "/c/other-chat" });
+    // The attempt mapping keeps pointing at the retained hold, without the user.
+    expect(
+      row(tables, "extra_usage_bundle_attempts", "bundle-attempt-user"),
+    ).toMatchObject({
+      user_id: DELETED_USER_ID,
+      reservation_id: "bundle-reservation-user",
+    });
+    expect(
+      row(tables, "extra_usage_bundle_attempts", "bundle-attempt-other"),
+    ).toMatchObject({ user_id: "user_other" });
     expect(row(tables, "paid_start_events", "paid-user-entity")).toMatchObject({
       entity_id: DELETED_USER_ID,
     });

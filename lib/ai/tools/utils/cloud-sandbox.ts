@@ -1,7 +1,12 @@
 import { resolveCloudWorkspaceRegion } from "./cloud-workspace-routing";
 import { DEFAULT_TRIGGER_RUN_REGION } from "@/lib/api/trigger-region";
 import { readFailures } from "@/lib/cloud-recovery/store";
-import { ensureCloudNetwork } from "@/lib/cloud-network/service";
+import {
+  ensureCloudNetwork,
+  parseCloudNetworkSuboperation,
+  type CloudNetworkSuboperation,
+} from "@/lib/cloud-network/service";
+import { checkpointCloudErrorContext } from "./persistence-failure";
 import {
   parseCloudAcquisitionStage,
   type CloudAcquisitionStage,
@@ -17,6 +22,7 @@ import type {
 import { ensureSandboxConnection, E2BAcquisitionError } from "./sandbox";
 import { isE2BSandbox } from "./sandbox-types";
 import { phLogger } from "@/lib/posthog/server";
+import { recordEgressReviewAcquisition } from "@/lib/abuse/egress-review-context";
 import type { TriggerRunRegion } from "@/lib/api/trigger-region";
 import {
   getConfiguredE2BClustersForCleanup,
@@ -62,8 +68,16 @@ export async function ensureCloudSandboxConnection(options: {
   const startedAt = Date.now();
   const acquisitionId = randomUUID();
   let lastReportedStage: CloudAcquisitionStage = "unknown";
+  // Keep the selection as reported when the provider connect starts.
+  // Later verification reports do not describe that selected connect.
+  let connectPausedResumeSelected: boolean | undefined;
   const reportStage: ReportCloudAcquisitionStage = (...args) => {
     lastReportedStage = parseCloudAcquisitionStage(args[0]) ?? "unknown";
+    if (args[0] === "connect") {
+      const pausedResume = args[1]?.resumingPausedWorkspace;
+      if (typeof pausedResume === "boolean")
+        connectPausedResumeSelected = pausedResume;
+    }
     options.reportStage?.(...args);
   };
   let bootInfo: SandboxBootInfo | undefined;
@@ -79,6 +93,17 @@ export async function ensureCloudSandboxConnection(options: {
         workspace_region?: TriggerRunRegion;
       }
     | undefined;
+  // Names only the verification boundary active when a failure escaped; it is
+  // not a cause, and stays unset for failures before verification began.
+  let workspaceVerificationPhase:
+    | "stage_report"
+    | "availability_check"
+    | "network_check"
+    | "post_checks"
+    | undefined;
+  // The network step last entered by this acquisition; "unknown" until the
+  // shared network service reports one. Exported only for network_check.
+  let networkSuboperation: CloudNetworkSuboperation | "unknown" = "unknown";
   const recordOutcome = (outcome: "success" | "error") => {
     const fields = {
       chat_id: options.context?.chatId,
@@ -98,6 +123,9 @@ export async function ensureCloudSandboxConnection(options: {
       image_version: bootInfo?.image_version,
       sandbox_create_attempts: bootInfo?.create_attempts,
       cloud_sandbox_acquisition_completed_event_version: 1,
+      ...(connectPausedResumeSelected !== undefined
+        ? { e2b_connect_paused_resume_selected: connectPausedResumeSelected }
+        : {}),
       ...workspaceGuardDiagnostics,
     };
     if (outcome === "error")
@@ -150,10 +178,14 @@ export async function ensureCloudSandboxConnection(options: {
     state = await readCloudWorkspaceState(options.userId);
     if (!state || (state.phase !== "e2b" && state.phase !== "provisioning"))
       throw new CloudWorkspaceUnavailableError();
+    // ensureSandboxConnection discovers, connects and creates only in this
+    // cluster, so its result is hosted here; it selects that region's egress.
+    const workspaceCluster =
+      getE2BClusterRouting(workspaceRegion).createCluster.cluster;
     if (state) {
       if (
         getE2BClusterRouting(state.region).createCluster.cluster !==
-        getE2BClusterRouting(workspaceRegion).createCluster.cluster
+        workspaceCluster
       ) {
         workspaceGuardDiagnostics = {
           workspace_guard_reason: "workspace_region_mismatch",
@@ -171,7 +203,7 @@ export async function ensureCloudSandboxConnection(options: {
     if (
       failed &&
       (getE2BClusterRouting(failed.region).createCluster.cluster !==
-        getE2BClusterRouting(workspaceRegion).createCluster.cluster ||
+        workspaceCluster ||
         (state?.phase === "e2b" && state.destinationId !== failed.sandboxId))
     )
       throw new CloudWorkspaceUnavailableError();
@@ -206,24 +238,52 @@ export async function ensureCloudSandboxConnection(options: {
         workspaceOrigin: state?.phase === "e2b" ? state.origin : undefined,
       },
     );
+    workspaceVerificationPhase = "stage_report";
     reportStage("workspace_verification");
+    workspaceVerificationPhase = "availability_check";
     await assertCloudWorkspaceAvailable(
       options.userId,
       result.sandbox.sandboxId,
     );
-    await ensureCloudNetwork(result.sandbox, options.userId, options.signal);
+    workspaceVerificationPhase = "network_check";
+    await ensureCloudNetwork(
+      result.sandbox,
+      options.userId,
+      workspaceCluster,
+      options.signal,
+      (suboperation) => {
+        networkSuboperation =
+          parseCloudNetworkSuboperation(suboperation) ?? "unknown";
+      },
+    );
+    workspaceVerificationPhase = "post_checks";
     registerE2BWorkspaceLease(result.sandbox, options.userId);
     options.signal?.throwIfAborted();
+    // Ownership and network are verified; synchronous, never throws or waits.
+    recordEgressReviewAcquisition({
+      region: workspaceCluster,
+      userId: options.userId,
+      sandboxId: result.sandbox.sandboxId,
+      chatId: options.context?.chatId,
+      runId: options.context?.triggerRunId,
+      runKind: options.context?.runKind ?? "parent",
+    });
     options.setSandbox(result.sandbox);
     recordOutcome("success");
     return { ...result, provider: "e2b" };
   } catch (error) {
     // Capture before onFailure: its cleanup may itself abort the signal.
     // Identity with the abort reason is context, not proof of the failure cause.
-    let failureProvenance: Record<string, string | boolean> = {};
+    let failureProvenance: Record<string, string | boolean | number> = {};
     try {
       const aborted = options.signal?.aborted === true;
       failureProvenance = {
+        ...(workspaceVerificationPhase
+          ? {
+              workspace_verification_diagnostic_version: 1,
+              workspace_verification_phase: workspaceVerificationPhase,
+            }
+          : {}),
         acquisition_signal_aborted: aborted,
         acquisition_error_is_signal_reason:
           aborted && Object.is(error, options.signal?.reason),
@@ -237,6 +297,23 @@ export async function ensureCloudSandboxConnection(options: {
       };
     } catch {
       /* Optional diagnostics cannot mask the original acquisition failure. */
+    }
+    let networkVerificationDiagnostics: Record<string, string | number> = {};
+    if (workspaceVerificationPhase === "network_check") {
+      networkVerificationDiagnostics = {
+        network_verification_diagnostic_version: 1,
+        network_verification_suboperation: networkSuboperation,
+      };
+      try {
+        // Reuse the bounded own-data projector; present only for TypeErrors.
+        const transportCode =
+          checkpointCloudErrorContext(error).cloud_transport_code;
+        if (transportCode !== undefined)
+          networkVerificationDiagnostics.network_verification_transport_code =
+            transportCode;
+      } catch {
+        /* The step label remains useful without a transport label. */
+      }
     }
     try {
       options.context?.onFailure?.();
@@ -262,6 +339,7 @@ export async function ensureCloudSandboxConnection(options: {
       error_name: error instanceof Error ? error.name : "UnknownError",
       ...(error instanceof E2BAcquisitionError ? error.diagnostics : {}),
       ...failureProvenance,
+      ...networkVerificationDiagnostics,
       cloud_sandbox_acquisition_failed_event_version: 7,
       ...workspaceGuardDiagnostics,
     });

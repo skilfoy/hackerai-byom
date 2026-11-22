@@ -15,7 +15,12 @@ import {
   clearResumeFailures,
 } from "@/lib/cloud-recovery/store";
 import { readNetworkSettings } from "@/lib/cloud-network/service";
-import { DEFAULT_NETWORK_POLICY, e2bNetwork } from "@/lib/cloud-network/policy";
+import { DEFAULT_NETWORK_POLICY } from "@/lib/cloud-network/policy";
+import {
+  desiredE2BNetwork,
+  managedEgressForCluster,
+  resolveManagedEgress,
+} from "@/lib/cloud-network/managed-egress";
 import {
   CloudAcquisitionTimeoutError,
   CLOUD_RESUME_DEADLINE_MS,
@@ -61,7 +66,7 @@ export {
 
 type SandboxReadyPath = SandboxBootInfo["path"];
 type E2BAcquisitionPhase = "routing" | "discovery" | "connect" | "create";
-type GetInfoErrorContext = ReturnType<typeof checkpointCloudErrorContext>;
+type CloudErrorContext = ReturnType<typeof checkpointCloudErrorContext>;
 
 const SAFE_E2B_CODES = new Set([
   "RATE_LIMIT",
@@ -90,16 +95,22 @@ export class E2BAcquisitionError extends Error {
       e2b_workspace_identity_operation?: "get_info" | "validate";
       e2b_workspace_identity_error_kind?: ReturnType<typeof getE2BErrorKind>;
       e2b_workspace_identity_get_info_context_version?: 1;
-      e2b_workspace_identity_get_info_error_kind?: GetInfoErrorContext["cloud_error_kind"];
-      e2b_workspace_identity_get_info_reported_status?: GetInfoErrorContext["cloud_http_status"];
-      e2b_workspace_identity_get_info_type_error_signal?: GetInfoErrorContext["cloud_type_error_signal"];
-      e2b_workspace_identity_get_info_transport_code?: GetInfoErrorContext["cloud_transport_code"];
+      e2b_workspace_identity_get_info_error_kind?: CloudErrorContext["cloud_error_kind"];
+      e2b_workspace_identity_get_info_reported_status?: CloudErrorContext["cloud_http_status"];
+      e2b_workspace_identity_get_info_type_error_signal?: CloudErrorContext["cloud_type_error_signal"];
+      e2b_workspace_identity_get_info_transport_code?: CloudErrorContext["cloud_transport_code"];
       e2b_workspace_identity_requested_target_fingerprint?: string | null;
       e2b_workspace_identity_requested_cluster?: E2BCluster | null;
       e2b_connect_conflict_message_signal_version?: 1;
       e2b_connect_conflict_message_signal?: ReturnType<
         typeof getE2BConnectConflictMessageSignal
       >;
+      e2b_connect_error_context_version?: 1;
+      e2b_connect_error_matches_sdk_rejection?: boolean;
+      e2b_connect_error_kind?: CloudErrorContext["cloud_error_kind"];
+      e2b_connect_reported_status?: CloudErrorContext["cloud_http_status"];
+      e2b_connect_type_error_signal?: CloudErrorContext["cloud_type_error_signal"];
+      e2b_connect_transport_code?: CloudErrorContext["cloud_transport_code"];
     },
   ) {
     super(message);
@@ -201,13 +212,20 @@ export const ensureSandboxConnection = async (
     { sandboxId: string; template: string; sandboxVersion: string } | undefined;
   let connectGatewayTimeout: SandboxError | undefined;
   let connectRejection: unknown;
+  // Diagnostic only: boxed so a thrown undefined differs from no rejection, and
+  // cleared on SDK success so a later failure reusing that object cannot match.
+  // The assertion keeps TypeScript from narrowing this closure-written latch.
+  let unresolvedSdkConnectRejection = null as { error: unknown } | null;
   const connectSelectedSandbox = async (
     sandboxId: string,
     connectOptions: Parameters<typeof Sandbox.connect>[1],
   ) => {
     try {
-      return await Sandbox.connect(sandboxId, connectOptions);
+      const sandbox = await Sandbox.connect(sandboxId, connectOptions);
+      unresolvedSdkConnectRejection = null;
+      return sandbox;
     } catch (error) {
+      unresolvedSdkConnectRejection = { error };
       connectRejection = error;
       if (error instanceof SandboxError && error.statusCode === 504)
         connectGatewayTimeout = error;
@@ -215,6 +233,9 @@ export const ensureSandboxConnection = async (
     }
   };
   try {
+    // An enrolled account's invalid regional config stops before any provider
+    // call or reservation transition, never falling back to direct egress.
+    const managedEgress = resolveManagedEgress(userID);
     options.reportStage?.("routing");
     const { discoveryClusters, createCluster } =
       getE2BClusterRouting(triggerRegion);
@@ -469,7 +490,12 @@ export const ensureSandboxConnection = async (
       selectedBuild === versionBuild ? SANDBOX_VERSION : "v12";
     // Pin the resolved build, not a mutable tag that could change before create.
     const createTemplate = `${templateName}:${selectedBuild}`;
-    const networkSettings = await readNetworkSettings(userID);
+    // Shares the reconciliation builder, with the proxy of the cluster that
+    // will host the workspace. Managed egress was validated before routing.
+    const network = desiredE2BNetwork(
+      (await readNetworkSettings(userID))?.policy ?? DEFAULT_NETWORK_POLICY,
+      managedEgressForCluster(managedEgress, createCluster.cluster),
+    );
     const reservation =
       options.reservation ?? (await readCloudWorkspaceState(userID));
     if (
@@ -488,7 +514,7 @@ export const ensureSandboxConnection = async (
     // No automatic HTTP/application retry: a failed response can hide a successful
     // provider create. A future request reconciles this token from inventory.
     const sandbox = await Sandbox.create(createTemplate, {
-      network: e2bNetwork(networkSettings?.policy ?? DEFAULT_NETWORK_POLICY),
+      network,
       ...createCluster.connectionOptions,
       ...requestOptions,
       retries: 0,
@@ -512,6 +538,20 @@ export const ensureSandboxConnection = async (
     reportBoot(createPath, 1);
     return { sandbox };
   } catch (error) {
+    // Snapshot before any await. Identity get_info/validate have their own
+    // context; this covers the remaining connect phase (stage callbacks, SDK
+    // connect and post-connect publication). The match is object identity with
+    // the latest unresolved SDK rejection, not a provider state or cause.
+    const connectErrorSnapshot =
+      phase === "connect" && identityOperation === undefined
+        ? {
+            // Object.is also matches a rethrown NaN rejection.
+            matchesSdkRejection:
+              unresolvedSdkConnectRejection !== null &&
+              Object.is(unresolvedSdkConnectRejection.error, error),
+            context: checkpointCloudErrorContext(error),
+          }
+        : undefined;
     if (failedTarget && options.acquisitionId && options.triggerRegion) {
       const status =
         error && typeof error === "object"
@@ -596,6 +636,20 @@ export const ensureSandboxConnection = async (
           context.cloud_type_error_signal;
         diagnostics.e2b_workspace_identity_get_info_transport_code =
           context.cloud_transport_code;
+      }
+    }
+    if (connectErrorSnapshot) {
+      const { context } = connectErrorSnapshot;
+      diagnostics.e2b_connect_error_context_version = 1;
+      diagnostics.e2b_connect_error_matches_sdk_rejection =
+        connectErrorSnapshot.matchesSdkRejection;
+      diagnostics.e2b_connect_error_kind = context.cloud_error_kind;
+      // The error's reported statusCode, not an observed HTTP response.
+      diagnostics.e2b_connect_reported_status = context.cloud_http_status;
+      if (context.cloud_type_error_signal !== undefined) {
+        diagnostics.e2b_connect_type_error_signal =
+          context.cloud_type_error_signal;
+        diagnostics.e2b_connect_transport_code = context.cloud_transport_code;
       }
     }
     const connectTargetFingerprint =

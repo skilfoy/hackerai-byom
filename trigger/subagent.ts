@@ -10,7 +10,6 @@ import {
   evidenceWarningText,
   type CheckedSubagentResult,
 } from "@/lib/ai/subagents/evidence-references";
-import type { FreeLimitPolicy } from "@/lib/rate-limit/free-config";
 import {
   logger as triggerLogger,
   metadata,
@@ -207,7 +206,6 @@ const loadPersistedTerminalOutput = async (
 };
 
 type SubagentTaskPayload = {
-  regionalFreeLimits?: FreeLimitPolicy;
   subagentId: string;
   convexUrl?: string;
   triggerRegion?: TriggerRunRegion;
@@ -754,7 +752,6 @@ export const subagentTask = task({
             row.free_quota_subject ?? row.user_id,
             ctx.run.id,
             costDollars,
-            payload.regionalFreeLimits,
           );
         } catch (error) {
           freeMonthlyAccountingFailed = true;
@@ -843,7 +840,6 @@ export const subagentTask = task({
             row.free_quota_subject ?? row.user_id,
             ctx.run.id,
             currentCostDollars,
-            payload.regionalFreeLimits,
           );
         } catch (error) {
           freeMonthlyAccountingFailed = true;
@@ -878,7 +874,6 @@ export const subagentTask = task({
         organizationId: row.organization_id,
         subscription: row.subscription,
         freeQuotaSubject: row.free_quota_subject,
-        freeLimits: payload.regionalFreeLimits,
         extraUsageConfig,
         modelName: selectedModel,
       });
@@ -1120,7 +1115,6 @@ export const subagentTask = task({
                 organizationId: currentEntitlement.organizationId,
                 subscription: currentEntitlement.subscription,
                 freeQuotaSubject: row.free_quota_subject,
-                freeLimits: payload.regionalFreeLimits,
                 extraUsageConfig: currentExtraUsageConfig,
                 modelName: selectedModel,
               });
@@ -1220,6 +1214,7 @@ export const subagentTask = task({
               },
               onAutoReviewCircuitBreaker: () => activeAbort.abort(),
               onPostWaitAuthorizationDenied: () => activeAbort.abort(),
+              onApprovalExpired: () => activeAbort.abort(),
             });
             const allowedToolNames =
               resolveSubagentAllowedToolNamesForPermissionMode(
@@ -1465,7 +1460,6 @@ export const subagentTask = task({
                     userId: row.user_id,
                     subscription: "free",
                     freeQuotaSubject: row.free_quota_subject,
-                    freeLimits: payload.regionalFreeLimits,
                     modelName: selectedModel,
                   });
                 } catch (error) {

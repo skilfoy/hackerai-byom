@@ -6,6 +6,7 @@ import {
   recordAttachmentCommandReceiver,
   recordAttachmentDownloadRoute,
   recordAttachmentCommandSetupAttempt,
+  readAttachmentCommandReceiverClientError,
   type AttachmentCommandReceiver,
 } from "../attachment-download-diagnostics";
 
@@ -272,6 +273,267 @@ it("bounds timeout wording scans and retains it through existing boundary and co
     getAttachmentDownloadFailureContext(copy)?.attachment_download_exit_code,
   ).toBe(28);
 });
+
+const progress = (
+  n: string,
+  c: string,
+  a: string,
+  h: string,
+  b: string,
+  r: string,
+) => `hackerai_curl_progress_v1 n=${n} c=${c} a=${a} h=${h} b=${b} r=${r}`;
+const zero = "0.000000";
+const lookupOnly = progress("0.004211", zero, zero, "000", "0", zero);
+const afterTls = ["0.004211", "0.031002", "0.129800"] as const;
+const progressFields = (curlProgressStdout?: string, overrides = {}) =>
+  getAttachmentDownloadFailureContext(
+    recordAttachmentDownloadFailure(new Error("private original"), {
+      ...input,
+      exitCode: 28,
+      stderr: "curl: (28) private detail",
+      curlProgressStdout,
+      ...overrides,
+    }),
+  );
+
+it.each([
+  [progress(zero, zero, zero, "000", "0", zero), "none_positive"],
+  // Measured stall before any TLS/HTTP bytes: no status, so no response.
+  [`${progress("0.000037", zero, zero, "000", "0", zero)}\n`, "name_lookup"],
+  [progress("0.004211", "0.031002", zero, "000", "0", zero), "connect"],
+  // Measured stall after TLS, before headers.
+  [`${progress(...afterTls, "000", "0", zero)}\r\n`, "tls_handshake"],
+  [progress(...afterTls, "200", "0", zero), "response_status_observed"],
+  // Measured stalled body: a status and positive downloaded bytes.
+  [progress(...afterTls, "200", "21", zero), "response_body_observed"],
+  // Plain HTTP never reports a TLS time; the status still proves a response.
+  [
+    progress("0.004211", "0.031002", zero, "206", "4096", zero),
+    "response_body_observed",
+  ],
+  // Redirect time accumulates across hops, so other values stay ambiguous.
+  [progress(...afterTls, "302", "0", "0.700000"), "redirected_or_ambiguous"],
+  [progress(...afterTls, "200", "21", "0.700000"), "redirected_or_ambiguous"],
+  [
+    progress(zero, zero, zero, "000", "0", "0.000001"),
+    "redirected_or_ambiguous",
+  ],
+])("keeps only the furthest completed curl stage: %j", (stdout, milestone) => {
+  const fields = progressFields(stdout);
+  expect(fields).toMatchObject({
+    attachment_download_timeout_hint: "unclassified",
+    attachment_download_curl_progress_version: 1,
+    attachment_download_curl_progress_state: "observed",
+    attachment_download_curl_progress_milestone: milestone,
+    // The marker's status is never projected as a reported HTTP status.
+    attachment_download_reported_http_status: null,
+  });
+  expect(JSON.stringify(fields)).not.toMatch(
+    /\d\.\d|hackerai_curl|private|200|206|302|4096/,
+  );
+});
+
+it.each([
+  ["", "absent"],
+  [`${lookupOnly}\n${lookupOnly}\n`, "unrecognized"],
+  [`${lookupOnly}\nprivate https://private.example/object\n`, "unrecognized"],
+  [`private body bytes\n${lookupOnly}\n`, "unrecognized"],
+  [` ${lookupOnly}`, "unrecognized"],
+  [lookupOnly.slice(0, -4), "unrecognized"],
+  [lookupOnly.replace("0.004211", "0,004211"), "unrecognized"],
+  [lookupOnly.replace("0.004211", "-0.004211"), "unrecognized"],
+  [lookupOnly.replace(" r=0.000000", ""), "unrecognized"],
+  [lookupOnly.replace("_v1", "_v2"), "unrecognized"],
+  // Body bytes without any HTTP status are contradictory, never a response.
+  [progress(...afterTls, "000", "21", zero), "unrecognized"],
+  [progress(...afterTls, "099", "0", zero), "unrecognized"],
+  [progress(...afterTls, "600", "0", zero), "unrecognized"],
+  [progress(...afterTls, "20", "0", zero), "unrecognized"],
+  [progress(...afterTls, "200", "21.000000", zero), "unrecognized"],
+  [progress(...afterTls, "200", "-1", zero), "unrecognized"],
+  [progress(...afterTls, "200", "1".repeat(16), zero), "unrecognized"],
+  // The superseded marker shape is never read.
+  [
+    `hackerai_curl_progress_v1 n=${afterTls[0]} c=${afterTls[1]} a=${afterTls[2]} t=0.253703 r=${zero}`,
+    "unrecognized",
+  ],
+  [lookupOnly + " ".repeat(300), "unrecognized"],
+  ["private".repeat(100_000), "unrecognized"],
+])(
+  "never interprets missing, malformed or extra private stdout: %#",
+  (stdout, state) => {
+    const fields = progressFields(stdout);
+    expect(fields).toMatchObject({
+      attachment_download_curl_progress_version: 1,
+      attachment_download_curl_progress_state: state,
+      attachment_download_curl_progress_milestone: null,
+      attachment_download_timeout_hint: "unclassified",
+    });
+    expect(JSON.stringify(fields)).not.toMatch(/\d\.\d|hackerai_curl|private/);
+  },
+);
+
+// A curl write failure: the exit code names the local write phase, while the
+// marker shows only the last positive network boundary before it.
+const curl23Stderr =
+  "curl: (23) Failure writing output to destination, passed 16384 returned 4294967295";
+const bodyMarker = progress(...afterTls, "200", "16384", zero);
+
+it("keeps the last positive boundary for a final Windows Bash curl exit23", () => {
+  const original = Object.freeze(new Error("private original"));
+  expect(
+    recordAttachmentDownloadFailure(original, {
+      ...input,
+      exitCode: 23,
+      stderr: curl23Stderr,
+      directoryProbe: {
+        state: "returned",
+        output: "private df output",
+        truncated: false,
+      },
+      curlProgressStdout: `${bodyMarker}\r\n`,
+    }),
+  ).toBe(original);
+  const fields = getAttachmentDownloadFailureContext(original);
+  expect(fields).toMatchObject({
+    attachment_download_exit_code: 23,
+    attachment_download_stderr_signal: "other",
+    attachment_download_reported_http_status: null,
+    attachment_download_target_dir_exists: null,
+    attachment_download_target_dir_writable: null,
+    attachment_download_curl_progress_version: 1,
+    attachment_download_curl_progress_state: "observed",
+    attachment_download_curl_progress_milestone: "response_body_observed",
+  });
+  // Exit23 gains no timeout wording; the marker never becomes a status.
+  expect(fields).not.toHaveProperty("attachment_download_timeout_hint");
+  expect(Object.keys(original)).toEqual([]);
+  expect(JSON.stringify(fields)).not.toMatch(
+    /\d\.\d|hackerai_curl|private|200|16384|4294967295|destination/,
+  );
+  // The same strict parser: absent or repeated markers are never read.
+  for (const [stdout, state] of [
+    ["", "absent"],
+    [`${bodyMarker}\n${bodyMarker}\n`, "unrecognized"],
+  ] as const)
+    expect(
+      progressFields(stdout, { exitCode: 23, stderr: curl23Stderr }),
+    ).toMatchObject({
+      attachment_download_curl_progress_state: state,
+      attachment_download_curl_progress_milestone: null,
+    });
+});
+
+it.each([
+  ["not supplied by the caller", undefined, {}],
+  ["a non-28 exit", lookupOnly, { exitCode: 7 }],
+  [
+    "a real Windows curl exit56 receive failure",
+    bodyMarker,
+    { exitCode: 56, stderr: "curl: (56) Recv failure: Connection was reset" },
+  ],
+  // Windows Bash stays exit28/23-only; the cloud's exit35 scope is separate.
+  ["a Windows exit 35", lookupOnly, { exitCode: 35 }],
+  ["successful exit", lookupOnly, { exitCode: 0 }],
+  ["Windows cmd", lookupOnly, { shell: "cmd" }],
+  ["POSIX Bash", lookupOnly, { platform: "posix" }],
+  ["unknown platform", lookupOnly, { platform: "unknown" }],
+  ["wget", lookupOnly, { httpClient: "wget" }],
+  ["PowerShell", lookupOnly, { httpClient: "powershell" }],
+  // Exit23 is read only on the Windows Bash curl scope.
+  [
+    "Windows cmd exit23",
+    bodyMarker,
+    { exitCode: 23, stderr: curl23Stderr, shell: "cmd" },
+  ],
+  [
+    "POSIX Bash exit23",
+    bodyMarker,
+    { exitCode: 23, stderr: curl23Stderr, platform: "posix" },
+  ],
+  [
+    "unknown-platform exit23",
+    bodyMarker,
+    { exitCode: 23, stderr: curl23Stderr, platform: "unknown" },
+  ],
+  [
+    "wget exit23",
+    bodyMarker,
+    { exitCode: 23, stderr: curl23Stderr, httpClient: "wget" },
+  ],
+] as const)("omits curl progress for %s", (_, stdout, overrides) => {
+  const fields = progressFields(stdout, overrides);
+  expect(fields).toBeDefined();
+  expect(Object.keys(fields!).some((key) => key.includes("progress"))).toBe(
+    false,
+  );
+});
+
+// The generic E2B shape: platform stays unknown, shell bash, client curl.
+const cloudProgressFields = (
+  exitCode: number,
+  cloudCurlProgressStdout?: string,
+  overrides = {},
+) =>
+  getAttachmentDownloadFailureContext(
+    recordAttachmentDownloadFailure(new Error("private original"), {
+      ...input,
+      platform: "unknown",
+      exitCode,
+      stderr: `curl: (${exitCode}) private detail`,
+      cloudCurlProgressStdout,
+      ...overrides,
+    }),
+  );
+
+it.each([28, 35])(
+  "reads a cloud curl exit%i marker only through the shared strict parser",
+  (exitCode) => {
+    const cases = [
+      [progress(...afterTls, "000", "0", zero), "observed", "tls_handshake"],
+      ["", "absent", null],
+      [
+        `${lookupOnly}\nprivate https://private.example/x`,
+        "unrecognized",
+        null,
+      ],
+    ] as const;
+    for (const [stdout, state, milestone] of cases) {
+      const fields = cloudProgressFields(exitCode, stdout);
+      expect(fields).toMatchObject({
+        attachment_download_exit_code: exitCode,
+        attachment_download_curl_progress_version: 1,
+        attachment_download_curl_progress_state: state,
+        attachment_download_curl_progress_milestone: milestone,
+      });
+      expect(JSON.stringify(fields)).not.toMatch(
+        /\d\.\d|hackerai_curl|private/,
+      );
+    }
+  },
+);
+
+it.each([
+  ["not supplied by the caller", 28, undefined, {}],
+  ["another curl exit", 7, lookupOnly, {}],
+  // The Windows exit23 scope never extends to the cloud input.
+  ["a cloud curl exit23", 23, lookupOnly, {}],
+  ["successful exit", 0, lookupOnly, {}],
+  // The cloud input never applies to a local transport's platform or client.
+  ["a Windows platform", 28, lookupOnly, { platform: "windows" }],
+  ["a POSIX platform", 35, lookupOnly, { platform: "posix" }],
+  ["cmd", 28, lookupOnly, { shell: "cmd" }],
+  ["wget", 35, lookupOnly, { httpClient: "wget" }],
+] as const)(
+  "omits cloud curl progress for %s",
+  (_, exitCode, stdout, overrides) => {
+    const fields = cloudProgressFields(exitCode, stdout, overrides);
+    expect(fields).toBeDefined();
+    expect(Object.keys(fields!).some((key) => key.includes("progress"))).toBe(
+      false,
+    );
+  },
+);
 
 const curl1Protocol =
   'curl: (1) Protocol "privateproto" not supported or disabled in libcurl';
@@ -1080,6 +1342,68 @@ it("retains the command hint through existing boundary and copy propagation", ()
   expect(Object.keys(original)).toEqual([]);
 });
 
+const notExecutable = "/system/bin/sh: curl: inaccessible or not found";
+const selectionFields = (error: object) =>
+  Object.fromEntries(
+    Object.entries(getAttachmentDownloadFailureContext(error) ?? {}).filter(
+      ([key]) => key.startsWith("attachment_client_selection_"),
+    ),
+  );
+
+it.each([
+  "current_probe_positive",
+  "cached_probe_positive",
+  "current_unverified_default",
+  "cached_unverified_default",
+] as const)(
+  "keeps the %s selection of a curl exit127 not-executable result through copy",
+  (clientSelection) => {
+    const original = recordAttachmentDownloadFailure(
+      Object.freeze(new Error("private original")),
+      { ...input, exitCode: 127, stderr: notExecutable, clientSelection },
+    );
+    const copy = copyAttachmentDownloadFailureContext(
+      original,
+      new Error("private wrapper"),
+    );
+    for (const error of [original, copy])
+      expect(selectionFields(error)).toEqual({
+        attachment_client_selection_version: 1,
+        attachment_client_selection_reason: clientSelection,
+      });
+    // Existing command-hint evidence for the same result is unchanged.
+    expect(getAttachmentDownloadFailureContext(copy)).toMatchObject({
+      attachment_download_exit_code: 127,
+      attachment_download_command_hint: "unclassified",
+    });
+  },
+);
+
+it.each([
+  ["another client", { httpClient: "wget" as const }],
+  ["another exit", { exitCode: 126 }],
+  ["command-not-found wording", { stderr: "sh: curl: not found" }],
+  [
+    "another program's wording",
+    { stderr: "sh: wget: inaccessible or not found" },
+  ],
+  ["an unrecorded selection", { clientSelection: undefined }],
+  ["an unknown value", { clientSelection: "private" as never }],
+])("omits client selection for %s", (_case, override) => {
+  const error = recordAttachmentDownloadFailure(new Error(), {
+    ...input,
+    exitCode: 127,
+    stderr: notExecutable,
+    clientSelection: "current_probe_positive",
+    ...override,
+  });
+  expect(getAttachmentDownloadFailureContext(error)).toHaveProperty(
+    "attachment_download_diagnostic_version",
+    1,
+  );
+  expect(selectionFields(error)).toEqual({});
+});
+
 const directoryKeys = [
   "attachment_download_directory_probe_version",
   "attachment_download_directory_probe_state",
@@ -1305,6 +1629,96 @@ it("retains receiver and setup context through the later existing boundary", () 
   expect(Object.keys(error)).toEqual([]);
 });
 
+const shellStageKeys = [
+  "attachment_download_shell_context_diagnostic_version",
+  "attachment_download_shell_context_stage",
+];
+const shellStageFields = (error: unknown) =>
+  Object.fromEntries(
+    Object.entries(getAttachmentDownloadFailureContext(error) ?? {}).filter(
+      ([key]) => shellStageKeys.includes(key),
+    ),
+  );
+
+it.each([
+  ["shell_context", "detect_shell", true],
+  ["shell_context", "native_path_conversion", true],
+  ["shell_context", undefined, false],
+  ["shell_context", "PRIVATE_PATH_CANARY", false],
+  ["shell_context", new String("detect_shell"), false],
+  ["http_client", "detect_shell", false],
+  ["download_command", "native_path_conversion", false],
+] as const)(
+  "binds the %s/%s shell-context stage only to its own closed phase",
+  (phase, stage, recorded) => {
+    const error = Object.freeze(new Error("private original"));
+    recordAttachmentCommandSetupAttempt(error, 1);
+    recordAttachmentDownloadBoundary(error, {
+      phase,
+      attempt: 0,
+      resultState: "not_observed",
+      shellContextStage: stage as never,
+    });
+    expect(shellStageFields(error)).toEqual(
+      recorded
+        ? {
+            attachment_download_shell_context_diagnostic_version: 1,
+            attachment_download_shell_context_stage: stage,
+          }
+        : {},
+    );
+    expect(getAttachmentDownloadFailureContext(error)).toMatchObject({
+      attachment_command_setup_attempt: 1,
+      attachment_download_phase: phase,
+    });
+    expect(
+      JSON.stringify(getAttachmentDownloadFailureContext(error)),
+    ).not.toMatch(/PRIVATE|private/);
+    expect(Object.keys(error)).toEqual([]);
+  },
+);
+
+it("clears an earlier shell-context stage when the same rejection reaches a later boundary", () => {
+  const reused = Object.freeze(new Error("private reused"));
+  recordAttachmentDownloadBoundary(reused, {
+    phase: "shell_context",
+    attempt: 0,
+    resultState: "not_observed",
+    shellContextStage: "native_path_conversion",
+  });
+  const copy = copyAttachmentDownloadFailureContext(reused, new Error());
+  expect(shellStageFields(copy)).toEqual({
+    attachment_download_shell_context_diagnostic_version: 1,
+    attachment_download_shell_context_stage: "native_path_conversion",
+  });
+  recordAttachmentCommandSetupAttempt(reused, 2);
+  recordAttachmentDownloadBoundary(reused, {
+    phase: "download_command",
+    attempt: 1,
+    resultState: "not_observed",
+    // A later caller's stale observation is not this phase's evidence.
+    shellContextStage: "detect_shell",
+  });
+  expect(shellStageFields(reused)).toEqual({});
+  expect(getAttachmentDownloadFailureContext(reused)).toMatchObject({
+    attachment_command_setup_attempt: 2,
+    attachment_download_phase: "download_command",
+    attachment_download_attempt: 1,
+  });
+  // A later shell-context failure without an observed stage is not guessed.
+  recordAttachmentDownloadBoundary(reused, {
+    phase: "shell_context",
+    attempt: 0,
+    resultState: "not_observed",
+  });
+  expect(shellStageFields(reused)).toEqual({});
+  // The earlier copy keeps its own finite evidence.
+  expect(shellStageFields(copy)).toEqual({
+    attachment_download_shell_context_diagnostic_version: 1,
+    attachment_download_shell_context_stage: "native_path_conversion",
+  });
+});
+
 it("keeps setup attempts bounded and primitives unrecorded", () => {
   for (const attempt of [0, 3, 1.5, NaN]) {
     const error = new Error();
@@ -1349,4 +1763,294 @@ it("reports only the final rejection's receiver context when an earlier failure 
     attachment_command_receiver_reason: "deadline",
     attachment_command_setup_attempt: 2,
   });
+});
+
+const clientErrorKeys = [
+  "attachment_command_receiver_client_error_version",
+  "attachment_command_receiver_client_error_type",
+  "attachment_command_receiver_client_error_code",
+  "attachment_command_receiver_client_error_temporary",
+  "attachment_command_receiver_client_error_connection_limit_predicate",
+];
+const clientErrorFields = (error: unknown) =>
+  Object.fromEntries(
+    Object.entries(getAttachmentDownloadFailureContext(error) ?? {}).filter(
+      ([key]) => clientErrorKeys.includes(key),
+    ),
+  );
+const clientErrorReceiver: AttachmentCommandReceiver = {
+  ...deadlineReceiver,
+  reason: "client_error",
+  subscribedObserved: false,
+  publicationStarted: false,
+  publishCompleted: false,
+};
+
+it.each([
+  [
+    "a non-temporary connect rejection",
+    { type: "connect", error: { code: 3500, temporary: false } },
+    { type: "connect", code: "other", temporary: false },
+  ],
+  [
+    "a temporary transport failure",
+    { type: "transport", error: { code: 2, temporary: true } },
+    { type: "transport", code: 2, temporary: true },
+  ],
+  [
+    "the public connection-limit code",
+    { type: "connect", error: { code: 4503 } },
+    { type: "connect", code: 4503, temporary: "unavailable" },
+  ],
+  [
+    "the lowest code",
+    { type: "connect", error: { code: 0 } },
+    { type: "connect", code: 0 },
+  ],
+  [
+    "the highest SDK code",
+    { type: "connect", error: { code: 99 } },
+    { type: "connect", code: 99 },
+  ],
+  ["the first server code", { error: { code: 100 } }, { code: "other" }],
+  ["a negative code", { error: { code: -1 } }, { code: "other" }],
+  ["a fractional code", { error: { code: 1.5 } }, { code: "other" }],
+  ["a NaN code", { error: { code: NaN } }, { code: "other" }],
+  ["an infinite code", { error: { code: Infinity } }, { code: "other" }],
+  ["a numeric string code", { error: { code: "4503" } }, {}],
+  ["an object code", { error: { code: { valueOf: () => 4503 } } }, {}],
+  ["another SDK error type", { type: "subscribe" }, { type: "other" }],
+  ["a numeric type", { type: 7 }, {}],
+  ["a string temporary flag", { error: { temporary: "true" } }, {}],
+  ["a missing error", { type: "connect" }, { type: "connect" }],
+  [
+    "a primitive error",
+    { type: "transport", error: "PRIVATE" },
+    { type: "transport" },
+  ],
+  ["an absent context", undefined, {}],
+  ["a primitive context", "PRIVATE", {}],
+])("snapshots only closed SDK fields for %s", (_name, ctx, expected) => {
+  expect(readAttachmentCommandReceiverClientError(ctx, false)).toEqual({
+    type: "unavailable",
+    code: "unavailable",
+    temporary: "unavailable",
+    connectionLimitPredicate: false,
+    ...expected,
+  });
+});
+
+it("records the supplied connection-limit predicate without re-deriving it from the code", () => {
+  // The receiver's computed predicate is the single source; the reader never
+  // recomputes it from the code (or reads the message).
+  expect(
+    readAttachmentCommandReceiverClientError(
+      { type: "connect", error: { code: 3501, temporary: false } },
+      true,
+    ),
+  ).toMatchObject({ code: "other", connectionLimitPredicate: true });
+  expect(
+    readAttachmentCommandReceiverClientError(
+      { type: "connect", error: { code: 4503 } },
+      false,
+    ),
+  ).toMatchObject({ code: 4503, connectionLimitPredicate: false });
+});
+
+it("reads only own data fields of the SDK context without invoking getters or traps", () => {
+  const getter = jest.fn(() => {
+    throw new Error("PRIVATE_GETTER");
+  });
+  const error = { message: "PRIVATE_MESSAGE" };
+  for (const key of ["code", "temporary", "message"])
+    Object.defineProperty(error, key, { enumerable: true, get: getter });
+  const ctx = Object.defineProperty({ error }, "type", {
+    enumerable: true,
+    get: getter,
+  });
+  // Inherited values are not the SDK's own context.
+  const inherited = Object.create({ type: "connect", error: { code: 1 } });
+  const trap = jest.fn(() => {
+    throw new Error("PRIVATE_TRAP");
+  });
+  const hostile = new Proxy(
+    {},
+    { get: trap, getOwnPropertyDescriptor: trap, ownKeys: trap, has: trap },
+  );
+  for (const value of [ctx, inherited, hostile])
+    expect(readAttachmentCommandReceiverClientError(value, true)).toEqual({
+      type: "unavailable",
+      code: "unavailable",
+      temporary: "unavailable",
+      connectionLimitPredicate: true,
+    });
+  expect(getter).not.toHaveBeenCalled();
+});
+
+it("binds a complete closed client-error group only to a client_error receiver", () => {
+  const error = Object.freeze(new Error("PRIVATE_ORIGINAL"));
+  recordAttachmentCommandReceiver(error, {
+    ...clientErrorReceiver,
+    clientError: {
+      type: "connect",
+      code: 4503,
+      temporary: false,
+      connectionLimitPredicate: true,
+    },
+  });
+  expect(getAttachmentDownloadFailureContext(error)).toEqual({
+    attachment_command_receiver_version: 1,
+    attachment_command_receiver_reason: "client_error",
+    attachment_command_receiver_connected_observed: true,
+    attachment_command_receiver_subscribed_observed: false,
+    attachment_command_receiver_publication_started: false,
+    attachment_command_receiver_publish_completed: false,
+    attachment_command_receiver_first_message_observed: false,
+    attachment_command_receiver_client_error_version: 1,
+    attachment_command_receiver_client_error_type: "connect",
+    attachment_command_receiver_client_error_code: 4503,
+    attachment_command_receiver_client_error_temporary: false,
+    attachment_command_receiver_client_error_connection_limit_predicate: true,
+  });
+  expect(Object.keys(error)).toEqual([]);
+
+  const other = new Error("PRIVATE_OTHER");
+  recordAttachmentCommandReceiver(other, {
+    ...deadlineReceiver,
+    clientError: {
+      type: "transport",
+      code: 1,
+      temporary: true,
+      connectionLimitPredicate: false,
+    },
+  });
+  expect(clientErrorFields(other)).toEqual({});
+  expect(getAttachmentDownloadFailureContext(other)).toMatchObject({
+    attachment_command_receiver_reason: "deadline",
+  });
+});
+
+it.each([
+  ["an unknown type", { type: "PRIVATE" }],
+  ["an unlisted code", { code: 4504 }],
+  ["a numeric string code", { code: "4503" }],
+  ["a non-finite code", { code: Infinity }],
+  ["a string temporary flag", { temporary: "false" }],
+  ["a string predicate", { connectionLimitPredicate: "true" }],
+  ["a missing predicate", { connectionLimitPredicate: undefined }],
+])("omits the whole client-error group for %s", (_name, change) => {
+  const error = new Error("PRIVATE_ORIGINAL");
+  recordAttachmentCommandReceiver(error, {
+    ...clientErrorReceiver,
+    clientError: {
+      type: "connect",
+      code: 3,
+      temporary: true,
+      connectionLimitPredicate: false,
+      ...(change as object),
+    } as never,
+  });
+  expect(clientErrorFields(error)).toEqual({});
+  // The existing receiver fields are still recorded.
+  expect(getAttachmentDownloadFailureContext(error)).toMatchObject({
+    attachment_command_receiver_version: 1,
+    attachment_command_receiver_reason: "client_error",
+  });
+  expect(
+    JSON.stringify(getAttachmentDownloadFailureContext(error)),
+  ).not.toMatch(/PRIVATE/);
+});
+
+it("validates the client-error group from own data fields without invoking getters", () => {
+  const getter = jest.fn(() => "connect");
+  const clientError = Object.defineProperty(
+    { code: 1, temporary: true, connectionLimitPredicate: false },
+    "type",
+    { enumerable: true, get: getter },
+  );
+  const error = new Error();
+  recordAttachmentCommandReceiver(error, {
+    ...clientErrorReceiver,
+    clientError: clientError as never,
+  });
+  expect(getter).not.toHaveBeenCalled();
+  expect(clientErrorFields(error)).toEqual({});
+  expect(getAttachmentDownloadFailureContext(error)).toMatchObject({
+    attachment_command_receiver_reason: "client_error",
+  });
+});
+
+it("clears an earlier client-error group when a reused rejection is recorded again", () => {
+  const reused = Object.freeze(new Error("PRIVATE_REUSED"));
+  const group = {
+    type: "transport",
+    code: 2,
+    temporary: true,
+    connectionLimitPredicate: false,
+  } as const;
+  recordAttachmentCommandReceiver(reused, {
+    ...clientErrorReceiver,
+    clientError: group,
+  });
+  recordAttachmentCommandSetupAttempt(reused, 2);
+  const copy = copyAttachmentDownloadFailureContext(reused, new Error());
+  const expected = {
+    attachment_command_receiver_client_error_version: 1,
+    attachment_command_receiver_client_error_type: "transport",
+    attachment_command_receiver_client_error_code: 2,
+    attachment_command_receiver_client_error_temporary: true,
+    attachment_command_receiver_client_error_connection_limit_predicate: false,
+  };
+  expect(clientErrorFields(copy)).toEqual(expected);
+
+  // A later reason on the same rejection never keeps the earlier detail.
+  recordAttachmentCommandReceiver(reused, deadlineReceiver);
+  expect(clientErrorFields(reused)).toEqual({});
+  expect(getAttachmentDownloadFailureContext(reused)).toMatchObject({
+    attachment_command_receiver_reason: "deadline",
+    attachment_command_setup_attempt: 2,
+  });
+
+  // An invalid replacement group does not partially inherit the earlier one.
+  recordAttachmentCommandReceiver(reused, {
+    ...clientErrorReceiver,
+    clientError: group,
+  });
+  recordAttachmentCommandReceiver(reused, {
+    ...clientErrorReceiver,
+    clientError: { ...group, code: 4504 } as never,
+  });
+  expect(clientErrorFields(reused)).toEqual({});
+
+  // The copy keeps its own complete group.
+  expect(clientErrorFields(copy)).toEqual(expected);
+});
+
+it("retains the client-error group through later route and boundary records but not a result overwrite", () => {
+  const error = new Error("PRIVATE_ORIGINAL");
+  recordAttachmentCommandReceiver(error, {
+    ...clientErrorReceiver,
+    clientError: {
+      type: "connect",
+      code: "other",
+      temporary: "unavailable",
+      connectionLimitPredicate: true,
+    },
+  });
+  recordAttachmentDownloadBoundary(error, {
+    phase: "http_client",
+    attempt: 0,
+    resultState: "not_observed",
+  });
+  recordAttachmentDownloadRoute(error, "native_method");
+  expect(clientErrorFields(error)).toEqual({
+    attachment_command_receiver_client_error_version: 1,
+    attachment_command_receiver_client_error_type: "connect",
+    attachment_command_receiver_client_error_code: "other",
+    attachment_command_receiver_client_error_temporary: "unavailable",
+    attachment_command_receiver_client_error_connection_limit_predicate: true,
+  });
+  // A returned-result failure replaces earlier rejection context entirely.
+  recordAttachmentDownloadFailure(error, input);
+  expect(clientErrorFields(error)).toEqual({});
 });

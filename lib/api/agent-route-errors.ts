@@ -12,6 +12,7 @@ import {
   GOAL_RECONCILIATION_STEPS,
   type GoalReconciliationStep,
 } from "@/lib/goals/reconciliation-diagnostics";
+import { selectedComputerFailureDiagnostics } from "@/lib/sandbox/selected-computer-diagnostics";
 
 const MAX_ERROR_FIELD_LENGTH = 1000;
 const MAX_STACK_FIELD_LENGTH = 2000;
@@ -28,6 +29,7 @@ const AGENT_START_STAGES = [
   "prepare_desktop_attachments",
   "persist_user_message",
   "create_idempotency_key",
+  "read_previous_owner",
   "sessions.start",
   "tasks.trigger",
   "create_tokens_and_associate_run",
@@ -271,6 +273,9 @@ export function handleAgentRouteError({
             ...(requestIdKind !== "unavailable"
               ? { request_id: requestId }
               : {}),
+            // Only this process's exact selected-computer failure has a tuple;
+            // copied or client-supplied metadata cannot create these fields.
+            ...selectedComputerFailureDiagnostics(error),
           }),
         );
       } else if (

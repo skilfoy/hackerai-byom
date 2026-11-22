@@ -1422,7 +1422,10 @@ describe("createAgentStream repeated compaction", () => {
   it("compacts an oversized restored prefix before the first provider step when UI usage is small", async () => {
     mockGetProviderPromptPressure.mockReturnValue(null);
     mockHistoryFlag.mockResolvedValue(true);
-    const model = "deepseek/deepseek-v4.1-flash-1017";
+    // Paid Auto stays route-aware; a new, unverified DeepSeek ID (history is
+    // DeepSeek-only) keeps the baseline budget. A restored prefix over 480K
+    // would exceed the history byte cap.
+    const model = "deepseek/deepseek-v4-unverified";
     const source: ModelMessage[] = [
       { role: "user", content: "Original request" },
     ];
@@ -1449,7 +1452,7 @@ describe("createAgentStream repeated compaction", () => {
     });
     mockRunSummarizationStep.mockImplementation(async (options) =>
       options.preparedInputTokens >
-      getSummarizationThresholdTokens(MAX_TOKENS_PAID)
+      getSummarizationThresholdTokens(options.ctxMaxTokens)
         ? {
             summarizationAttempted: true,
             needsSummarization: true,
@@ -1470,7 +1473,6 @@ describe("createAgentStream repeated compaction", () => {
     const stream = (await createAgentStream(
       "model-deepseek-v4-flash-0731",
       createTestStreamContext({
-        agentModelContextEnabled: true,
         trackedProvider: { languageModel: () => ({ modelId: model }) },
         usageTracker: {},
         summarizationTracker: {
@@ -1498,6 +1500,9 @@ describe("createAgentStream repeated compaction", () => {
     expect(JSON.stringify(prepared.messages)).toContain("Verified checkpoint");
     expect(JSON.stringify(prepared.messages).includes(retained)).toBe(false);
     expect(prepared.system).toBe("system");
+    expect(mockRunSummarizationStep.mock.calls[0][0].ctxMaxTokens).toBe(
+      MAX_TOKENS_PAID,
+    );
     expect(state.ctxUsage.maxTokens).toBe(MAX_TOKENS_PAID);
   });
 
@@ -1664,6 +1669,524 @@ describe("createAgentStream repeated compaction", () => {
       expect(state.finalMessages).toEqual(original);
     },
   );
+
+  describe("context budget projection diagnostics", () => {
+    const ANNOTATION_CANARY = "PRIVATE_ANNOTATION_CANARY";
+    const IMAGE_CANARY = "PRIVATE_IMAGE_URL_CANARY";
+    // 22 + 24 UTF-16 code units.
+    const IMAGE_URL = `data:image/png;base64,${IMAGE_CANARY}`;
+    const GUARD_MESSAGE =
+      "Conversation could not be compacted to fit the selected model. Please retry.";
+    const threshold = getSummarizationThresholdTokens(MAX_TOKENS_PAID);
+    const stepMessages = [
+      { role: "user", content: "Read the synthetic attachment" },
+      { role: "assistant", content: "Reading the attachment" },
+    ];
+    let warn: jest.SpyInstance;
+
+    const budgetWarnings = () =>
+      warn.mock.calls
+        .map(([value]) => {
+          try {
+            return typeof value === "string" ? JSON.parse(value) : undefined;
+          } catch {
+            return undefined;
+          }
+        })
+        .filter((value) => value?.event === "agent_context_budget_exceeded");
+
+    const createRouteAwareStream = async (
+      original: UIMessage[],
+      summarizationCount = 0,
+    ) => {
+      const state = initAgentStreamState(original, {
+        usedTokens: 100,
+        maxTokens: MAX_TOKENS_PAID,
+      });
+      const stream = (await createAgentStream(
+        "test-model",
+        createTestStreamContext({
+          agentModelContextEnabled: true,
+          trackedProvider: {
+            languageModel: () => ({ modelId: "synthetic/provider-model" }),
+          },
+          usageTracker: {
+            setAuthoritativeModelCostForStep: jest.fn(),
+            computeCostDollars: () => 0,
+          },
+          summarizationTracker: {
+            hasSummarized: summarizationCount > 0,
+            summarizationCount,
+          },
+        }) as any,
+        state,
+      )) as any;
+      return { state, stream };
+    };
+
+    // One parsed-file annotation of roughly `words` estimated tokens.
+    const fileAnnotations = (words: number, withImage = false) => [
+      {
+        type: "file",
+        file: {
+          hash: "synthetic-hash",
+          name: "synthetic.pdf",
+          content: [
+            {
+              type: "text",
+              text: `${ANNOTATION_CANARY}${" word".repeat(words)}`,
+            },
+            ...(withImage
+              ? [{ type: "image_url", image_url: { url: IMAGE_URL } }]
+              : []),
+          ],
+        },
+      },
+    ];
+
+    // Source-owned growth: annotations from a finished step are attached to
+    // the next prepared request.
+    const finishStepWithAnnotations = (
+      stream: any,
+      annotations = fileAnnotations(MAX_TOKENS_PAID + 10_000, true),
+      modelId = "synthetic/provider-model",
+    ) =>
+      stream.onStepFinish({
+        content: [],
+        response: { modelId, messages: [] },
+        providerMetadata: { openrouter: { annotations } },
+        toolCalls: [],
+        toolResults: [],
+        text: "",
+        finishReason: "tool-calls",
+      });
+
+    const countCanary = (value: unknown) =>
+      JSON.stringify(value).split(ANNOTATION_CANARY).length - 1;
+
+    beforeEach(() => {
+      mockGetProviderPromptPressure.mockReturnValue(null);
+      warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      warn.mockRestore();
+    });
+
+    it("bounds one failed compaction for annotation growth that cannot fit and explains the guard", async () => {
+      const original = [uiMessage("initial", "Read the synthetic attachment")];
+      const { state, stream } = await createRouteAwareStream(original);
+      await finishStepWithAnnotations(stream);
+      // The previous provider request was comfortably below the threshold.
+      state.lastStepInputTokens = 136_500;
+      mockCompactModelMessagesInRun.mockResolvedValue(null);
+      const step = {
+        steps: [{ toolResults: [] }],
+        stepNumber: 1,
+        messages: stepMessages,
+      };
+
+      await expect(stream.prepareStep(step)).rejects.toThrow(GUARD_MESSAGE);
+      // A retry of the same raw cursor must not spend another summary.
+      await expect(stream.prepareStep(step)).rejects.toThrow(GUARD_MESSAGE);
+
+      expect(mockCompactModelMessagesInRun).toHaveBeenCalledTimes(1);
+      // The summarizer receives the rolling history, not the annotation.
+      expect(countCanary(mockCompactModelMessagesInRun.mock.calls[0][0])).toBe(
+        0,
+      );
+      expect(mockRunSummarizationStep).not.toHaveBeenCalled();
+      expect(state.finalMessages).toEqual(original);
+      const warnings = budgetWarnings();
+      expect(warnings).toHaveLength(2);
+      expect(warnings[1]).toMatchObject({
+        compaction_attempt_count: 1,
+        unproductive_compaction_count: 1,
+      });
+      const [warning] = warnings;
+      expect(warning).toMatchObject({
+        compaction_attempt_count: 1,
+        unproductive_compaction_count: 1,
+        context_budget_projection_diagnostic_version: 1,
+        context_budget_step_index: 1,
+        context_budget_decision_source: "rolling_check",
+        context_budget_without_file_annotations_status: "measured",
+        context_budget_file_annotation_count: 1,
+        context_budget_annotation_image_diagnostic_version: 1,
+        context_budget_annotation_image_status: "measured",
+        context_budget_annotation_image_part_count: 1,
+        context_budget_annotation_image_url_chars: 46,
+      });
+      // The decision counted the attached annotation, so it compacted; the
+      // annotation alone still keeps the prepared request above the budget.
+      expect(warning.context_budget_decision_input_tokens).toBeGreaterThan(
+        threshold,
+      );
+      expect(warning.estimated_input_tokens).toBeGreaterThan(MAX_TOKENS_PAID);
+      expect(
+        warning.context_budget_prepared_message_tokens +
+          warning.context_budget_system_tokens +
+          warning.tool_schema_tokens,
+      ).toBe(warning.estimated_input_tokens);
+      // Removing only the attached annotations explains the difference.
+      expect(
+        warning.context_budget_without_file_annotations_message_tokens +
+          warning.context_budget_system_tokens,
+      ).toBeLessThan(threshold);
+      expect(JSON.stringify(warn.mock.calls)).not.toContain(ANNOTATION_CANARY);
+      expect(JSON.stringify(warn.mock.calls)).not.toContain(IMAGE_CANARY);
+    });
+
+    it("never reports a previous step's decision or measures healthy steps", async () => {
+      const { state, stream } = await createRouteAwareStream([
+        uiMessage("initial", "Read the synthetic attachment"),
+      ]);
+      state.lastStepInputTokens = 100;
+      await stream.prepareStep({
+        steps: [{ toolResults: [] }],
+        stepNumber: 1,
+        messages: stepMessages,
+      });
+      // The healthy step evaluated the rolling check but emitted nothing.
+      expect(budgetWarnings()).toHaveLength(0);
+
+      await finishStepWithAnnotations(stream);
+      // Provider usage short-circuits the rolling estimate on this step.
+      state.lastStepInputTokens = MAX_TOKENS_PAID;
+      mockCompactModelMessagesInRun.mockResolvedValue(null);
+      await expect(
+        stream.prepareStep({
+          steps: [{ toolResults: [] }, { toolResults: [] }],
+          stepNumber: 2,
+          messages: [...stepMessages, { role: "user", content: "Continue" }],
+        }),
+      ).rejects.toThrow(GUARD_MESSAGE);
+
+      expect(mockCompactModelMessagesInRun).toHaveBeenCalledTimes(1);
+      const [warning] = budgetWarnings();
+      expect(warning).toMatchObject({
+        compaction_attempt_count: 1,
+        context_budget_step_index: 2,
+        context_budget_decision_source: "not_evaluated",
+        context_budget_without_file_annotations_status: "measured",
+      });
+      expect(warning).not.toHaveProperty(
+        "context_budget_decision_input_tokens",
+      );
+    });
+
+    it("reports the exact startup durable-check input when nothing was attached", async () => {
+      const largeText = " ordinary".repeat(MAX_TOKENS_PAID + 10_000);
+      const original = [uiMessage("large", largeText)];
+      const { state, stream } = await createRouteAwareStream(original);
+
+      await expect(
+        stream.prepareStep({
+          steps: [],
+          stepNumber: 0,
+          messages: [{ role: "user", content: largeText }],
+        }),
+      ).rejects.toThrow(GUARD_MESSAGE);
+
+      expect(mockRunSummarizationStep).toHaveBeenCalledTimes(1);
+      const durableInput =
+        mockRunSummarizationStep.mock.calls[0][0].preparedInputTokens;
+      expect(Number.isSafeInteger(durableInput)).toBe(true);
+      expect(state.finalMessages).toEqual(original);
+      const [warning] = budgetWarnings();
+      expect(warning).toMatchObject({
+        compaction_attempt_count: 0,
+        context_budget_step_index: 0,
+        context_budget_decision_source: "durable_check",
+        context_budget_decision_input_tokens: durableInput,
+        context_budget_without_file_annotations_status: "not_present",
+        context_budget_without_file_annotations_message_tokens:
+          warning.context_budget_prepared_message_tokens,
+        context_budget_annotation_image_status: "not_present",
+      });
+      expect(warning).not.toHaveProperty(
+        "context_budget_file_annotation_count",
+      );
+      expect(warning).not.toHaveProperty(
+        "context_budget_annotation_image_part_count",
+      );
+      expect(warning).not.toHaveProperty(
+        "context_budget_annotation_image_url_chars",
+      );
+    });
+
+    describe("paid Auto annotation growth", () => {
+      // Production shape: a paid Auto run on a verified 1M route resolves a
+      // 500K budget with a 480K compaction threshold, with no assignment.
+      const PAID_MODEL_ID = "z-ai/glm-5.3";
+      const PAID_BUDGET = 500_000;
+      // Mirrors the observed failure: rolling history ~220K tokens, previous
+      // provider usage ~456K and one ~298K non-image file annotation.
+      const ANNOTATION_WORDS = 298_000;
+      const history: ModelMessage[] = [
+        {
+          role: "user",
+          content: `Review the attached report${" ordinary".repeat(220_000)}`,
+        },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool-call",
+              toolCallId: "read-report",
+              toolName: "run_terminal_cmd",
+              input: { command: "wc -c report.pdf" },
+            },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "read-report",
+              toolName: "run_terminal_cmd",
+              output: { type: "text", value: "report.pdf parsed" },
+            },
+          ],
+        },
+      ];
+      const original = [uiMessage("initial", "Review the attached report")];
+      const step = { steps: [{ toolResults: [] }], stepNumber: 1 };
+
+      const createPaidStream = async (overrides: Record<string, unknown>) => {
+        const state = initAgentStreamState(original, {
+          usedTokens: 100,
+          maxTokens: PAID_BUDGET,
+        });
+        const stream = (await createAgentStream(
+          "test-model",
+          createTestStreamContext({
+            trackedProvider: {
+              languageModel: () => ({ modelId: PAID_MODEL_ID }),
+            },
+            usageTracker: {
+              setAuthoritativeModelCostForStep: jest.fn(),
+              computeCostDollars: () => 0,
+            },
+            summarizationTracker: {
+              hasSummarized: false,
+              summarizationCount: 0,
+              recordSummarization: jest.fn(),
+              recordSummarizationUsage: jest.fn(),
+            },
+            ...overrides,
+          }) as any,
+          state,
+        )) as any;
+        await finishStepWithAnnotations(
+          stream,
+          fileAnnotations(ANNOTATION_WORDS),
+          PAID_MODEL_ID,
+        );
+        return { state, stream };
+      };
+
+      it("compacts once and sends the summary with the annotation once", async () => {
+        const { state, stream } = await createPaidStream({});
+        state.lastStepInputTokens = 455_916;
+        mockCompactModelMessagesInRun.mockResolvedValue({
+          summaryMessage: uiMessage(
+            "summary",
+            "<context_summary>Report reviewed</context_summary>",
+          ),
+          summarizationUsage: {},
+        });
+
+        const prepared = await stream.prepareStep({
+          ...step,
+          messages: history,
+        });
+
+        expect(budgetWarnings()).toHaveLength(0);
+        expect(mockCompactModelMessagesInRun).toHaveBeenCalledTimes(1);
+        const [compactionInput] = mockCompactModelMessagesInRun.mock.calls[0];
+        expect(compactionInput.maxTokens).toBe(PAID_BUDGET);
+        expect(countCanary(compactionInput)).toBe(0);
+        const sent = JSON.stringify(prepared.messages);
+        expect(sent).toContain("Report reviewed");
+        expect(sent).toContain("read-report");
+        expect(sent).not.toContain("Review the attached report");
+        expect(countCanary(prepared.messages)).toBe(1);
+        expect(mockRunSummarizationStep).not.toHaveBeenCalled();
+        expect(state.finalMessages).toEqual(original);
+      });
+
+      it("keeps the annotation memo when the compacted request has no assistant and reuses it once on the next assistant", async () => {
+        const PDF_CANARY = "PRIVATE_PDF_PART_CANARY";
+        const pdfHistory: ModelMessage[] = [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: history[0].content as string },
+              {
+                type: "file",
+                mediaType: "application/pdf",
+                filename: "report.pdf",
+                data: PDF_CANARY,
+              },
+            ],
+          },
+          ...history.slice(1),
+        ];
+        const { state, stream } = await createPaidStream({});
+        state.lastStepInputTokens = 455_916;
+        // Existing empty-tail shape: runtime context consumes the whole
+        // retained-tail budget, so no assistant message survives compaction.
+        mockCompactModelMessagesInRun.mockResolvedValue({
+          summaryMessage: uiMessage(
+            "summary",
+            "<context_summary>Report reviewed</context_summary>",
+          ),
+          runtimeContextTokens: require("@/lib/chat/summarization/constants")
+            .SUMMARY_RECENT_MODEL_TAIL_MAX_TOKENS,
+          summarizationUsage: {},
+        });
+
+        const compacted = await stream.prepareStep({
+          ...step,
+          messages: pdfHistory,
+        });
+
+        expect(mockCompactModelMessagesInRun).toHaveBeenCalledTimes(1);
+        expect(budgetWarnings()).toHaveLength(0);
+        const compactedJson = JSON.stringify(compacted.messages);
+        expect(compactedJson).toContain("Report reviewed");
+        // The source PDF part was summarized away with the history.
+        expect(compactedJson).not.toContain(PDF_CANARY);
+        expect(
+          compacted.messages.some(
+            (message: ModelMessage) => message.role === "assistant",
+          ),
+        ).toBe(false);
+        // Existing attachment policy: no assistant anchor, so not sent here.
+        expect(countCanary(compacted.messages)).toBe(0);
+
+        // The compacted step finishes without new parsed-file metadata.
+        await stream.onStepFinish({
+          content: [],
+          response: { modelId: PAID_MODEL_ID, messages: [] },
+          providerMetadata: {},
+          toolCalls: [],
+          toolResults: [],
+          text: "",
+          finishReason: "tool-calls",
+        });
+        const next = await stream.prepareStep({
+          steps: [{ toolResults: [] }, { toolResults: [] }],
+          stepNumber: 2,
+          messages: [
+            ...pdfHistory,
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool-call",
+                  toolCallId: "summarize-findings",
+                  toolName: "run_terminal_cmd",
+                  input: { command: "cat findings.txt" },
+                },
+              ],
+            },
+            {
+              role: "tool",
+              content: [
+                {
+                  type: "tool-result",
+                  toolCallId: "summarize-findings",
+                  toolName: "run_terminal_cmd",
+                  output: { type: "text", value: "findings listed" },
+                },
+              ],
+            },
+          ],
+        });
+
+        // The memo is reused once on the new assistant message, under budget,
+        // without another summary or vision call.
+        const anchored = next.messages.filter(
+          (message: ModelMessage) => countCanary(message) > 0,
+        );
+        expect(anchored).toHaveLength(1);
+        expect(anchored[0].role).toBe("assistant");
+        expect(JSON.stringify(anchored[0])).toContain("summarize-findings");
+        expect(countCanary(next.messages)).toBe(1);
+        expect(JSON.stringify(next.messages)).not.toContain(PDF_CANARY);
+        expect(budgetWarnings()).toHaveLength(0);
+        expect(mockCompactModelMessagesInRun).toHaveBeenCalledTimes(1);
+        expect(mockRunSummarizationStep).not.toHaveBeenCalled();
+        expect(mockDescribeImage).not.toHaveBeenCalled();
+        expect(state.finalMessages).toEqual(original);
+      });
+
+      it("propagates cancellation during that compaction instead of a budget failure", async () => {
+        const abortController = new AbortController();
+        const { state, stream } = await createPaidStream({ abortController });
+        state.lastStepInputTokens = 455_916;
+        const cancelled = new DOMException("Stopped", "AbortError");
+        mockCompactModelMessagesInRun.mockImplementation(async () => {
+          abortController.abort();
+          throw cancelled;
+        });
+
+        await expect(
+          stream.prepareStep({ ...step, messages: history }),
+        ).rejects.toBe(cancelled);
+
+        expect(mockCompactModelMessagesInRun).toHaveBeenCalledTimes(1);
+        expect(budgetWarnings()).toHaveLength(0);
+        expect(state.finalMessages).toEqual(original);
+      });
+
+      it("counts an annotation already on the replayed assistant message once", async () => {
+        // Counted once this stays under the threshold; twice would cross it.
+        const annotations = fileAnnotations(250_000);
+        const { state, stream } = await createPaidStream({});
+        await finishStepWithAnnotations(stream, annotations, PAID_MODEL_ID);
+        state.lastStepInputTokens = 100;
+
+        const prepared = await stream.prepareStep({
+          ...step,
+          messages: [
+            { role: "user", content: "Review the attached report" },
+            {
+              role: "assistant",
+              content: "Reading the report",
+              providerOptions: { openrouter: { annotations } },
+            },
+          ],
+        });
+
+        expect(mockCompactModelMessagesInRun).not.toHaveBeenCalled();
+        expect(budgetWarnings()).toHaveLength(0);
+        expect(countCanary(prepared.messages)).toBe(1);
+      });
+
+      it("keeps the Free Agent baseline compaction decision and sends its annotation", async () => {
+        // The ~298K annotation would cross the baseline threshold if the
+        // route-aware decision applied outside its own send guard.
+        const { state, stream } = await createPaidStream({
+          subscription: "free",
+        });
+        state.lastStepInputTokens = 100;
+
+        const prepared = await stream.prepareStep({
+          ...step,
+          messages: stepMessages,
+        });
+
+        expect(mockCompactModelMessagesInRun).not.toHaveBeenCalled();
+        expect(mockRunSummarizationStep).not.toHaveBeenCalled();
+        expect(budgetWarnings()).toHaveLength(0);
+        expect(countCanary(prepared.messages)).toBe(1);
+      });
+    });
+  });
 
   it.each(
     (["control", "test", undefined] as const).flatMap((variant) =>
@@ -2037,10 +2560,13 @@ describe("createAgentStream repeated compaction", () => {
             }) as any,
             state,
           );
+          // Paid Agent Auto compacts with the expanded 480K summarizer.
           expect(await state.compactionPolicy!.resolve()).toMatchObject({
-            model: platformAuthorized
-              ? "model-abliterated"
-              : "model-glm-5.3-flash",
+            model: !platformAuthorized
+              ? "model-glm-5.3-flash"
+              : mode === "agent"
+                ? "model-abliterated-large-v2"
+                : "model-abliterated",
           });
           expect(phLogger.event).not.toHaveBeenCalledWith(
             "compaction_model_started",
@@ -4754,8 +5280,451 @@ describe("createAgentStream repeated compaction", () => {
         messages: [{ role: "user", content: "old context ".repeat(4_000) }],
       });
       expect(JSON.stringify(next.messages).match(/HANDOFF:/g)).toHaveLength(1);
+      expect(JSON.stringify(next.messages)).not.toContain(
+        "[REPEATED TOOL RESULTS]",
+      );
     },
   );
+
+  describe("varied tool failure recovery", () => {
+    const FAILURE_NOTICE = "[REPEATED TOOL FAILURES]";
+    const failureContext = (overrides: Record<string, unknown> = {}) =>
+      createTestStreamContext({
+        tools: {
+          run_terminal_cmd: {},
+          file: {},
+          interact_terminal_session: {},
+        },
+        summarizationTracker: { hasSummarized: false, summarizationCount: 0 },
+        usageTracker: {
+          setAuthoritativeModelCostForStep: jest.fn(),
+          computeCostDollars: () => 0,
+        },
+        ...overrides,
+      }) as any;
+    const newState = () =>
+      initAgentStreamState([uiMessage("initial", "Inspect the fixture")], {
+        usedTokens: 1_000,
+        maxTokens: 128_000,
+      });
+    const step = (
+      id: string,
+      toolName: string,
+      input: Record<string, unknown>,
+      output?: unknown,
+    ) => ({
+      response: { modelId: "test-model" },
+      toolCalls: [{ toolCallId: id, toolName, input }],
+      toolResults: output === undefined ? [] : [{ toolCallId: id, output }],
+    });
+    const command = (id: string, result?: Record<string, unknown>) =>
+      step(
+        id,
+        "run_terminal_cmd",
+        { command: `synthetic-probe --target /tmp/fixture-${id}` },
+        result && { result },
+      );
+    const failedCommand = (id: string) =>
+      command(id, {
+        status: "failed",
+        processStarted: true,
+        exitCode: 2,
+        output: `SYNTHETIC_OUTPUT_${id}`,
+        error: `SYNTHETIC_ERROR_${id}`,
+      });
+    const requestText = async (stream: any) =>
+      JSON.stringify(
+        (
+          await stream.prepareStep({
+            steps: [],
+            messages: [{ role: "user", content: "Continue" }],
+          })
+        ).messages,
+      );
+    const failureNudges = (onAgentGuardrail: jest.Mock) =>
+      onAgentGuardrail.mock.calls.filter(
+        ([event]) =>
+          event.reason === "repeated_tool_failure" && event.action === "nudge",
+      );
+
+    it("guides varied failed commands at actual requests without stopping diagnostics", async () => {
+      const onAgentGuardrail = jest.fn();
+      const state = newState();
+      const context = failureContext({ onAgentGuardrail });
+      let stream = (await createAgentStream(
+        "test-model",
+        context,
+        state,
+      )) as any;
+      const steps: any[] = [];
+      const finish = async (next: unknown) => {
+        steps.push(next);
+        await stream.onStepFinish(next);
+      };
+
+      await finish(failedCommand("a"));
+      await finish(failedCommand("b"));
+      expect(await requestText(stream)).not.toContain(FAILURE_NOTICE);
+      await finish(failedCommand("c"));
+      const prepared = await stream.prepareStep({
+        steps: [],
+        messages: [{ role: "user", content: "Continue" }],
+      });
+      const text = JSON.stringify(prepared.messages);
+      expect(text).toContain(
+        `${FAILURE_NOTICE} run_terminal_cmd has returned 3 failed results`,
+      );
+      expect(text).not.toMatch(/SYNTHETIC|fixture-/);
+      // Every tool, including the terminal, stays available for diagnosis.
+      expect(prepared.activeTools).toBeUndefined();
+      expect(await stream.stopWhen.at(-1)({ steps })).toBe(false);
+      expect(await stream.stopWhen.at(-2)({ steps })).toBe(false);
+      expect(failureNudges(onAgentGuardrail)).toHaveLength(0);
+
+      // A canceled request never reached the model; its replacement still does.
+      context.abortController.abort();
+      stream.experimental_onStepStart({ model: { modelId: "test-model" } });
+      expect(failureNudges(onAgentGuardrail)).toHaveLength(0);
+      context.abortController = new AbortController();
+      stream = (await createAgentStream("test-model", context, state)) as any;
+      expect(await requestText(stream)).toContain(FAILURE_NOTICE);
+      stream.experimental_onStepStart({ model: { modelId: "test-model" } });
+      expect(onAgentGuardrail).toHaveBeenLastCalledWith({
+        reason: "repeated_tool_failure",
+        action: "nudge",
+        tool_names: ["run_terminal_cmd"],
+        repeat_count: 3,
+        step_count: 3,
+        configured_max_steps: 500,
+      });
+      expect(await requestText(stream)).not.toContain(FAILURE_NOTICE);
+
+      for (const id of ["d", "e", "f"]) await finish(failedCommand(id));
+      expect(await requestText(stream)).toContain(
+        "run_terminal_cmd has returned 6 failed results",
+      );
+      stream.experimental_onStepStart({ model: { modelId: "test-model" } });
+      for (const id of ["g", "h", "i"]) await finish(failedCommand(id));
+      expect(await requestText(stream)).not.toContain(FAILURE_NOTICE);
+      stream.experimental_onStepStart({ model: { modelId: "test-model" } });
+
+      expect(failureNudges(onAgentGuardrail)).toHaveLength(2);
+      expect(await stream.stopWhen.at(-1)({ steps })).toBe(false);
+      expect(state.stoppedDueToDoomLoop).toBe(false);
+      expect(JSON.stringify(onAgentGuardrail.mock.calls)).not.toMatch(
+        /SYNTHETIC|fixture-/,
+      );
+    });
+
+    it.each([
+      [
+        "a successful command",
+        command("ok", {
+          status: "completed",
+          processStarted: true,
+          exitCode: 0,
+          output: "ok",
+        }),
+      ],
+      [
+        "a landed file write",
+        step(
+          "write",
+          "file",
+          { action: "write", path: "/tmp/fixture/notes.txt", text: "x" },
+          "File written: /tmp/fixture/notes.txt",
+        ),
+      ],
+      ["a missing result", command("gap")],
+      [
+        "a permission denial",
+        command("denied", {
+          output: "",
+          exitCode: 1,
+          error: "Denied in synthetic fixture",
+          approvalDenied: true,
+        }),
+      ],
+      [
+        "a cancellation",
+        command("canceled", {
+          output: "",
+          exitCode: 130,
+          error: "Command execution aborted by user",
+        }),
+      ],
+      [
+        "an unknown command outcome",
+        command("unknown", {
+          status: "failed",
+          exitCode: null,
+          executionOutcome: "unknown",
+          output: "",
+          error: "Local command outcome is unknown",
+        }),
+      ],
+      [
+        "an unchanged poll",
+        step(
+          "poll",
+          "interact_terminal_session",
+          { action: "wait", session: "fixture" },
+          { result: { output: "still running", exitCode: 1 } },
+        ),
+      ],
+      [
+        "an unrecognized file result",
+        step("empty", "file", { action: "write", path: "/tmp/fixture" }, {}),
+      ],
+    ])("restarts the failure streak after %s", async (_name, between) => {
+      const state = newState();
+      const stream = (await createAgentStream(
+        "test-model",
+        failureContext(),
+        state,
+      )) as any;
+      for (const next of [
+        failedCommand("a"),
+        failedCommand("b"),
+        between,
+        failedCommand("c"),
+        failedCommand("d"),
+      ])
+        await stream.onStepFinish(next);
+      expect(await requestText(stream)).not.toContain(FAILURE_NOTICE);
+      await stream.onStepFinish(failedCommand("e"));
+      expect(await requestText(stream)).toContain(
+        "run_terminal_cmd has returned 3 failed results",
+      );
+    });
+
+    it("guides varied failed PTY launches, restarts after a successful one and never arms on polls", async () => {
+      // An interactive PTY that finishes during launch reports `exited` only.
+      const ptyLaunch = (id: string, exitCode: number) =>
+        step(
+          id,
+          "run_terminal_cmd",
+          {
+            command: `synthetic-repl --script /tmp/fixture-${id}`,
+            interactive: true,
+          },
+          {
+            result: {
+              pid: 4_000,
+              output: `SYNTHETIC_OUTPUT_${id}`,
+              sessionSnapshot: `SYNTHETIC_SNAPSHOT_${id}`,
+              exited: { exitCode },
+            },
+          },
+        );
+      const poll = (id: string) =>
+        step(
+          id,
+          "interact_terminal_session",
+          { action: "wait", session: "fixture" },
+          { result: { output: "unchanged", exitCode: 1 } },
+        );
+      const requestAfter = async (steps: unknown[]) => {
+        const stream = (await createAgentStream(
+          "test-model",
+          failureContext(),
+          newState(),
+        )) as any;
+        for (const next of steps) await stream.onStepFinish(next);
+        return requestText(stream);
+      };
+
+      const failed = await requestAfter(
+        ["a", "b", "c"].map((id) => ptyLaunch(id, 2)),
+      );
+      expect(failed).toContain(
+        `${FAILURE_NOTICE} run_terminal_cmd has returned 3 failed results`,
+      );
+      expect(failed).not.toMatch(/SYNTHETIC|fixture-/);
+      expect(
+        await requestAfter([
+          ptyLaunch("a", 2),
+          ptyLaunch("b", 2),
+          ptyLaunch("ok", 0),
+          ptyLaunch("c", 2),
+          ptyLaunch("d", 2),
+        ]),
+      ).not.toContain(FAILURE_NOTICE);
+      expect(
+        await requestAfter(["p1", "p2", "p3", "p4"].map(poll)),
+      ).not.toContain(FAILURE_NOTICE);
+    });
+
+    it("keeps counting across a successful read of another tool, whatever its text", async () => {
+      const state = newState();
+      const stream = (await createAgentStream(
+        "test-model",
+        failureContext(),
+        state,
+      )) as any;
+      for (const next of [
+        failedCommand("a"),
+        failedCommand("b"),
+        step(
+          "read",
+          "file",
+          { action: "read", path: "/tmp/fixture/build.log" },
+          {
+            content: "Text file: build.log\n     1|Error: build failed",
+            originalContent: "Error: build failed",
+          },
+        ),
+      ])
+        await stream.onStepFinish(next);
+      expect(await requestText(stream)).not.toContain(FAILURE_NOTICE);
+      await stream.onStepFinish(failedCommand("c"));
+      expect(await requestText(stream)).toContain(
+        "run_terminal_cmd has returned 3 failed results",
+      );
+    });
+
+    it.each(["durable", "rolling"])(
+      "delivers the failure notice in one %s compaction request, not its later or replacement requests",
+      async (kind) => {
+        const summary = uiMessage("summary", "Continue the compacted task.");
+        mockRunSummarizationStep.mockResolvedValue({
+          summarizationAttempted: true,
+          needsSummarization: true,
+          summarizedMessages: [summary],
+        });
+        mockCompactModelMessagesInRun.mockResolvedValue({
+          summaryMessage: summary,
+          summaryText: "Continue the compacted task.",
+          runtimeContextTokens: 0,
+          summarizationUsage: { inputTokens: 10, outputTokens: 2 },
+        });
+        if (kind === "rolling")
+          mockGetProviderPromptPressure.mockReturnValue({
+            reason: "serialized_message_bytes",
+            reasons: [],
+          });
+        const onAgentGuardrail = jest.fn();
+        const context = failureContext({
+          onAgentGuardrail,
+          summarizationTracker: {
+            hasSummarized: kind === "rolling",
+            summarizationCount: kind === "rolling" ? 1 : 0,
+            recordSummarization() {
+              this.hasSummarized = true;
+              this.summarizationCount++;
+            },
+            recordSummarizationUsage: jest.fn(),
+          },
+        });
+        const state = newState();
+        let stream = (await createAgentStream(
+          "test-model",
+          context,
+          state,
+        )) as any;
+        for (const id of ["a", "b", "c"])
+          await stream.onStepFinish(failedCommand(id));
+
+        const raw: ModelMessage[] = [
+          { role: "user", content: "old context ".repeat(4_000) },
+        ];
+        const prepared = await stream.prepareStep({
+          steps: kind === "rolling" ? [{ toolResults: [] }] : [],
+          messages: raw,
+        });
+        expect(
+          kind === "durable"
+            ? mockRunSummarizationStep
+            : mockCompactModelMessagesInRun,
+        ).toHaveBeenCalled();
+        const text = JSON.stringify(prepared.messages);
+        expect(text).toContain("Continue the compacted task.");
+        expect(text.split(FAILURE_NOTICE)).toHaveLength(2);
+        expect(text).toContain(
+          `${FAILURE_NOTICE} run_terminal_cmd has returned 3 failed results`,
+        );
+        expect(text).not.toMatch(/SYNTHETIC|fixture-/);
+        stream.experimental_onStepStart({ model: { modelId: "test-model" } });
+        expect(failureNudges(onAgentGuardrail)).toHaveLength(1);
+
+        // The next request replays the compacted checkpoint plus new history.
+        mockGetProviderPromptPressure.mockReturnValue(null);
+        const next = await stream.prepareStep({
+          stepNumber: 1,
+          steps: [{ toolResults: [] }],
+          messages: [
+            ...raw,
+            { role: "assistant", content: "Checked the prerequisite." },
+          ],
+        });
+        expect(JSON.stringify(next.messages)).toContain(
+          "Continue the compacted task.",
+        );
+        expect(JSON.stringify(next.messages)).not.toContain(FAILURE_NOTICE);
+
+        // A replacement starts from the saved recovery context, if any.
+        stream = (await createAgentStream("test-model", context, state)) as any;
+        const replacement = await stream.prepareStep({
+          steps: [],
+          messages: stream.messages,
+        });
+        expect(JSON.stringify(replacement.messages)).not.toContain(
+          FAILURE_NOTICE,
+        );
+        expect(failureNudges(onAgentGuardrail)).toHaveLength(1);
+        expect(JSON.stringify(onAgentGuardrail.mock.calls)).not.toMatch(
+          /SYNTHETIC|fixture-/,
+        );
+      },
+    );
+
+    it("leaves exact repeated failures to the result-cycle recovery and halt", async () => {
+      const state = newState();
+      const stream = (await createAgentStream(
+        "test-model",
+        failureContext(),
+        state,
+      )) as any;
+      const steps: any[] = [];
+      const repeated = (id: string) =>
+        step(
+          id,
+          "run_terminal_cmd",
+          { command: "synthetic-probe" },
+          { result: { status: "failed", exitCode: 2, output: "same" } },
+        );
+      for (const id of ["a", "b", "c"]) {
+        steps.push(repeated(id));
+        await stream.onStepFinish(steps.at(-1));
+      }
+      const text = await requestText(stream);
+      expect(text).toContain("[REPEATED TOOL RESULTS]");
+      expect(text).not.toContain(FAILURE_NOTICE);
+      stream.experimental_onStepStart({ model: { modelId: "test-model" } });
+      for (const id of ["d", "e"]) {
+        steps.push(repeated(id));
+        await stream.onStepFinish(steps.at(-1));
+      }
+      expect(await stream.stopWhen.at(-1)({ steps })).toBe(true);
+      expect(state.stoppedDueToDoomLoop).toBe(true);
+    });
+
+    it("leaves Ask requests unchanged", async () => {
+      const onAgentGuardrail = jest.fn();
+      const stream = (await createAgentStream(
+        "test-model",
+        failureContext({ mode: "ask", onAgentGuardrail }),
+        newState(),
+      )) as any;
+      for (const id of ["a", "b", "c"])
+        await stream.onStepFinish(failedCommand(id));
+      expect(await requestText(stream)).not.toContain(FAILURE_NOTICE);
+      stream.experimental_onStepStart({ model: { modelId: "test-model" } });
+      expect(JSON.stringify(onAgentGuardrail.mock.calls)).not.toContain(
+        "repeated_tool_failure",
+      );
+    });
+  });
 
   it.each(["ask", "agent"] as const)(
     "halts a repeated response in %s without logging its text",
@@ -6316,6 +7285,8 @@ describe("createAgentStream repeated compaction", () => {
     const stream = (await createAgentStream(
       "test-model",
       createTestStreamContext({
+        // Free Agent keeps the baseline, non-route-aware estimate path.
+        subscription: "free",
         tools: {
           large_tool: {
             description: "Inspect local state.",
@@ -6363,6 +7334,120 @@ describe("createAgentStream repeated compaction", () => {
     state.lastStepInputTokens = 300_000;
     expect(stream.stopWhen[1]()).toBe(true);
     expect(state.stoppedDueToTokenExhaustion).toBe(true);
+  });
+
+  it.each([-5, 1.5])(
+    "uses the recovery estimate when compacted steps report malformed input %p",
+    async (inputTokens) => {
+      mockRunSummarizationStep.mockResolvedValue({
+        summarizationAttempted: true,
+        needsSummarization: true,
+        summarizedMessages: [uiMessage("small-summary", "Keep the objective.")],
+      });
+      mockCompactModelMessagesInRun.mockResolvedValue(null);
+      mockGetProviderPromptPressure.mockReturnValue({
+        reason: "serialized_message_bytes",
+        reasons: [],
+      });
+      const state = initAgentStreamState(
+        [uiMessage("original", "old context ".repeat(2_000))],
+        { usedTokens: 120_000, maxTokens: 128_000 },
+      );
+      const stream = (await createAgentStream(
+        "test-model",
+        createTestStreamContext({
+          // Free Agent keeps the baseline, non-route-aware estimate path.
+          subscription: "free",
+          tools: {
+            large_tool: {
+              description: "Inspect local state.",
+              inputSchema: {
+                type: "object",
+                properties: {
+                  input: {
+                    type: "string",
+                    description: "schema overhead ".repeat(50_000),
+                  },
+                },
+              },
+            },
+          },
+          summarizationTracker: {
+            hasSummarized: false,
+            summarizationCount: 0,
+            recordSummarization: jest.fn(),
+            recordSummarizationUsage: jest.fn(),
+          },
+          usageTracker: {
+            accumulateStep: jest.fn(() => 0),
+            setAuthoritativeModelCostForStep: jest.fn(),
+            computeCostDollars: () => 0,
+          },
+        }) as any,
+        state,
+      )) as any;
+      const malformedStep = {
+        usage: { inputTokens, outputTokens: 10 },
+        response: { modelId: "test-model", messages: [] },
+      };
+
+      const initial: ModelMessage[] = [
+        { role: "user", content: "old context ".repeat(2_000) },
+      ];
+      await stream.prepareStep({ steps: [], messages: initial });
+      await stream.onStepFinish(malformedStep);
+      const next: ModelMessage = { role: "assistant", content: "new work" };
+      await stream.prepareStep({
+        steps: [{ toolResults: [], response: { messages: [next] } }],
+        messages: [...initial, next],
+      });
+      await stream.onStepFinish(malformedStep);
+
+      // A malformed count must not confirm that compaction recovered context.
+      expect(state.lastStepInputTokens).toBe(0);
+      expect(state.ctxUsage.usedTokens).toBeGreaterThan(0);
+      state.lastStepInputTokens = 300_000;
+      expect(stream.stopWhen[1]()).toBe(true);
+      expect(state.stoppedDueToTokenExhaustion).toBe(true);
+    },
+  );
+
+  it("keeps reported context usage when a later step reports malformed input", async () => {
+    const { UsageTracker } = jest.requireActual("@/lib/usage-tracker");
+    const usageTracker = new UsageTracker();
+    const state = initAgentStreamState(
+      [uiMessage("context", "verified context")],
+      { usedTokens: 1_000, maxTokens: 128_000 },
+    );
+    const stream = (await createAgentStream(
+      "test-model",
+      createTestStreamContext({
+        usageTracker,
+        summarizationTracker: {
+          hasSummarized: false,
+          summarizationCount: 0,
+          recordSummarization: jest.fn(),
+          recordSummarizationUsage: jest.fn(),
+        },
+      }) as any,
+      state,
+    )) as any;
+    const finishStep = (inputTokens: number) =>
+      stream.onStepFinish({
+        usage: { inputTokens, outputTokens: 2 },
+        response: { modelId: "test-model", messages: [] },
+      });
+
+    await finishStep(120_000);
+    expect(state.ctxUsage.usedTokens).toBe(120_000);
+    expect(state.lastStepInputTokens).toBe(120_000);
+    for (const malformed of [-5, 1.5]) {
+      await finishStep(malformed);
+      expect(state.ctxUsage.usedTokens).toBe(120_000);
+      expect(state.lastStepInputTokens).toBe(0);
+    }
+    expect(usageTracker.inputTokens).toBe(120_000);
+    expect(usageTracker.outputTokens).toBe(6);
   });
 
   it("allows compaction after provider rejection recovery without usage", async () => {
@@ -6594,4 +7679,97 @@ test("local loss preserves a manual stop reason through model abort and finish",
     response: { modelId: "test-model" },
   });
   expect(state.streamFinishReason).toBe("local-connection-lost");
+});
+
+describe("context pressure snapshot", () => {
+  const threshold = getSummarizationThresholdTokens(MAX_TOKENS_PAID);
+  const createMeasuredStream = async (
+    mode: "agent" | "ask",
+    { recordFails = false } = {},
+  ) => {
+    const writer = { write: jest.fn() };
+    const recorded: unknown[] = [];
+    const tracker = {
+      hasSummarized: false,
+      summarizationCount: 0,
+      recordContextPressure: (snapshot: unknown) => {
+        if (recordFails) throw new Error("diagnostics unavailable");
+        recorded.push(snapshot);
+      },
+      clearContextPressure: () => recorded.push("cleared"),
+    };
+    const state = initAgentStreamState([uiMessage("initial", "Inspect")], {
+      usedTokens: 1_000,
+      maxTokens: MAX_TOKENS_PAID,
+    });
+    const context = createTestStreamContext({
+      mode,
+      writer,
+      summarizationTracker: tracker,
+      usageTracker: {
+        accumulateStep: jest.fn(() => 0),
+        setAuthoritativeModelCostForStep: jest.fn(),
+        computeCostDollars: () => 0,
+      },
+    }) as any;
+    const start = async () =>
+      (await createAgentStream("test-model", context, state)) as any;
+    const finishStep = (stream: any, inputTokens: unknown) =>
+      stream.onStepFinish({
+        usage: { inputTokens, outputTokens: 10 },
+        response: { modelId: "test-model", messages: [] },
+        toolCalls: [],
+        toolResults: [],
+      });
+    const snapshotWrites = () =>
+      writer.write.mock.calls
+        .map(([chunk]) => chunk)
+        .filter((chunk) => chunk.type === "data-context-usage");
+    return { start, finishStep, recorded, snapshotWrites, context };
+  };
+
+  it("reports provider input against the active threshold for Agent only", async () => {
+    const agent = await createMeasuredStream("agent");
+    const stream = await agent.start();
+    await agent.finishStep(stream, 120_000);
+    // Malformed and missing reports never fabricate zero or replace it.
+    for (const invalid of [undefined, -1, 1.5, Number.NaN, 0]) {
+      await agent.finishStep(stream, invalid);
+    }
+    const measured = {
+      usedTokens: 120_000,
+      compactionThresholdTokens: threshold,
+    };
+    expect(agent.snapshotWrites()).toEqual([
+      { type: "data-context-usage", id: "context-usage-0", data: measured },
+    ]);
+    expect(agent.recorded).toEqual(["cleared", measured]);
+
+    // A replacement stream starts unmeasured before its own first step.
+    const replacement = await agent.start();
+    expect(agent.recorded.at(-1)).toBe("cleared");
+    await agent.finishStep(replacement, 130_000);
+    expect(agent.recorded.at(-1)).toEqual({
+      usedTokens: 130_000,
+      compactionThresholdTokens: threshold,
+    });
+    await agent.finishStep(replacement, 140_000);
+    const [originalReport, firstReplacement, secondReplacement] =
+      agent.snapshotWrites();
+    expect(firstReplacement.id).not.toBe(originalReport.id);
+    expect(secondReplacement.id).toBe(firstReplacement.id);
+
+    const ask = await createMeasuredStream("ask");
+    await ask.finishStep(await ask.start(), 120_000);
+    expect(ask.snapshotWrites()).toEqual([]);
+    expect(ask.recorded).toEqual(["cleared"]);
+  });
+
+  it("never disrupts the step when the tracker cannot record", async () => {
+    const agent = await createMeasuredStream("agent", { recordFails: true });
+    const stream = await agent.start();
+    await expect(agent.finishStep(stream, 120_000)).resolves.toBeUndefined();
+    expect(agent.snapshotWrites()).toEqual([]);
+    expect(agent.context.abortController.signal.aborted).toBe(false);
+  });
 });

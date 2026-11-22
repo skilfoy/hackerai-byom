@@ -32,8 +32,10 @@ import {
 import {
   getDraftAttachmentsById,
   getDraftContentById,
+  isDraftGoalModeById,
   removeDraft,
   removeDraftAttachments,
+  setDraftGoalMode,
   upsertDraftAttachments,
   type ConversationDraftAttachment,
 } from "@/lib/utils/client-storage";
@@ -43,12 +45,18 @@ import {
 } from "../RateLimitWarning";
 import { isAgentMode } from "@/lib/utils/mode-helpers";
 import { toast } from "sonner";
-import { GoalSubmissionUnconfirmedError } from "@/lib/chat/goal-submission";
+import {
+  GoalSubmissionUnconfirmedError,
+  isGoalWorkspaceSelectionRefusal,
+} from "@/lib/chat/goal-submission";
+import { CloudWorkspaceRegionChoice } from "../CloudWorkspaceRegionChoice";
 import { NULL_THREAD_DRAFT_ID } from "@/lib/utils/client-storage";
 import { SandboxSelector } from "../SandboxSelector";
 import { ChatInputTextarea } from "./ChatInputTextarea";
 import { ChatInputToolbar } from "./ChatInputToolbar";
+import type { ContextMeterData } from "../ChatContextDetails";
 import { AgentApprovalPrompt } from "./AgentApprovalPrompt";
+import { AgentInputNotificationPrompt } from "../AgentInputNotificationPrompt";
 import {
   WaitingForReplyBanner,
   WAITING_FOR_REPLY_DESCRIPTION_ID,
@@ -109,6 +117,8 @@ interface ChatInputProps {
   isNewChat?: boolean;
   clearDraftOnSubmit?: boolean;
   chatId?: string;
+  /** Existing Agent chat context for the opt-in composer meter. */
+  contextMeter?: ContextMeterData;
   rateLimitWarning?: RateLimitWarningData;
   onDismissRateLimitWarning?: () => void;
   placeholder?: string;
@@ -312,6 +322,7 @@ const ChatInputContent = ({
   isNewChat = false,
   clearDraftOnSubmit = true,
   chatId,
+  contextMeter,
   rateLimitWarning,
   onDismissRateLimitWarning,
   placeholder,
@@ -366,7 +377,8 @@ const ChatInputContent = ({
     handleUpdateGeneratedTextFile,
     handleAttachClick,
   } = useFileUpload(chatMode);
-  const { activeToolApprovalRequest } = useAgentApproval();
+  const { activeToolApprovalRequest, toolApprovalSendStates } =
+    useAgentApproval();
 
   const isGenerating =
     hasActiveGoalRun || status === "submitted" || status === "streaming";
@@ -393,6 +405,11 @@ const ChatInputContent = ({
   );
   const [isStoppingAgent, setIsStoppingAgent] = useState(false);
   const [submissionPending, setSubmissionPending] = useState(false);
+  // The chat whose first submission left the empty new-chat draft and is
+  // still awaiting admission.
+  const [pendingNewChatSubmission, setPendingNewChatSubmission] = useState<
+    string | null
+  >(null);
   const [isReconnecting, setIsReconnecting] = useState(false);
   const [composerFocused, setComposerFocused] = useState(false);
   const isMobile = useIsMobile();
@@ -462,6 +479,22 @@ const ChatInputContent = ({
       definition_version: 1,
     });
   }, [isWaitingForReply, pendingUserWait]);
+  // Real Agent waits only: pre-run goal questions, answers being sent, settled
+  // approvals and stopping runs get no offer.
+  const notificationOfferKey =
+    !user || !chatId
+      ? undefined
+      : showAgentApprovalPrompt &&
+          approvalRequest &&
+          (toolApprovalSendStates[approvalRequest.approvalId] ?? "idle") ===
+            "idle"
+        ? `${user.id}:${chatId}:approval:${approvalRequest.approvalId}:${approvalRequest.toolCallId}`
+        : isWaitingForReply &&
+            pendingUserWait?.status === "waiting" &&
+            !submissionPending &&
+            !isStoppingAgent
+          ? `${user.id}:${chatId}:wait:${pendingUserWait.runId}:${pendingUserWait.toolCallId}`
+          : undefined;
   const hasJoinedComposerPanels =
     !!user &&
     !showAgentApprovalPrompt &&
@@ -558,11 +591,21 @@ const ChatInputContent = ({
     }
   };
 
-  const draftId = isEmptyNewChat ? "new" : chatId || NULL_THREAD_DRAFT_ID;
+  // The optimistic user message makes a new chat non-empty before admission.
+  // Keep its draft (text, attachments and Goal mode) until the submission
+  // settles: a refused start removes that message and must find it intact.
+  const draftId =
+    isEmptyNewChat ||
+    (isNewChat && !!chatId && pendingNewChatSubmission === chatId)
+      ? "new"
+      : chatId || NULL_THREAD_DRAFT_ID;
   const skipNextAttachmentPersistRef = useRef(false);
   const hasPersistedDraftAttachmentsRef = useRef(false);
   const isSubmittingAttachmentsRef = useRef(false);
   const isSubmittingRef = useRef(false);
+  // A new chat whose unconfirmed goal start kept its message; its Goal mode
+  // moves with the draft when the composer adopts that chat.
+  const goalCarryChatIdRef = useRef<string | null>(null);
   const isMountedRef = useRef(true);
   const uploadedFilesRef = useRef(uploadedFiles);
   const prevDraftIdRef = useRef(draftId);
@@ -786,6 +829,14 @@ const ChatInputContent = ({
     }
 
     if (prevDraftId === "new" && draftId !== "new") {
+      // Runs before useComposerGoalMode reads the adopted draft's flag.
+      if (goalCarryChatIdRef.current === draftId) {
+        goalCarryChatIdRef.current = null;
+        if (isDraftGoalModeById("new")) {
+          setDraftGoalMode(draftId, true);
+          setDraftGoalMode("new", false);
+        }
+      }
       if (isSubmittingAttachmentsRef.current) {
         uploadedFilesRef.current = [];
         removeDraft("new");
@@ -948,6 +999,35 @@ const ChatInputContent = ({
     sendDisabledReason: computerSendDisabledReason,
   } = useSelectedComputerConnection();
   const [goalMode, setGoalMode] = useComposerGoalMode(draftId);
+  // A workspace-selection refusal belongs to the chat, environment and Goal
+  // mode that sent it. Any change there makes its Retry unsafe (for example,
+  // a goal Retry becoming an ordinary send), so drop the selector.
+  const workspaceRecoveryScope = JSON.stringify([
+    chatId ?? null,
+    chatMode,
+    sandboxPreference ?? null,
+    goalMode,
+  ]);
+  const workspaceRecoveryScopeRef = useRef(workspaceRecoveryScope);
+  // Counts scope changes, so leaving and returning to an identical scope still
+  // invalidates a refusal that arrives late from the earlier visit.
+  const workspaceRecoveryGenerationRef = useRef(0);
+  const [workspaceRecovery, setWorkspaceRecovery] = useState<{
+    scope: string;
+    attempt: number;
+  } | null>(null);
+  useEffect(() => {
+    if (workspaceRecoveryScopeRef.current !== workspaceRecoveryScope)
+      workspaceRecoveryGenerationRef.current += 1;
+    workspaceRecoveryScopeRef.current = workspaceRecoveryScope;
+    setWorkspaceRecovery((current) =>
+      current && current.scope !== workspaceRecoveryScope ? null : current,
+    );
+  }, [workspaceRecoveryScope]);
+  const clearWorkspaceRecovery = (scope: string) =>
+    setWorkspaceRecovery((current) =>
+      current?.scope === scope ? null : current,
+    );
   const [goalEnabled, setGoalEnabled] = useState<boolean | null>(null);
   const [dismissedGoalSuggestionInput, setDismissedGoalSuggestionInput] =
     useState<string | null>(null);
@@ -1231,23 +1311,27 @@ const ChatInputContent = ({
       isSubmittingRef.current = true;
       const finishPredictionSubmission = nextActions.prepareSubmission();
       setSubmissionPending(true);
+      if (draftId === "new" && chatId) setPendingNewChatSubmission(chatId);
       const submittedInput = getInput();
       const submittedFiles = getUploadedFiles();
+      const submittedScope = workspaceRecoveryScope;
+      const submittedGeneration = workspaceRecoveryGenerationRef.current;
+      goalCarryChatIdRef.current = null;
       const submittedDraftAttachments = JSON.stringify(
         getDraftAttachmentsById(draftId),
       );
       try {
         isSubmittingAttachmentsRef.current =
           clearDraftOnSubmit && uploadedFiles.length > 0;
-        const accepted = await onSubmit(
-          e,
-          isGoalSubmission ? `/goal start ${input}` : undefined,
-        );
+        const goalInput = isGoalSubmission ? `/goal start ${input}` : undefined;
+        const accepted = await onSubmit(e, goalInput);
         if (isGoalSubmission)
           captureGoalComposerAction(
             accepted === false ? "submit_refused" : "submit_accepted",
           );
         finishPredictionSubmission(accepted !== false);
+        if (accepted !== false && isMountedRef.current)
+          clearWorkspaceRecovery(submittedScope);
         if (accepted !== false && isGoalSubmission) setGoalMode(false);
         const unchanged =
           getInput() === submittedInput &&
@@ -1289,8 +1373,26 @@ const ChatInputContent = ({
           setInput("");
         }
       } catch (error) {
+        const workspaceRefusal = isGoalWorkspaceSelectionRefusal(error);
         finishPredictionSubmission(false);
         isSubmittingAttachmentsRef.current = false;
+        if (workspaceRefusal) {
+          if (isGoalSubmission) captureGoalComposerAction("submit_refused");
+          // Nothing was admitted: keep the draft and offer the selector, but
+          // only where this request came from.
+          if (
+            isMountedRef.current &&
+            workspaceRecoveryScopeRef.current === submittedScope &&
+            workspaceRecoveryGenerationRef.current === submittedGeneration
+          )
+            setWorkspaceRecovery((current) => ({
+              scope: submittedScope,
+              attempt: (current?.attempt ?? 0) + 1,
+            }));
+          return;
+        }
+        // An unconfirmed or failed retry must not keep inviting another one.
+        if (isMountedRef.current) clearWorkspaceRecovery(submittedScope);
         if (error instanceof GoalSubmissionUnconfirmedError) {
           reportUnconfirmedGoalSubmission(error);
           return;
@@ -1303,7 +1405,16 @@ const ChatInputContent = ({
         console.error("Failed to submit message:", error);
       } finally {
         isSubmittingRef.current = false;
-        if (isMountedRef.current) setSubmissionPending(false);
+        if (isMountedRef.current) {
+          setSubmissionPending(false);
+          // An admitted chat now moves to its own draft; the existing
+          // new-chat transition clears the submitted draft at that point.
+          // If Goal mode is still on (the start was not confirmed and its
+          // message stays), that draft keeps Goal mode as it moves too.
+          if (draftId === "new" && chatId && isDraftGoalModeById("new"))
+            goalCarryChatIdRef.current = chatId;
+          setPendingNewChatSubmission(null);
+        }
       }
     } else if (isGoalSubmission) {
       captureGoalComposerAction(
@@ -1365,12 +1476,39 @@ const ChatInputContent = ({
         className="mx-auto flex min-h-0 w-full min-w-0 max-w-full flex-1 flex-col sm:max-w-[768px]"
         data-testid="chat-input-container"
       >
+        {/* Outside the scrolling stack so notices cannot push it out of view;
+            the stack shrinks first, keeping the card's actions reachable. */}
+        {user && notificationOfferKey && (
+          <AgentInputNotificationPrompt
+            key={notificationOfferKey}
+            userId={user.id}
+          />
+        )}
         {/* Panels keep their content height and scroll as a stack instead of
             shrinking beneath the next panel. Reserve the input or approval card. */}
         <div
           className={`flex min-h-0 shrink flex-col overflow-y-auto md:bg-background [&>*]:shrink-0 ${showAgentApprovalPrompt ? "max-h-[25dvh]" : "max-h-[calc(100dvh-11rem)]"} ${hasJoinedComposerPanels && !isWaitingForReply && !hasFilePreviews ? "-mb-5 md:mb-0" : ""}`}
         >
           {topNotice}
+          {workspaceRecovery?.scope === workspaceRecoveryScope && (
+            <div className="mb-2 bg-background">
+              <CloudWorkspaceRegionChoice
+                // Each refusal reloads the options with a fresh token.
+                key={workspaceRecovery.attempt}
+                onRetry={() =>
+                  void handleSubmit({
+                    preventDefault: () => {},
+                  } as React.FormEvent)
+                }
+                onCancel={() => {
+                  // Dismissing also invalidates a pending Retry's refusal so
+                  // it cannot reopen the card. The request itself continues.
+                  workspaceRecoveryGenerationRef.current += 1;
+                  clearWorkspaceRecovery(workspaceRecoveryScope);
+                }}
+              />
+            </div>
+          )}
           {isOffline && (
             <div
               role="status"
@@ -1408,6 +1546,7 @@ const ChatInputContent = ({
                 isNewChat={isNewChat}
                 sandboxPreference={sandboxPreference}
                 onSelect={setSandboxPreference}
+                confirmEnvironmentChange={!isNewChat && hasMessages}
                 reconnectInstructions={
                   isDesktopPreference(sandboxPreference) &&
                   !selectedNativeDesktop
@@ -1454,6 +1593,7 @@ const ChatInputContent = ({
                   <SandboxSelector
                     value={sandboxPreference}
                     onChange={setSandboxPreference}
+                    confirmEnvironmentChange={!isNewChat && hasMessages}
                     compact
                     size="sm"
                     menuAlign="end"
@@ -1680,6 +1820,13 @@ const ChatInputContent = ({
               }}
             />
             <ChatInputToolbar
+              contextMeter={
+                // A composer mid-transition must not show another chat's data.
+                contextMeter && contextMeter.chatId === chatId
+                  ? contextMeter
+                  : undefined
+              }
+              confirmEnvironmentChange={!isNewChat && hasMessages}
               replyActionLabel={
                 isWaitingForReply
                   ? questionAnswers.index < answerQuestions.length - 1

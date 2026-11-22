@@ -1,9 +1,14 @@
 import {
+  CURL_PROGRESS_WRITE_OUT,
   recordAttachmentDownloadFailure,
   recordAttachmentDownloadBoundary,
   recordAttachmentCommandReceiver,
   recordAttachmentCommandSetupAttempt,
+  readAttachmentCommandReceiverClientError,
+  type AttachmentClientSelection,
+  type AttachmentCommandReceiverClientError,
   type AttachmentDownloadBoundary,
+  type AttachmentDownloadShellContextObservation,
 } from "./attachment-download-diagnostics";
 import {
   DesktopFileBridgeError,
@@ -25,18 +30,28 @@ import {
 import {
   createReceiverDiagnostics,
   type ReceiverCleanupReason,
+  type AttachmentLocalCopyOwnerStage,
 } from "@/lib/centrifugo/receiver-diagnostics";
 import { sandboxOperationChannel } from "@/packages/local/src/operation-channels";
 import {
   dispatchIsolatedOperation,
   RelayOperationReadinessTimeout,
+  type IsolatedOperationPhase,
 } from "@/lib/centrifugo/dispatch-operation";
 import {
+  AttachmentLocalCopySetupDeadlineError,
   runAttachmentCommand,
   throwIfAttachmentAborted,
 } from "./attachment-command";
 import { recordLocalCopyFailure } from "./local-copy-failure-context";
 import { abortableDelay } from "@/lib/utils/abortable-delay";
+import {
+  DESKTOP_SESSION_CHALLENGE,
+  DESKTOP_SESSION_PROOF,
+  type DesktopDispatchGate,
+  type PublishedDesktopCommand,
+} from "@/lib/centrifugo/desktop-session";
+import { LocalConnectionLostError } from "@/lib/chat/local-connection-stop";
 import { EventEmitter } from "events";
 import { Centrifuge, type Subscription } from "centrifuge";
 
@@ -106,6 +121,8 @@ const VALID_MESSAGE_TYPES = new Set([
 const IGNORED_MESSAGE_TYPES = new Set([
   "command_output_ack",
   "command_output_resume",
+  DESKTOP_SESSION_CHALLENGE,
+  DESKTOP_SESSION_PROOF,
   "file_stat",
   "file_read",
   "file_write",
@@ -136,6 +153,9 @@ const COMMAND_CANCEL_RETRY_MS = 1500;
 const TRANSIENT_COMMAND_TIMEOUT_ERROR_PATTERN =
   /\b(?:deadline_exceeded|operation timed out:.*\btimeoutMs\b|exceeding ['"]?timeoutMs['"]?|Command timeout after \d+ms)\b/i;
 
+/** Which path of a local copy issued a setup command. */
+type LocalCopyRole = "source" | "destination";
+
 /** Classify rejected conversion output without retaining any path or output text. */
 function nativePathOutputShape(value: string) {
   if (value.startsWith("\uFEFF")) return "leading_bom";
@@ -156,6 +176,9 @@ type NativeReceiverErrorClass =
   | "authorization_send_unavailable"
   | "authorization_denied"
   | "authorization_response_invalid"
+  | "authorized_ipc_denied"
+  | "authorization_message_invalid"
+  | "authorized_file_request_invalid"
   | "other";
 
 // Exact public authorization errors from the Desktop native file command
@@ -181,6 +204,90 @@ const NATIVE_RECEIVER_ERROR_CLASSES: ReadonlyMap<
   ["Desktop operation was not authorized", "authorization_denied"],
   ["Invalid Desktop authorization response", "authorization_response_invalid"],
 ]);
+
+// Exact rejections of an authorized_desktop_file_request invocation: Tauri's
+// release ACL denial for that command (pinned tauri src/webview/mod.rs), the
+// authorization message shape check and the redeemed file request shape checks
+// (packages/desktop/src-tauri/src/lib.rs). Classified only when the receiver
+// reports that exact invoke boundary, so other adapters' text stays "other".
+const AUTHORIZED_NATIVE_RECEIVER_ERROR_CLASSES: ReadonlyMap<
+  string,
+  NativeReceiverErrorClass
+> = new Map([
+  [
+    "Command authorized_desktop_file_request not allowed by ACL",
+    "authorized_ipc_denied",
+  ],
+  ["Invalid Desktop operation", "authorization_message_invalid"],
+  ["Desktop operation type is missing", "authorized_file_request_invalid"],
+  [
+    "Desktop operation type is not allowed here",
+    "authorized_file_request_invalid",
+  ],
+  ["File path is missing", "authorized_file_request_invalid"],
+]);
+
+function nativeReceiverErrorClass(
+  message: string,
+  diagnostic: DesktopFileReceiverDiagnostic | undefined,
+): NativeReceiverErrorClass {
+  const authorizedInvoke =
+    diagnostic?.version === 1 &&
+    diagnostic.stage === "native_invoke" &&
+    diagnostic.adapter === "authorized_native";
+  return (
+    NATIVE_RECEIVER_ERROR_CLASSES.get(message) ??
+    (authorizedInvoke
+      ? AUTHORIZED_NATIVE_RECEIVER_ERROR_CLASSES.get(message)
+      : undefined) ??
+    "other"
+  );
+}
+
+/**
+ * Version 1 of the last sender step the read-only capability probe entered.
+ * Each phase means only that the server began that step. None implies that a
+ * request reached the Desktop, that native code ran, or that a step finished.
+ * - path_resolution: resolving the probe path (Windows may run a shell lookup).
+ * - token: minting the reply-channel token.
+ * - reply_subscription: reply client created; waiting for its subscription.
+ * - shared_presence / shared_publish: connection-channel presence check and
+ *   publish call (Desktop without operation channels).
+ * - control_ready ... ready_received: the existing isolated dispatch phases;
+ *   "publish" begins before operation authorization.
+ * - response_wait: dispatch returned; awaiting the matched native response.
+ * - response_received: matched response accepted; ACK and cleanup pending.
+ */
+type FileProbeSenderPhase =
+  | "path_resolution"
+  | "token"
+  | "reply_subscription"
+  | "shared_presence"
+  | "shared_publish"
+  | IsolatedOperationPhase
+  | "response_wait"
+  | "response_received";
+
+/**
+ * Observation-only probe state. It must never drive request behavior.
+ * dispatchEntered: the reply subscription's dispatch handler ran (not delivery).
+ * publicationStarted: a request publish was attempted (not delivery/execution).
+ * Once frozen at the deadline or settlement, late callbacks cannot rewrite it.
+ */
+interface FileProbeSenderState {
+  phase: FileProbeSenderPhase;
+  fileRequestId: string | null;
+  dispatchEntered: boolean;
+  publicationStarted: boolean;
+  frozen: boolean;
+}
+
+function noteFileProbe(
+  probe: FileProbeSenderState | undefined,
+  update: Partial<Omit<FileProbeSenderState, "frozen">>,
+): void {
+  if (probe && !probe.frozen) Object.assign(probe, update);
+}
 
 type HttpClient = "curl" | "wget" | "powershell";
 
@@ -412,6 +519,13 @@ export class CentrifugoSandbox extends EventEmitter {
   >();
   private readonly reportedNativePathFailures =
     new Set<NativePathResolutionFailure>();
+  /** The owning run's live host readiness, checked before each publication. */
+  private dispatchGate?: DesktopDispatchGate;
+  /** Commands whose execution publication began and that have not settled. */
+  private readonly publishedCommands = new Map<
+    string,
+    PublishedDesktopCommand
+  >();
 
   constructor(
     private userId: string,
@@ -449,6 +563,37 @@ export class CentrifugoSandbox extends EventEmitter {
     return this.workingDirectory;
   }
 
+  /**
+   * Admit new command and file publications only while the owning run's
+   * selected host is verified. Undefined restores ungated dispatch.
+   */
+  setDispatchGate(gate: DesktopDispatchGate | undefined): void {
+    this.dispatchGate = gate;
+  }
+
+  /** The owning run's readiness, for transports that publish on their own. */
+  getDispatchGate(): DesktopDispatchGate | undefined {
+    return this.dispatchGate;
+  }
+
+  /** In-flight commands to reconcile after the selected host returns. */
+  getPublishedCommands(): PublishedDesktopCommand[] {
+    return [...this.publishedCommands.values()];
+  }
+
+  /**
+   * Record an operation whose execution publication began, until it settles.
+   * One without replayable output reports outputComplete() false, so a host
+   * return while it is active stops the run for manual Resume.
+   */
+  registerPublishedOperation(operation: PublishedDesktopCommand): () => void {
+    this.publishedCommands.set(operation.commandId, operation);
+    return () => {
+      if (this.publishedCommands.get(operation.commandId) === operation)
+        this.publishedCommands.delete(operation.commandId);
+    };
+  }
+
   supportsPty(): boolean {
     return this.connectionInfo.capabilities?.pty !== false;
   }
@@ -476,7 +621,18 @@ export class CentrifugoSandbox extends EventEmitter {
     // Confirm on that same connection before choosing artifact paths/transport.
     // Do not grant commandStdin or bypass Local's private-storage preparation.
     const controller = new AbortController();
-    const deadline = setTimeout(() => controller.abort(), 3000);
+    // Dispatch begins with path resolution; the deadline covers every phase.
+    const sender: FileProbeSenderState = {
+      phase: "path_resolution",
+      fileRequestId: null,
+      dispatchEntered: false,
+      publicationStarted: false,
+      frozen: false,
+    };
+    const deadline = setTimeout(() => {
+      sender.frozen = true;
+      controller.abort();
+    }, 3000);
     let failure: string | undefined;
     let fileFailure: DesktopFileFailure | undefined;
     let receiverErrorClass: NativeReceiverErrorClass | undefined;
@@ -487,6 +643,8 @@ export class CentrifugoSandbox extends EventEmitter {
         new Set(["file_stat_result"]),
         3000,
         controller.signal,
+        undefined,
+        sender,
       );
       this.nativeFileRelayConfirmed = true;
     } catch (error) {
@@ -501,13 +659,16 @@ export class CentrifugoSandbox extends EventEmitter {
         fileFailure === "unknown" &&
         error instanceof LocalFileRequestError
       )
-        receiverErrorClass =
-          NATIVE_RECEIVER_ERROR_CLASSES.get(error.message) ?? "other";
+        receiverErrorClass = nativeReceiverErrorClass(
+          error.message,
+          error.receiverDiagnostic,
+        );
       // Observation only: the receiver's last attempted boundary and adapter.
       if (failure === "native_error" && error instanceof LocalFileRequestError)
         receiverDiagnostic = error.receiverDiagnostic;
     } finally {
       clearTimeout(deadline);
+      sender.frozen = true;
     }
     console.info(
       JSON.stringify({
@@ -523,6 +684,14 @@ export class CentrifugoSandbox extends EventEmitter {
         receiver_stage: receiverDiagnostic?.stage,
         receiver_adapter: receiverDiagnostic?.adapter,
         receiver_native_version_lookup: receiverDiagnostic?.nativeVersionLookup,
+        // Overall-deadline failures only: where the sender was when it expired.
+        ...(failure === "timeout" && {
+          sender_phase_version: 1,
+          sender_phase: sender.phase,
+          sender_file_request_id: sender.fileRequestId,
+          sender_dispatch_entered: sender.dispatchEntered,
+          sender_publication_started: sender.publicationStarted,
+        }),
       }),
     );
     if (!this.nativeFileRelayConfirmed) {
@@ -663,6 +832,7 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
     timeoutMs: number,
     signal?: AbortSignal,
     nativePaths?: Map<string, string>,
+    probe?: FileProbeSenderState,
   ): Promise<T> {
     signal?.throwIfAborted();
     // Resolve before subscribing so a failed/cancelled shell lookup cannot
@@ -679,6 +849,7 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
         : undefined;
     signal?.throwIfAborted();
     const requestId = crypto.randomUUID();
+    noteFileProbe(probe, { phase: "token", fileRequestId: requestId });
     const isolated = this.supportsOperationChannels();
     const channel = isolated
       ? sandboxOperationChannel(
@@ -691,6 +862,7 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
     const tokenExpSeconds = Math.ceil(timeoutMs / 1000) + 30;
     const token = await generateCentrifugoToken(this.userId, tokenExpSeconds);
     signal?.throwIfAborted();
+    noteFileProbe(probe, { phase: "reply_subscription" });
     const client = new Centrifuge(this.config.wsUrl, { token });
     this.activeClients.push(client);
 
@@ -748,6 +920,7 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
       const fail = (error: Error) => {
         if (settled) return;
         settled = true;
+        if (probe) probe.frozen = true;
         cleanup();
         reject(error);
       };
@@ -790,6 +963,8 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
           return;
 
         settled = true;
+        noteFileProbe(probe, { phase: "response_received" });
+        if (probe) probe.frozen = true;
         // Receipt is final even if the broker never acknowledges our ACK.
         // Keep the subscription briefly for delivery, but bound caller cleanup.
         let finished = false;
@@ -850,6 +1025,10 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
         // File writes and appends are not safe to replay after a reconnect.
         if (requestDispatchStarted) return;
         requestDispatchStarted = true;
+        noteFileProbe(probe, {
+          dispatchEntered: true,
+          ...(!isolated && { phase: "shared_presence" }),
+        });
 
         void (async () => {
           try {
@@ -894,6 +1073,7 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
             targetConnectionId: this.connectionInfo.connectionId,
           } as FileRequestMessage;
 
+          const gate = this.dispatchGate;
           try {
             if (isolated) {
               await dispatchIsolatedOperation(
@@ -905,13 +1085,23 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
                 subscription!,
                 () => {
                   requestPublicationStarted = true;
+                  noteFileProbe(probe, { publicationStarted: true });
                 },
-                undefined,
+                probe && ((phase) => noteFileProbe(probe, { phase })),
                 this.connectionInfo.isDesktop === true,
+                { gate, signal },
               );
             } else {
+              while (gate && !gate.isReady()) await gate.waitUntilReady(signal);
+              signal?.throwIfAborted();
+              if (settled) return;
+              noteFileProbe(probe, {
+                phase: "shared_publish",
+                publicationStarted: true,
+              });
               await subscription.publish(request);
             }
+            noteFileProbe(probe, { phase: "response_wait" });
           } catch (error) {
             if (
               isolated &&
@@ -962,6 +1152,8 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
         signal?: AbortSignal;
         onCancelReady?: (cancel: () => Promise<boolean>) => void;
       },
+      /** Server-internal diagnostics only; never published to the host. */
+      copyOwnerStage?: AttachmentLocalCopyOwnerStage,
     ): Promise<{
       stdout: string;
       stderr: string;
@@ -1012,7 +1204,12 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
 
       const result = await new Promise<CommandResult>((resolve, fail) => {
         let commandPublicationStarted = false;
-        const reject = (error: unknown, retryable = false) => {
+        const reject = (
+          error: unknown,
+          retryable = false,
+          // Only the terminal client_error branch supplies this snapshot.
+          clientError?: AttachmentCommandReceiverClientError,
+        ) => {
           const rejection = isLocalCommandRelayUnsubscribedError(error)
             ? error
             : new LocalCommandDispatchError(
@@ -1029,6 +1226,7 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
               publicationStarted: commandPublicationStarted,
               publishCompleted: Boolean(tPublished),
               firstMessageObserved: Boolean(tFirstMessage),
+              ...(clientError && { clientError }),
             });
           fail(rejection);
         };
@@ -1058,6 +1256,13 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
         let terminalCursorPublished = false;
         let terminalReceivedDuringCancellation = false;
         let completeTerminal: (() => void) | undefined;
+        // Desktop retains this command's output only when it was requested.
+        const requestsAcknowledgedOutput =
+          isolated && this.connectionInfo.isDesktop === true;
+        const gate = this.dispatchGate;
+        // Ends only readiness waits before publication starts; never a
+        // published command, whose Stop goes to the host.
+        const dispatchAbort = new AbortController();
         const diagnostics = createReceiverDiagnostics(
           {
             commandId,
@@ -1066,6 +1271,7 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
             // Requested execution intent, not maxWaitTime's delivery window.
             requestedBackground: opts?.background === true,
             requestedTimeoutMs: timeout,
+            attachmentLocalCopyOwnerStage: copyOwnerStage,
           },
           () => ({
             sequence: lastStreamSequence,
@@ -1077,8 +1283,15 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
         diagnostics.start();
         const sendOutputCursor = async (
           type: "command_output_ack" | "command_output_resume",
+          // A host that returned may hold output this receiver never saw.
+          requested = false,
         ) => {
-          if (!subscription || settled || !acknowledgedOutput) return;
+          if (
+            !subscription ||
+            settled ||
+            !(acknowledgedOutput || (requested && requestsAcknowledgedOutput))
+          )
+            return;
           // A preceding output ACK may complete after terminal receipt. Only
           // a successfully published terminal cursor can release its receiver.
           const sequence = lastStreamSequence;
@@ -1133,9 +1346,31 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
         let tFirstMessage = 0;
         let cleanupReason: ReceiverCleanupReason | undefined;
 
+        const published: PublishedDesktopCommand = {
+          commandId,
+          // Sequenced frames are accepted only in order, so a received
+          // terminal means every frame before it was received too.
+          outputComplete: () => acknowledgedOutput && terminalReceived,
+          resumeOutput: () => {
+            void sendOutputCursor("command_output_resume", true);
+          },
+        };
+        let unregisterPublished: (() => void) | undefined;
+        const markPublicationStarted = () => {
+          commandPublicationStarted = true;
+          unregisterPublished ??= this.registerPublishedOperation(published);
+        };
+
         const cleanup = (reason: ReceiverCleanupReason) => {
           cleanupReason = reason;
           diagnostics.finish(reason);
+          // Published, but neither a terminal nor a confirmed cancellation
+          // arrived: execution may continue. Stop the run before forgetting
+          // it, so no recovery or later dispatch can proceed past it.
+          if (unregisterPublished && !terminalReceived && reason !== "canceled")
+            gate?.failUncertainExecution?.();
+          unregisterPublished?.();
+          dispatchAbort.abort();
           clearTimeout(acknowledgementTimer);
           // Every terminal path must release Stop callers before clearing the
           // cancellation timers. Confirmed cancellation resolves true first.
@@ -1233,7 +1468,12 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
             diagnostics.transition("cancel_requested");
           }
           if (!publishedCommand || !subscription) {
-            if (commandPublishInFlight) return;
+            if (commandPublishInFlight) {
+              // Still unpublished: end any readiness wait now. Once
+              // publication starts, Stop waits for it and targets the host.
+              if (!commandPublicationStarted) dispatchAbort.abort();
+              return;
+            }
             resolveCanceled();
             return;
           }
@@ -1718,7 +1958,6 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
                 : {}),
             };
 
-            if (!isolated) commandPublicationStarted = true;
             commandPublishInFlight = true;
 
             (async () => {
@@ -1730,13 +1969,22 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
                   commandMessage as unknown as Record<string, unknown>,
                   () => !settled,
                   subscription!,
-                  () => {
-                    commandPublicationStarted = true;
-                  },
+                  markPublicationStarted,
                   diagnostics.dispatchPhase,
                   this.connectionInfo.isDesktop === true,
+                  { gate, signal: dispatchAbort.signal },
                 );
-              } else if (opts?.stdin === undefined) {
+                return;
+              }
+              // The same live admission as isolated dispatch, read in the
+              // tick that starts publication.
+              while (gate && !gate.isReady())
+                await gate.waitUntilReady(dispatchAbort.signal);
+              dispatchAbort.signal.throwIfAborted();
+              if (settled)
+                throw new Error("Command ended before dispatch completed");
+              markPublicationStarted();
+              if (opts?.stdin === undefined) {
                 // Preserve the legacy command shape for local clients that do
                 // not implement transport-fragment reassembly.
                 await subscription!.publish(commandMessage);
@@ -1758,6 +2006,20 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
               })
               .catch((err: unknown) => {
                 commandPublishInFlight = false;
+                if (!settled && !commandPublicationStarted) {
+                  // Nothing reached the host: a pending Stop completes here,
+                  // and a lost selected host keeps its own cause.
+                  if (cancelRequested || opts?.signal?.aborted) {
+                    resolveCanceled();
+                    return;
+                  }
+                  if (err instanceof LocalConnectionLostError) {
+                    settled = true;
+                    cleanup("dispatch_failed");
+                    reject(err);
+                    return;
+                  }
+                }
                 if (
                   !settled &&
                   isolated &&
@@ -1854,19 +2116,25 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
             const msg = ctx.error?.message ?? "unknown";
             const isConnectionLimit =
               msg.includes("connection limit") || ctx.error?.code === 4503;
-            reject(
-              new Error(
-                isConnectionLimit
-                  ? "Centrifugo connection limit reached. The server has too many active connections. Please try again later."
-                  : `Centrifugo client error: ${msg}`,
-              ),
-              isConnectionLimit ||
-                ctx.type === "transport" ||
-                (ctx.type === "connect" &&
-                  (ctx.error.code < 100 ||
-                    ("temporary" in ctx.error &&
-                      ctx.error.temporary === true))),
+            const error = new Error(
+              isConnectionLimit
+                ? "Centrifugo connection limit reached. The server has too many active connections. Please try again later."
+                : `Centrifugo client error: ${msg}`,
             );
+            const retryable =
+              isConnectionLimit ||
+              ctx.type === "transport" ||
+              (ctx.type === "connect" &&
+                (ctx.error.code < 100 ||
+                  ("temporary" in ctx.error && ctx.error.temporary === true)));
+            // Only after the original outcome is settled: descriptor reads can
+            // reach SDK-context traps, so they must not affect it. Closed
+            // values plus the predicate above; never the message.
+            const clientError = readAttachmentCommandReceiverClientError(
+              ctx,
+              isConnectionLimit,
+            );
+            reject(error, retryable, clientError);
           }
         });
 
@@ -1938,13 +2206,14 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
     path: string,
     signal?: AbortSignal,
     nativePaths?: Map<string, string>,
+    copyRole?: LocalCopyRole,
   ): Promise<string> {
     signal?.throwIfAborted();
     if (!this.isWindows()) return path;
     if (
       path.startsWith("/") &&
       !path.startsWith("//") &&
-      (await this.detectShell(signal)) === "bash"
+      (await this.detectShell(signal, copyRole)) === "bash"
     ) {
       const cached = nativePaths?.get(path);
       if (cached !== undefined) return cached;
@@ -1952,7 +2221,10 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
       // Use its installed utility, independent of PATH or project executables.
       const result = await this.runSetupCommand(
         `/usr/bin/cygpath -w -- ${CentrifugoSandbox.escapePath(path)}`,
-        { signal },
+        {
+          signal,
+          copyOwnerStage: copyRole && `${copyRole}_native_path_conversion`,
+        },
       );
       const resolved = result.stdout.replace(/\r?\n$/, "");
       if (
@@ -2072,7 +2344,11 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
    * Probe: `echo $BASH_VERSION` — cmd.exe echoes the literal variable while
    * POSIX shells either expand it (Bash) or emit an empty line (sh/dash/zsh).
    */
-  async detectShell(signal?: AbortSignal): Promise<"bash" | "cmd"> {
+  async detectShell(
+    signal?: AbortSignal,
+    /** Set only by a local copy, to attribute a probe it actually issues. */
+    copyRole?: LocalCopyRole,
+  ): Promise<"bash" | "cmd"> {
     signal?.throwIfAborted();
     if (this.shellKind) return this.shellKind;
     const declaredPlatform = this.connectionInfo.osInfo?.platform;
@@ -2086,6 +2362,7 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
     const probe = await this.runSetupCommand("echo $BASH_VERSION", {
       signal,
       displayName: "",
+      copyOwnerStage: copyRole && "shell_detection",
     });
     if (probe.exitCode !== 0) {
       throw persistenceCommandError("Failed to detect local shell", probe);
@@ -2100,6 +2377,8 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
       displayName?: string;
       timeoutMs?: number;
       signal?: AbortSignal;
+      /** Reused by each attempt; every attempt is its own command. */
+      copyOwnerStage?: AttachmentLocalCopyOwnerStage;
     } = {},
   ): Promise<CommandResult> {
     for (let attempt = 1; attempt <= SETUP_COMMAND_MAX_ATTEMPTS; attempt++) {
@@ -2112,6 +2391,7 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
             timeoutMs: options.timeoutMs ?? SETUP_COMMAND_TIMEOUT_MS,
             displayName: options.displayName ?? "",
           },
+          options.copyOwnerStage,
         );
         options.signal?.throwIfAborted();
         return result;
@@ -2143,11 +2423,14 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
    * returns escaping helpers for paths and arbitrary shell values.
    *
    * Centralizes the branching that used to be duplicated across every
-   * `files.*` method and `ensureDirectory`.
+   * `files.*` method and `ensureDirectory`. A caller-owned `observation`
+   * receives the call last entered; it never affects this context.
    */
   private async shellContext(
     rawPath: string,
     signal?: AbortSignal,
+    observation?: AttachmentDownloadShellContextObservation,
+    copyRole?: LocalCopyRole,
   ): Promise<{
     useBash: boolean;
     path: string;
@@ -2155,12 +2438,16 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
     escapePath: (value: string) => string;
     escapeValue: (value: string) => string;
   }> {
-    const shell = await this.detectShell(signal);
+    if (observation) observation.stage = "detect_shell";
+    const shell = await this.detectShell(signal, copyRole);
     signal?.throwIfAborted();
     const useBash = shell === "bash";
+    if (observation) observation.stage = "native_path_conversion";
     const nativePath = await this.toNativePath(
       this.resolveWorkingPath(rawPath),
       signal,
+      undefined,
+      copyRole,
     );
     const path =
       useBash && this.isWindows()
@@ -2203,8 +2490,9 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
     }
   }
 
-  // Cache for the detected HTTP client.
+  // Cache for the detected HTTP client, and whether a probe found it.
   private httpClient: HttpClient | null = null;
+  private httpClientProbePositive: boolean | undefined;
   private powerShellExecutable: string | undefined;
   private uploadReadDiagnosticStarted = false;
 
@@ -2410,9 +2698,29 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
    * Alpine Linux uses wget by default, most other distros have curl.
    * Windows falls back to PowerShell when curl.exe is unavailable.
    */
-  private async detectHttpClient(signal?: AbortSignal): Promise<HttpClient> {
+  private async detectHttpClient(
+    signal?: AbortSignal,
+    /** Owned by one transfer; set as this call selects, before it returns. */
+    observation?: { selection?: AttachmentClientSelection },
+  ): Promise<HttpClient> {
     signal?.throwIfAborted();
-    if (this.httpClient) return this.httpClient;
+    if (this.httpClient) {
+      // A cache without recorded provenance stays unattributed.
+      if (observation && this.httpClientProbePositive !== undefined)
+        observation.selection = this.httpClientProbePositive
+          ? "cached_probe_positive"
+          : "cached_unverified_default";
+      return this.httpClient;
+    }
+    const select = (client: HttpClient, probePositive: boolean) => {
+      this.httpClient = client;
+      this.httpClientProbePositive = probePositive;
+      if (observation)
+        observation.selection = probePositive
+          ? "current_probe_positive"
+          : "current_unverified_default";
+      return client;
+    };
 
     // Most supported Windows versions bundle curl.exe, but hardened or older
     // installations can omit it. Probe with syntax matching the selected
@@ -2427,13 +2735,11 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
         curlCheck.exitCode === 0 &&
         /curl(?:\.exe)?/i.test(curlCheck.stdout)
       ) {
-        this.httpClient = "curl";
-        return "curl";
+        return select("curl", true);
       }
 
       await this.resolvePowerShellExecutable(signal);
-      this.httpClient = "powershell";
-      return "powershell";
+      return select("powershell", true);
     }
 
     const curlCheck = await this.runSetupCommand("command -v curl || true", {
@@ -2445,8 +2751,7 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
     // can report the destination writable while Snap curl still cannot open
     // that same host path, so prefer the already-supported wget when present.
     if (curlPath && !curlPath.endsWith("/snap/bin/curl")) {
-      this.httpClient = "curl";
-      return "curl";
+      return select("curl", true);
     }
 
     const wgetCheck = await this.runSetupCommand("command -v wget || true", {
@@ -2475,17 +2780,15 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
           }),
         );
       }
-      this.httpClient = "wget";
-      return "wget";
+      return select("wget", true);
     }
 
+    // Snap curl found without wget is still a positive probe.
     if (curlPath) {
-      this.httpClient = "curl";
-      return "curl";
+      return select("curl", true);
     }
 
-    this.httpClient = "curl";
-    return "curl";
+    return select("curl", false);
   }
 
   private static encodePowerShellValue(value: string): string {
@@ -2931,11 +3234,56 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
     copyLocal: async (
       sourceRawPath: string,
       destRawPath: string,
-      options?: { signal?: AbortSignal },
+      options?: {
+        signal?: AbortSignal;
+        /** Absolute epoch ms bounding only read-only shell/path setup. */
+        setupDeadlineAt?: number;
+      },
     ): Promise<void> => {
       options?.signal?.throwIfAborted();
-      const sourceCtx = await this.shellContext(sourceRawPath, options?.signal);
-      const destCtx = await this.shellContext(destRawPath, options?.signal);
+      const deadlineAt = options?.setupDeadlineAt;
+      let setupSignal = options?.signal;
+      let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+      if (deadlineAt !== undefined) {
+        const expired = new AbortController();
+        const expire = () =>
+          expired.abort(new AttachmentLocalCopySetupDeadlineError());
+        const remainingMs = deadlineAt - Date.now();
+        if (remainingMs > 0) deadlineTimer = setTimeout(expire, remainingMs);
+        else expire();
+        // A caller's Stop that is already pending keeps its own reason.
+        setupSignal = options?.signal
+          ? AbortSignal.any([options.signal, expired.signal])
+          : expired.signal;
+      }
+      // The deadline bounds only these read-only shell/path probes. Each
+      // role attributes only the setup commands it actually issues.
+      const [sourceCtx, destCtx] = await (async () => {
+        try {
+          const source = await this.shellContext(
+            sourceRawPath,
+            setupSignal,
+            undefined,
+            "source",
+          );
+          const destination = await this.shellContext(
+            destRawPath,
+            setupSignal,
+            undefined,
+            "destination",
+          );
+          // Never start the write once the setup budget is spent.
+          setupSignal?.throwIfAborted();
+          return [source, destination] as const;
+        } finally {
+          clearTimeout(deadlineTimer);
+        }
+      })();
+      // A resolved probe can resume before an overdue timer callback.
+      options?.signal?.throwIfAborted();
+      if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+        throw new AttachmentLocalCopySetupDeadlineError();
+      }
       const fileName = getSandboxFileName(destCtx.path, this.isWindows());
       const dir = this.parentDir(destCtx.path);
 
@@ -2950,6 +3298,7 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
         ? `cp -f ${sourceCtx.escapePath(sourceCtx.path)} ${destCtx.escapePath(destCtx.path)}`
         : `copy /Y ${sourceCtx.escapePath(sourceCtx.path)} ${destCtx.escapePath(destCtx.path)} >nul`;
 
+      // One combined mutation; never split into separate directory/copy stages.
       const result = await runAttachmentCommand(
         this,
         `${mkdirPart} ${copyPart}`,
@@ -2957,6 +3306,7 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
         {
           displayName: `Preparing: ${fileName}`,
         },
+        "directory_and_copy",
       );
       options?.signal?.throwIfAborted();
       if (result.exitCode !== 0) {
@@ -3051,6 +3401,8 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
       let diagnosticAttempt = 0;
       let resultState: AttachmentDownloadBoundary["resultState"] =
         "not_observed";
+      const shellContextObservation: AttachmentDownloadShellContextObservation =
+        {};
       try {
         const signal = options?.signal;
         signal?.throwIfAborted();
@@ -3062,9 +3414,16 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
         // causing curl to fail with the Windows "invalid filename syntax" error.
         phase = "shell_context";
         const { useBash, path, nativePath, escapePath, escapeValue } =
-          await this.shellContext(rawPath, signal);
+          await this.shellContext(rawPath, signal, shellContextObservation);
         phase = "http_client";
-        const httpClient = await this.detectHttpClient(signal);
+        // This call's own selection; later awaits and concurrent transfers
+        // sharing the adapter cache cannot change it.
+        const clientObservation: { selection?: AttachmentClientSelection } = {};
+        const httpClient = await this.detectHttpClient(
+          signal,
+          clientObservation,
+        );
+        const clientSelection = clientObservation.selection;
         phase = "prepare_command";
         const dir = this.parentDir(path);
         const fileName = getSandboxFileName(path, this.isWindows());
@@ -3086,6 +3445,10 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
             ? `mkdir -p ${escapedDir} &&`
             : `(if not exist ${escapedDir} mkdir ${escapedDir}) &&`;
         let downloadPart: string;
+        // Windows Git Bash only: the body goes to -o, so stdout carries just
+        // this static marker, read only for a terminal curl exit 28 or 23.
+        const curlProgress =
+          httpClient === "curl" && useBash && this.isWindows();
         if (httpClient === "curl") {
           phase = "curl_capabilities";
           const caps = await this.detectCurlCaps(signal);
@@ -3097,6 +3460,7 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
             "--retry-delay 1",
             caps.retryAllErrors ? "--retry-all-errors" : "",
             caps.retryConnrefused ? "--retry-connrefused" : "",
+            curlProgress ? `-w ${escapeValue(CURL_PROGRESS_WRITE_OUT)}` : "",
           ]
             .filter(Boolean)
             .join(" ");
@@ -3259,6 +3623,8 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
                 exitCode: result.exitCode,
                 stderr: result.stderr,
                 directoryProbe,
+                clientSelection,
+                ...(curlProgress && { curlProgressStdout: result.stdout }),
               },
             );
           }
@@ -3270,6 +3636,7 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
           phase,
           attempt: diagnosticAttempt,
           resultState,
+          shellContextStage: shellContextObservation.stage,
         });
         throw error;
       }

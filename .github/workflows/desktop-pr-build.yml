@@ -44,6 +44,7 @@ jobs:
             .github/scripts/prepare-desktop-release.sh \
             '.github/scripts/*universal-dmg.sh' \
             .github/scripts/redact-notary-output.py \
+            .github/scripts/staple-notarization.sh \
             .github/scripts/prefer-ubuntu-apt-mirror.sh > changed-desktop-paths.txt
             if [[ -s changed-desktop-paths.txt ]]; then
               echo 'desktop=true' >> "$GITHUB_OUTPUT"
@@ -60,11 +61,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest
+          # The Rust target selects the output architecture on this Intel host.
+          - platform: macos-15-intel
             target: aarch64-apple-darwin
             name: macOS-arm64
             bundles: app,dmg
-          - platform: macos-latest
+          - platform: macos-15-intel
             target: x86_64-apple-darwin
             name: macOS-x64
             bundles: app,dmg
@@ -95,14 +97,14 @@ jobs:
         with:
           node-version: 20
       - name: Install Rust stable (Linux, Windows)
-        if: matrix.platform != 'macos-latest'
+        if: matrix.platform != 'macos-15-intel'
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           toolchain: stable
           target: ${{ matrix.target }}
           cache: false
       - name: Install Rust stable (macOS - pinned rustup-init)
-        if: matrix.platform == 'macos-latest'
+        if: matrix.platform == 'macos-15-intel'
         shell: bash
         env:
           RUSTUP_VERSION: 1.29.0

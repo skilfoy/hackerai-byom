@@ -75,6 +75,16 @@ export const BROWSER_OPEN_INFO_FLAGS = [
   "help_and_version",
 ] as const;
 
+// Wire code sd1 is the index. That same plain OPEN's own AGENT_BROWSER_SOCKET_DIR
+// declaration, recorded only when its selected socket was missing at return:
+// exactly this root's managed directory, unset/empty, or any other value. Not the
+// value, where the CLI or daemon actually routed, or whether a daemon ran.
+export const BROWSER_OPEN_SOCKET_DIRECTORY_DECLARATIONS = [
+  "managed_directory",
+  "unset_or_empty",
+  "different_directory",
+] as const;
+
 // Wire code k1 is the index. The latest wrapped command's declared first verb
 // token category; not its execution, the daemon's active command or a cause.
 export const BROWSER_WRAPPER_COMMAND_CLASSES = [
@@ -98,6 +108,45 @@ export const BROWSER_DAEMON_VERSION_FILE_STATUSES = [
   "unparsed",
 ] as const;
 
+// Wire tuple l1 codes are the indexes. The selected session's latest returned
+// wrapped CLI process and its wrapper-measured elapsed time: its own when the
+// receipt is COMPLETED, the immediately preceding wrapper's when STARTED. Not a
+// compound shell result, daemon/CDP state or a capture cause.
+export const BROWSER_WRAPPER_RESULTS = [
+  "exit_zero",
+  "exit_nonzero",
+  "signal",
+  "verification_gate",
+] as const;
+export const BROWSER_WRAPPER_RESULT_ELAPSED = [
+  "lt1s",
+  "lt10s",
+  "lt30s",
+  "lt60s",
+  "lt5m",
+  "older",
+] as const;
+
+// Wire code cp1 is the index. Only an opted-in recognize_closed status without
+// owned_port whose selected socket lstat found no entry (exit2 socket_stat
+// missing): the first check of the existing close-proof verification that
+// refused it, in that one call. Absent proof includes older wrappers and closes
+// that earned none; superseded means the selection is no longer the proof's
+// linked private inode; out_of_scope means the root or sockets directory is
+// not owned and private. Not whether a close ran, a cause, or any path, name or
+// inode. Absent is unmeasured (older helper, budget or an unclassified error).
+export const BROWSER_CLOSE_PROOF_FAILURES = [
+  "proof_absent",
+  "proof_invalid",
+  "proof_mismatch",
+  "socket_reappeared",
+  "selection_missing",
+  "selection_superseded",
+  "unreadable",
+  "out_of_scope",
+  "selection_invalid",
+] as const;
+
 export const BROWSER_DAEMON_DEADLINE_PHASES = [
   "connecting",
   "awaiting_response",
@@ -114,6 +163,45 @@ export const BROWSER_DAEMON_RESPONSE_VALIDATIONS = [
   "success_other",
 ] as const;
 
+// Wire tuple s1 code is the index. The screenshot action's success_false error
+// matched against fixed agent-browser literals/prefixes: the upstream message
+// family, not a transport, errno or cause. Never the error text or its suffix.
+export const BROWSER_DAEMON_SCREENSHOT_REFUSALS = [
+  "browser_not_launched",
+  "no_active_page",
+  "decode_failed",
+  "save_failed",
+  "other_or_unavailable",
+] as const;
+
+/**
+ * Opt-in status progress on stderr: only a stream_status request carrying the
+ * internal observe_progress flag writes fixed frames "hp1:<letter>\n", each at
+ * most once and in this order: e entered the helper, c initialized its socket
+ * path with its own 6s deadline armed, w reached the local write-attempt
+ * boundary (not daemon receipt), then the helper-selected disposition (not
+ * actual exit delivery) immediately before its unchanged stdout and exit:
+ * s exit0 (including an open deferral at its deadline), d its own deadline
+ * (exit3), o any other exit. These are the only
+ * complete sequences the helper can write, keyed by their letters. Frames are
+ * dropped under backpressure, so a missing frame was not delivered, not
+ * proven absent.
+ */
+export const BROWSER_DAEMON_PROGRESS_FRAMES = /^(?:hp1:[ecwsdo]\n){0,4}$/;
+export const BROWSER_DAEMON_PROGRESS_SEQUENCES = {
+  "": "none_delivered",
+  e: "entered",
+  ec: "connecting",
+  ecw: "write_attempted",
+  es: "entered_success",
+  eo: "entered_other",
+  ecd: "connecting_deadline",
+  eco: "connecting_other",
+  ecws: "write_success",
+  ecwd: "write_deadline",
+  ecwo: "write_other",
+} as const;
+
 export const BROWSER_DAEMON_PROGRAM = String.raw`
 const fs = require('node:fs');
 const net = require('node:net');
@@ -126,8 +214,51 @@ let done = false;
 let precondition = 'arguments';
 let argumentsValid = false;
 let rootInfo;
+let socketsInfo;
 // Socket progress only: a queued write is not a daemon acknowledgement.
 let deadlinePhase = 'connecting';
+// Only a stream_status request whose selected socket lstat found no entry.
+let statusSocketMissing = false;
+// The selected socket's lstat at start, for listener-queue drift checks.
+let selectedSocketInfo;
+// Only a connected status/screenshot request at its original deadline.
+let queueSnapshot = false;
+// Only an opted-in fresh stream_status (never a screenshot or owned-port lookup).
+let deferOpen = false;
+// Only that opted-in status beside the selected still-running plain OPEN: one bounded
+// sample taken before this helper connects, compared once at its own deadline. Local only.
+let preconnect;
+// Only a recognize_closed screenshot: this guest's wall-clock ms just before its
+// one local write attempt (not daemon receipt). Compared locally, never exported.
+let screenshotWriteAt;
+// Only the internal opted-in status request writes progress frames: constant
+// bytes, never caller data. A write to fd 2 blocks on a full Linux pipe, so
+// frames go only to this helper's own O_NONBLOCK open of that same stderr FIFO;
+// fd 2 and its shared flags stay untouched. A TTY, regular file or socket gets
+// no frames, and a full pipe (EAGAIN), absent reader or any failure drops the
+// frame. Never flushed or awaited, so the helper's schedule is unchanged.
+let progressFd;
+try {
+  const opted = JSON.parse(payload);
+  if (opted?.observe_progress === true && opted.action === 'stream_status' &&
+      process.platform === 'linux' && typeof fs.constants?.O_WRONLY === 'number' &&
+      typeof fs.constants.O_NONBLOCK === 'number') {
+    const target = fs.fstatSync(2);
+    if (target.isFIFO()) {
+      // A nonblocking FIFO open never waits for a reader (ENXIO instead).
+      const fd = fs.openSync('/proc/self/fd/2', fs.constants.O_WRONLY | fs.constants.O_NONBLOCK);
+      const own = fs.fstatSync(fd);
+      if (own.isFIFO() && own.dev === target.dev && own.ino === target.ino) progressFd = fd;
+      else fs.closeSync(fd);
+    }
+  }
+} catch {}
+function mark(letter) {
+  if (progressFd === undefined) return;
+  // Six bytes, under PIPE_BUF: a nonblocking pipe write is whole or EAGAIN, never partial.
+  try { fs.writeSync(progressFd, 'hp1:' + letter + '\n'); } catch {}
+}
+mark('e');
 /** Read only a bounded owned private file; never follow links or block on pipes. */
 function readReceipt(filename) {
   let fd;
@@ -263,6 +394,27 @@ function wrapperProcess(identity) {
       error?.code === 'EACCES' || error?.code === 'EPERM' ? 5 : 6;
   } finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch {} } }
 }
+/** After a queue sample beside a STARTED plain OPEN, reread each bounded receipt once.
+ * True only when both still show that same selected STARTED invocation (action, timestamp,
+ * the wrapper's PID/start identity, the sticky plain flag) and its exact incarnation is
+ * still visible. The wrapper records completion before its process exits, so liveness
+ * alone cannot show the OPEN was still running. These are consistent observations before
+ * and after the sample, not an always-unique timestamp or a cause. Any doubt is false.
+ */
+function openStillStarted(before, sessionKey) {
+  try {
+    const latest = readReceipt('wrapper-receipt.json');
+    const sticky = readReceipt('open-receipt.json');
+    const identity = latest?.process;
+    return validReceipt(latest) && latest.action === 'open' && latest.phase === 'started' &&
+      latest.session_key === sessionKey && latest.at === before.at &&
+      Array.isArray(identity) && Array.isArray(before.process) && identity.length === 3 &&
+      before.process.length === 3 && identity.every((value, index) => value === before.process[index]) &&
+      validReceipt(sticky) && sticky.action === 'open' && sticky.phase === 'started' &&
+      sticky.session_key === sessionKey && sticky.at === before.at && sticky.o1 === 0 &&
+      wrapperProcess(identity) === 3;
+  } catch { return false; }
+}
 /** Return finite observations only; session keys and private paths stay local. */
 function wrapperReceipt() {
   try {
@@ -288,6 +440,12 @@ function wrapperReceipt() {
       result.w1 = wrapperProcess(receipt.process);
     // Declared first-verb category of this latest command; older writers omit it.
     if (Number.isInteger(receipt.k1) && receipt.k1 >= 0 && receipt.k1 <= 7) result.k1 = receipt.k1;
+    // Selected session only: [1, result, elapsed] of its latest returned wrapper.
+    // Older writers omit it; it is unmeasured, never a failure or completion.
+    const last = receipt.lr;
+    if (receipt.session_key === sessionKey && Array.isArray(last) && last.length === 3 && last[0] === 1 &&
+        Number.isInteger(last[1]) && last[1] >= 0 && last[1] <= 3 &&
+        Number.isInteger(last[2]) && last[2] >= 0 && last[2] <= 5) result.l1 = [1, last[1], last[2]];
     const history = receipt.history;
     if (Array.isArray(history) && history.length === 3 && history[0] === 1 &&
         typeof history[1] === 'boolean' && typeof history[2] === 'boolean' &&
@@ -340,8 +498,60 @@ function wrapperReceipt() {
       if (Number.isInteger(open.os1) && open.os1 >= 0 && open.os1 <= 4) result.os1 = open.os1;
       // That OPEN's declared help(1)/version(2) tokens; not its effective result.
       if (Number.isInteger(open.o1) && open.o1 >= 0 && open.o1 <= 3) result.o1 = open.o1;
+      // That plain OPEN's socket-directory declaration, beside this current missing socket only.
+      if (statusSocketMissing && open.os1 === 2 && open.o1 === 0 &&
+          Number.isInteger(open.sd1) && open.sd1 >= 0 && open.sd1 <= 2) result.sd1 = open.sd1;
       const declared = daemonVersionFile();
       if (declared) result.dv = declared;
+      if (queueSnapshot) {
+        const queue = listenerQueue();
+        if (queue) {
+          result.q1 = queueTuple(queue);
+          // e1: an opted-in status's deadline with none pending and at least two held, beside
+          // the selected session's live STARTED other wrapper that declared a plain eval
+          // (k1 6). One reread after the sample must still show that same record and exact
+          // incarnation live; a completed, replaced or foreign receipt omits it. A declaration,
+          // not the daemon's active command, its progress or a cause; never the argument.
+          if (deferOpen && queue.pending === 0 && queue.held.size >= 2 && receipt.action === 'other' &&
+              receipt.phase === 'started' && receipt.session_key === sessionKey && result.w1 === 3 &&
+              receipt.k1 === 6 && receipt.e1 === 1) {
+            try {
+              const latest = readReceipt('wrapper-receipt.json');
+              const identity = latest?.process;
+              if (validReceipt(latest) && latest.action === 'other' && latest.phase === 'started' &&
+                  latest.session_key === sessionKey && latest.at === receipt.at && latest.k1 === 6 &&
+                  latest.e1 === 1 && Array.isArray(identity) && identity.length === 3 &&
+                  identity.every((value, index) => value === receipt.process[index]) &&
+                  wrapperProcess(identity) === 3) result.e1 = 1;
+            } catch {}
+          }
+        }
+      }
+    } else if (queueSnapshot && receipt.action === 'open' && receipt.phase === 'started' &&
+        receipt.session_key === sessionKey && result.w1 === 3 && open?.session_key === sessionKey &&
+        open.phase === 'started' && open.at === receipt.at && open.o1 === 0) {
+      // The selected plain OPEN observed STARTED before and after the sample, never a
+      // cause or navigation. q1 is dropped first at the cap, so the fields scoping it remain.
+      const queue = listenerQueue();
+      if (queue && openStillStarted(receipt, sessionKey)) {
+        result.q1 = queueTuple(queue);
+        // ph1: an opted-in status's sole held connection here, beside at least one pending,
+        // was already held (1) or not (2) at the pre-connect sample. Both samples matched the
+        // selected socket's start lstat and share the daemon PID, listener and this exact
+        // STARTED OPEN invocation. Not which client it is, request acceptance or a cause;
+        // never the inodes. Any unverified sample omits it.
+        const before = preconnect;
+        if (deferOpen && before && queue.held.size === 1 && queue.pending >= 1 &&
+            before.queue.pid === queue.pid && before.queue.listener === queue.listener &&
+            before.receipt.at === receipt.at &&
+            before.receipt.process.every((value, index) => value === receipt.process[index]))
+          result.ph1 = before.queue.held.has([...queue.held][0]) ? 1 : 2;
+        // ot1: that exact OPEN's wrapper STARTED record (truncated ms, same guest clock)
+        // relative to this screenshot's local write attempt: 1 before, 2 after. A tie is
+        // omitted. Not daemon receipt or order, file state or a cause; never the values.
+        if (Number.isSafeInteger(screenshotWriteAt) && receipt.at !== screenshotWriteAt)
+          result.ot1 = receipt.at < screenshotWriteAt ? 1 : 2;
+      }
     }
     return result;
   } catch { return {}; }
@@ -424,19 +634,185 @@ function ownedStreamPort(root, sockets, address) {
   } catch {}
   return 0;
 }
+/** Wire tuple q1 [1, pending, held], each saturated at 15, beside the selected session's
+ * completed successful OPEN or its same still-running plain OPEN wrapper: rows on the selected
+ * path besides its listener, sampled once after the original deadline, before this
+ * helper closes its own connection, so the counts may include it. Pending: an unaccepted
+ * stream connection (flags 0, state 02, no inode). Held: an accepted connection
+ * (flags 0, state 03) whose exact inode the selected daemon PID holds; a client
+ * may already have closed it. Visible sockets only, not request acceptance, the
+ * lock holder, Chromium state or a cause. Requires the same daemon PID to hold the
+ * one selected listener; a bound, other-state, unowned, truncated, slow or drifting
+ * view returns undefined. Returns the local PID, listener inode, pending count and held
+ * inode set; only queueTuple's counts leave. Paths, PIDs, inodes and rows stay local.
+ */
+function listenerQueue(budget = 200000000n) {
+  try {
+    const started = process.hrtime.bigint();
+    const late = () => process.hrtime.bigint() - started > budget;
+    if (process.platform !== 'linux' || typeof fs.constants?.O_NOFOLLOW !== 'number' ||
+        typeof fs.constants.O_NONBLOCK !== 'number' || typeof fs.statfsSync !== 'function' ||
+        [rootInfo, socketsInfo].some(item => !item?.isDirectory() || item.uid !== process.getuid() ||
+          (item.mode & 0o077) !== 0) ||
+        !selectedSocketInfo?.isSocket() || selectedSocketInfo.uid !== process.getuid() ||
+        fs.statfsSync('/proc').type !== 0x9fa0) return;
+    const address = path.join(directory, 'sockets', name + '.sock');
+    const pidPath = path.join(directory, 'sockets', name + '.pid');
+    const pid = ownedInteger(pidPath, 4194304);
+    if (!pid || fs.statSync('/proc/' + pid).uid !== process.getuid()) return;
+    const rows = procTable('/proc/net/unix');
+    if (!rows || late()) return;
+    let listener;
+    let pending = 0;
+    const held = new Set();
+    for (const row of rows) {
+      // The path follows the inode and may contain spaces; only the exact selected path.
+      const match = /^[0-9a-fA-F]+: [0-9A-F]{8} [0-9A-F]{8} ([0-9A-F]{8}) ([0-9A-F]{4}) ([0-9A-F]{2}) +(0|[1-9][0-9]{0,19}) (.*)$/.exec(row);
+      if (match?.[5] !== address) continue;
+      const [, flags, type, state, inode] = match;
+      if (type !== '0001') return;
+      if (flags === '00010000' && state === '01' && inode !== '0' && listener === undefined) listener = inode;
+      else if (flags === '00000000' && state === '02' && inode === '0') pending++;
+      else if (flags === '00000000' && state === '03' && inode !== '0' && !held.has(inode)) held.add(inode);
+      else return;
+    }
+    if (listener === undefined) return;
+    const wanted = new Set([listener, ...held].map(inode => 'socket:[' + inode + ']'));
+    let fds;
+    try {
+      fds = fs.opendirSync('/proc/' + pid + '/fd');
+      for (let count = 0, entry; wanted.size > 0 && count < 256 && (entry = fds.readSync()); count++) {
+        if (!/^[0-9]+$/.test(entry.name) || late()) return;
+        wanted.delete(fs.readlinkSync('/proc/' + pid + '/fd/' + entry.name));
+      }
+    } finally { if (fds) { try { fds.closeSync(); } catch {} } }
+    if (wanted.size > 0) return;
+    // A replaced socket or PID sidecar, or another process owner, is visible drift.
+    const current = fs.lstatSync(address);
+    if (!current.isSocket() || current.uid !== process.getuid() || current.dev !== selectedSocketInfo.dev ||
+        current.ino !== selectedSocketInfo.ino || ownedInteger(pidPath, 4194304) !== pid ||
+        fs.statSync('/proc/' + pid).uid !== process.getuid() || late()) return;
+    return { pid, listener, pending, held };
+  } catch {}
+}
+const queueTuple = queue => [1, Math.min(queue.pending, 15), Math.min(queue.held.size, 15)];
+/** Before connecting, an opted-in status samples the selected daemon's accepted connections
+ * once with the deadline scanner and a 20 ms budget, only between two checks that the selected
+ * session's same plain OPEN is still STARTED with its exact wrapper incarnation live. Keeps
+ * that receipt and the local sample; any doubt or a late sample is undefined. Never exported.
+ */
+function preconnectQueue() {
+  try {
+    const started = process.hrtime.bigint();
+    if (!argumentsValid || !rootInfo?.isDirectory() || rootInfo.uid !== process.getuid() ||
+        (rootInfo.mode & 0o077) !== 0 || typeof fs.constants?.O_NOFOLLOW !== 'number' ||
+        typeof fs.constants.O_NONBLOCK !== 'number') return;
+    const receipt = readReceipt('wrapper-receipt.json');
+    const sessionKey = createHash('sha256').update(name, 'utf8').digest('hex');
+    if (!validReceipt(receipt) || receipt.action !== 'open' || receipt.phase !== 'started' ||
+        receipt.session_key !== sessionKey || receipt.open_receipt_support !== 1 ||
+        !openStillStarted(receipt, sessionKey)) return;
+    const queue = listenerQueue(20000000n);
+    if (queue && openStillStarted(receipt, sessionKey) &&
+        process.hrtime.bigint() - started <= 20000000n) return { queue, receipt };
+  } catch {}
+}
+/** Only the selected session's still-STARTED WAIT whose exact wrapper incarnation
+ * is visible and not a zombie; any missing, other or uncertain observation is false.
+ * Proves no daemon progress, health or freshness.
+ */
+function activeWait() {
+  const wrapper = wrapperReceipt();
+  return wrapper.wrapper_phase === 'started' && wrapper.wrapper_session_matches === true &&
+    wrapper.w1 === 3 && wrapper.k1 === 0;
+}
+/** Only an opted-in status or screenshot request whose selected owned socket is absent: true
+ * when the wrapper's private close proof links to the still-current selection inode for this
+ * exact name. The proof stays pinned by its descriptor, so a replaced proof cannot alias a reused
+ * inode; with it pinned the socket is absent again and the selection is unchanged, so no
+ * later command has started. Never exports the name, path or inode; any doubt is false.
+ * Past the opt-in, a false result also records its first refusing check in closeProofFailure
+ * (a BROWSER_CLOSE_PROOF_FAILURES index) from these same calls; the result is unchanged.
+ */
+let closeProofFailure;
+function sessionClosed() {
+  let fd;
+  // Which check is running, for classifying a thrown error; undefined before the opt-in.
+  let step;
+  const refuse = code => { closeProofFailure = code; return false; };
+  try {
+    const opted = JSON.parse(payload);
+    if (opted?.recognize_closed !== true || !['stream_status', 'screenshot'].includes(opted.action)) return false;
+    step = 'scope';
+    if (!argumentsValid || typeof fs.constants?.O_NOFOLLOW !== 'number' || typeof fs.constants.O_NONBLOCK !== 'number' ||
+        [rootInfo, socketsInfo].some(item => !item?.isDirectory() || item.uid !== process.getuid() ||
+          (item.mode & 0o077) !== 0)) return refuse(7);
+    const uid = BigInt(process.getuid());
+    // BigInt identities: large inode numbers can collide as Numbers.
+    const valid = entry => entry.isFile() && entry.uid === uid && (entry.mode & 0o077n) === 0n &&
+      entry.size >= 1n && entry.size <= 512n;
+    const proofPath = path.join(directory, 'closed-session');
+    step = 'proof';
+    if (!valid(fs.lstatSync(proofPath, { bigint: true }))) return refuse(1);
+    fd = fs.openSync(proofPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    const proof = fs.fstatSync(fd, { bigint: true });
+    if (!valid(proof)) return refuse(1);
+    const bytes = Buffer.alloc(513);
+    const size = fs.readSync(fd, bytes, 0, bytes.length, 0);
+    if (!Buffer.from(name, 'utf8').equals(bytes.subarray(0, size))) return refuse(2);
+    step = 'socket';
+    try {
+      fs.lstatSync(path.join(directory, 'sockets', name + '.sock'));
+      return refuse(3);
+    } catch (error) { if (error?.code !== 'ENOENT') return refuse(6); }
+    step = 'selection';
+    const active = fs.lstatSync(path.join(directory, 'active-session'), { bigint: true });
+    if (!valid(active)) return refuse(8);
+    return active.dev === proof.dev && active.ino === proof.ino ? true : refuse(5);
+  } catch (error) {
+    // A missing proof or selection entry is distinct; any other coded error is unreadable,
+    // and an uncoded one is no distinct fact.
+    try {
+      const code = error?.code;
+      if (step !== undefined && typeof code === 'string')
+        closeProofFailure = code !== 'ENOENT' ? 6 : step === 'proof' ? 0 : step === 'selection' ? 4 : 6;
+    } catch {}
+    return false;
+  } finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch {} } }
+}
 /** Finish with the original daemon status even when optional diagnostics cannot be written. */
 function finish(code, value) {
   if (done) return;
   done = true;
   clearTimeout(timer);
+  // Only the eligible deadline reads receipts before its own connection closes.
+  const early = queueSnapshot ? wrapperReceipt() : undefined;
   if (socket) socket.destroy();
+  // Helper-only literal at this same original deadline, never a wait extension:
+  // an opted-in status awaiting a reply during the selected session's still-running
+  // plain OPEN, with the daemon holding at least one accepted connection besides this
+  // helper's own: two held, or its sole held one proved held before this helper
+  // connected (ph1 1). Any other deadline keeps its unchanged exit3 packet.
+  if (code === 3 && deferOpen && early?.open_phase === 'started' &&
+      (early.q1?.[2] >= 2 || early.ph1 === 1)) {
+    code = 0;
+    value = { open_deferred: 1 };
+  }
   if (code !== 0) {
-    const receipt = wrapperReceipt();
+    const receipt = early ?? wrapperReceipt();
     if (receipt.wrapper_receipt_version === 1) value = { ...value, ...receipt };
     const cli = cliAtPrepare();
     if (cli) value = { ...value, cv: cli };
     // Optional codes never displace existing context at the parser cap; the
     // newest is dropped first.
+    if (value?.cp1 !== undefined && Buffer.byteLength(JSON.stringify(value)) > 544) delete value.cp1;
+    if (value?.e1 !== undefined && Buffer.byteLength(JSON.stringify(value)) > 544) delete value.e1;
+    if (value?.ph1 !== undefined && Buffer.byteLength(JSON.stringify(value)) > 544) delete value.ph1;
+    if (value?.ot1 !== undefined && Buffer.byteLength(JSON.stringify(value)) > 544) delete value.ot1;
+    if (value?.q1 !== undefined && Buffer.byteLength(JSON.stringify(value)) > 544) delete value.q1;
+    if (value?.sd1 !== undefined && Buffer.byteLength(JSON.stringify(value)) > 544) delete value.sd1;
+    if (value?.s1 !== undefined && Buffer.byteLength(JSON.stringify(value)) > 544) delete value.s1;
+    if (value?.l1 !== undefined && Buffer.byteLength(JSON.stringify(value)) > 544) delete value.l1;
     if (value?.o1 !== undefined && Buffer.byteLength(JSON.stringify(value)) > 544) delete value.o1;
     if (value?.r1 !== undefined && Buffer.byteLength(JSON.stringify(value)) > 544) delete value.r1;
     if (value?.dv !== undefined && Buffer.byteLength(JSON.stringify(value)) > 544) delete value.dv;
@@ -444,6 +820,9 @@ function finish(code, value) {
     if (value?.os1 !== undefined && Buffer.byteLength(JSON.stringify(value)) > 544) delete value.os1;
     if (value?.w1 !== undefined && Buffer.byteLength(JSON.stringify(value)) > 544) delete value.w1;
   }
+  // Helper-selected disposition, not actual exit delivery; exit3 is only this
+  // helper's own deadline.
+  mark(code === 0 ? 's' : code === 3 ? 'd' : 'o');
   if (value !== undefined) {
     if (code === 0) process.stdout.write(JSON.stringify(value));
     else { try { process.stdout.write(JSON.stringify(value)); } catch {} }
@@ -462,9 +841,11 @@ try {
   rootInfo = root;
   precondition = 'sockets_stat';
   const sockets = fs.lstatSync(path.join(directory, 'sockets'));
+  socketsInfo = sockets;
   const address = path.join(directory, 'sockets', name + '.sock');
   precondition = 'socket_stat';
   const info = fs.lstatSync(address);
+  selectedSocketInfo = info;
   precondition = 'root_type';
   if (!root.isDirectory()) throw new Error();
   precondition = 'sockets_type';
@@ -474,21 +855,48 @@ try {
   precondition = 'owner_mismatch';
   if ([root, sockets, info].some(item => item.uid !== process.getuid())) throw new Error();
   precondition = 'request_invalid';
-  // The internal opt-in never reaches the daemon.
-  const { owned_port: ownedPort, ...request } = JSON.parse(payload);
+  // The internal opt-ins never reach the daemon.
+  const { owned_port: ownedPort, defer_wait: deferWait, defer_open: deferOpenRequested,
+    recognize_closed: recognizeClosed, observe_progress: _progress, ...request } = JSON.parse(payload);
   if (!['stream_status', 'screenshot', 'viewport'].includes(request.action)) throw new Error();
+  // A screenshot sent during an OPEN can still write its file later, so only status.
+  deferOpen = deferOpenRequested === true && ownedPort === undefined &&
+    request.action === 'stream_status';
   const id = 'hackerai-preview';
+  // Upstream runs WAIT under its daemon state lock, so a queued fresh status or
+  // screenshot request would reach the deadline; a WAIT can start after status
+  // already answered. A fresh passive preview may yield only to the selected
+  // session's exact still-running WAIT wrapper incarnation on a daemon that
+  // provably holds its own listeners; any doubt sends the original strict
+  // request, never the owned-port shortcut.
+  const deferred = deferWait === true && ownedPort === undefined &&
+    ['stream_status', 'screenshot'].includes(request.action) && activeWait() &&
+    ownedStreamPort(root, sockets, address) > 0;
   // A non-fresh preview may skip the serialized daemon queue only with listener proof.
-  const port = ownedPort === true && request.action === 'stream_status' ?
+  const port = !deferred && ownedPort === true && request.action === 'stream_status' ?
     ownedStreamPort(root, sockets, address) : 0;
-  if (port) finish(0, { id, success: true, data: { port } });
+  // Helper-only literal: a daemon reply always carries its own id and success.
+  if (deferred) finish(0, { wait_deferred: 1 });
+  else if (port) finish(0, { id, success: true, data: { port } });
   else {
     let buffer = '';
-    timer = setTimeout(() => finish(3, { deadline: [1, deadlinePhase] }), 6000);
+    timer = setTimeout(() => {
+      // One observation of the connected listener queue; no further daemon traffic.
+      queueSnapshot = deadlinePhase === 'awaiting_response' &&
+        ['stream_status', 'screenshot'].includes(request.action);
+      finish(3, { deadline: [1, deadlinePhase] });
+    }, 6000);
+    // With the unchanged deadline already armed and before any daemon traffic.
+    if (deferOpen) preconnect = preconnectQueue();
     socket = net.createConnection(address);
     socket.setEncoding('utf8');
+    // The socket path is initialized with the 6s deadline already armed.
+    mark('c');
     socket.on('connect', () => {
       deadlinePhase = 'awaiting_response';
+      // Local write-attempt boundary, not daemon receipt.
+      mark('w');
+      if (recognizeClosed === true && request.action === 'screenshot') screenshotWriteAt = Date.now();
       socket.write(JSON.stringify({ ...request, id }) + '\n');
     });
     socket.on('data', chunk => {
@@ -497,37 +905,124 @@ try {
       if (buffer.length > 2 * 1024 * 1024) return finish(4);
       const newline = buffer.indexOf('\n');
       if (newline < 0) return;
-      // Every refusal keeps exit5; r1 records only which check refused it. Only
-      // the parse can throw before finish marks done, so catch remains invalid_json.
+      // Every refusal keeps exit5; r1 records only which check refused it, s1 only
+      // a screenshot error's fixed message family. Only the parse can throw
+      // before finish marks done, so catch remains invalid_json.
       try {
         const response = JSON.parse(buffer.slice(0, newline));
         const refused = response === null || typeof response !== 'object' || Array.isArray(response) ? 1 :
           response.id !== id ? 2 : response.success === false ? 3 : response.success !== true ? 4 : -1;
+        if (refused === 3 && request.action === 'screenshot') {
+          const error = response.error;
+          return finish(5, { r1: [1, 3], s1: [1, typeof error !== 'string' ? 4 :
+            error === 'Browser not launched' ? 0 : error === 'No active page' ? 1 :
+            error.startsWith('Failed to decode screenshot:') ? 2 :
+            error.startsWith('Failed to save screenshot to ') ? 3 : 4] });
+        }
         if (refused >= 0) return finish(5, { r1: [1, refused] });
         finish(0, response);
       } catch { finish(5, { r1: [1, 0] }); }
     });
-    socket.on('error', () => finish(6));
-    socket.on('close', () => { if (!done) finish(6); });
+    // A connection ending without a final reply is never a close by itself. Only an
+    // opted-in status or screenshot whose selected socket is now absent beside the
+    // same verified close proof answers the helper literal; anything else keeps exit6.
+    const dropped = () => {
+      if (done) return;
+      if (sessionClosed()) finish(0, { session_closed: 1 });
+      else finish(6);
+    };
+    socket.on('error', dropped);
+    socket.on('close', dropped);
   }
 } catch (error) {
-  const value = { diagnostic_reason: precondition };
-  if (['root_stat', 'sockets_stat', 'socket_stat'].includes(precondition)) {
-    let code;
-    try { code = Object.getOwnPropertyDescriptor(error, 'code')?.value; } catch {}
-    value.diagnostic_error = code === 'ENOENT' ? 'missing' :
-      code === 'EACCES' || code === 'EPERM' ? 'permission' :
-      code === 'ENOTDIR' ? 'not_directory' : 'other';
+  let code;
+  try { code = Object.getOwnPropertyDescriptor(error, 'code')?.value; } catch {}
+  // Helper-only literal: a daemon reply always carries its own id and success.
+  if (precondition === 'socket_stat' && code === 'ENOENT' && sessionClosed())
+    finish(0, { session_closed: 1 });
+  else {
+    try {
+      statusSocketMissing = precondition === 'socket_stat' && code === 'ENOENT' &&
+        JSON.parse(payload)?.action === 'stream_status';
+    } catch {}
+    const value = { diagnostic_reason: precondition };
+    if (['root_stat', 'sockets_stat', 'socket_stat'].includes(precondition)) {
+      value.diagnostic_error = code === 'ENOENT' ? 'missing' :
+        code === 'EACCES' || code === 'EPERM' ? 'permission' :
+        code === 'ENOTDIR' ? 'not_directory' : 'other';
+    }
+    // That same refused close-proof check, for an opted-in status without owned_port only.
+    try {
+      if (statusSocketMissing && closeProofFailure !== undefined &&
+          JSON.parse(payload)?.owned_port === undefined) value.cp1 = closeProofFailure;
+    } catch {}
+    finish(2, value);
   }
-  finish(2, value);
 }
 `;
+
+/**
+ * The helper's exact exit-0 output when a defer_wait status or screenshot
+ * request yielded to the selected session's verified active WAIT without any
+ * daemon traffic. A daemon reply always includes its own id and success, so it
+ * can never equal this literal.
+ */
+export const BROWSER_DAEMON_WAIT_DEFERRED = '{"wait_deferred":1}';
+
+/**
+ * The helper's exact exit-0 output when a defer_open status request reached its
+ * unchanged original deadline awaiting a response while the selected session's
+ * plain OPEN was still STARTED (same live wrapper incarnation before and after
+ * the owned listener sample) and that daemon held at least two accepted
+ * connections, or its sole held one beside a pending connection was already
+ * held at the same OPEN's pre-connect sample. A daemon reply can never equal
+ * this literal.
+ */
+export const BROWSER_DAEMON_OPEN_DEFERRED = '{"open_deferred":1}';
+
+/**
+ * The helper's exact exit-0 output when a recognize_closed status or screenshot
+ * request found the selected owned socket absent after the wrapper's verified
+ * close of that still-current selection, either before connecting or when its
+ * connection ends without a final reply. A daemon reply can never equal this
+ * literal.
+ */
+export const BROWSER_DAEMON_SESSION_CLOSED = '{"session_closed":1}';
 
 type BrowserDaemonRequest =
   // owned_port lets the helper prove the port from the daemon's own listeners;
   // the helper strips it and falls back to this same daemon request otherwise.
-  | { action: "stream_status"; owned_port?: true }
-  | { action: "screenshot"; path: string; format: "jpeg"; quality: 65 }
+  // recognize_closed (either status form) only lets an absent socket with a
+  // verified close answer; the helper strips it before any daemon traffic.
+  // observe_progress (either status form) only adds stderr progress frames;
+  // the helper strips it before any daemon traffic.
+  | {
+      action: "stream_status";
+      owned_port?: true;
+      recognize_closed?: true;
+      observe_progress?: true;
+    }
+  // defer_wait lets a fresh passive preview yield to a verified active WAIT;
+  // defer_open lets its deadline report a verified still-running plain OPEN,
+  // and adds one local pre-connect queue sample beside it for an exit3 code.
+  // The helper strips both and sends this same strict request otherwise.
+  | {
+      action: "stream_status";
+      defer_wait?: true;
+      defer_open?: true;
+      recognize_closed?: true;
+      observe_progress?: true;
+    }
+  // defer_wait and recognize_closed have the same meanings for a fresh passive
+  // preview's screenshot; both are stripped before any daemon traffic.
+  | {
+      action: "screenshot";
+      path: string;
+      format: "jpeg";
+      quality: 65;
+      defer_wait?: true;
+      recognize_closed?: true;
+    }
   | {
       action: "viewport";
       width: number;

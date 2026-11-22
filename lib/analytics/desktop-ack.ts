@@ -18,6 +18,8 @@ import {
   readNativeAuthorizationIo,
   readNativeAuthorizationMitigation,
   readNativeAuthorizationResponse,
+  readNativeAuthorizationResponseRead,
+  readNativeAuthorizationResponseReadTiming,
   readNativeAuthorizationTransport,
   type NativeAuthorizationCauseDiagnostic,
   type NativeAuthorizationConnectorDiagnostic,
@@ -25,12 +27,28 @@ import {
   type NativeAuthorizationIoDiagnostic,
   type NativeAuthorizationMitigationDiagnostic,
   type NativeAuthorizationResponseDiagnostic,
+  type NativeAuthorizationResponseReadDiagnostic,
+  type NativeAuthorizationResponseReadTimingDiagnostic,
   type NativeAuthorizationTransportDiagnostic,
 } from "./native-authorization-diagnostics";
 import {
   readDesktopTerminalErrorDiagnostic,
   type DesktopTerminalErrorDiagnostic,
 } from "./desktop-terminal-error-diagnostics";
+import {
+  readDesktopInvocationAdmissionDiagnostic,
+  readDesktopInvocationRejectionDiagnostic,
+  readDesktopInvocationSpawnHintDiagnostic,
+  readDesktopInvocationUnknownDiagnostic,
+  readDesktopStreamFenceDiagnostic,
+  readDesktopStreamFenceRendererCancelDiagnostic,
+  type DesktopInvocationAdmissionDiagnostic,
+  type DesktopInvocationRejectionDiagnostic,
+  type DesktopInvocationSpawnHintDiagnostic,
+  type DesktopInvocationUnknownDiagnostic,
+  type DesktopStreamFenceDiagnostic,
+  type DesktopStreamFenceRendererCancelDiagnostic,
+} from "./desktop-invocation-rejection-diagnostics";
 
 interface DesktopAckContext {
   connectionId: string | null;
@@ -57,8 +75,35 @@ type DesktopAckSettlement = Readonly<AcknowledgedCommandSettlement> & {
   nativeAuthorizationResponse?: NativeAuthorizationResponseDiagnostic;
   /** Same response's mitigation marker; only joined to a valid response. */
   nativeAuthorizationMitigation?: NativeAuthorizationMitigationDiagnostic;
+  /** Same response's failed JSON read; only joined to a valid `json_error`
+   * response. */
+  nativeAuthorizationResponseRead?: NativeAuthorizationResponseReadDiagnostic;
+  /** Same read timeout's timing; only joined to a valid `timeout` read, its
+   * 2xx `json_error` response and an `authorization_response_invalid`
+   * rejection class. */
+  nativeAuthorizationResponseReadTiming?: NativeAuthorizationResponseReadTimingDiagnostic;
   /** Same invocation's first terminal error source; only for a terminal error. */
   terminalError?: DesktopTerminalErrorDiagnostic;
+  /** The same invocation's rejection message class; only joined to a valid
+   * `invocation_rejected` terminal error kind. */
+  invocationRejection?: DesktopInvocationRejectionDiagnostic;
+  /** The same message's admission class; only joined to a valid
+   * `execution_admission` rejection class. */
+  invocationAdmission?: DesktopInvocationAdmissionDiagnostic;
+  /** The same message's OS code hint; only joined to a valid `spawn_failed`
+   * rejection class from a selected native command set. */
+  invocationSpawnHint?: DesktopInvocationSpawnHintDiagnostic;
+  /** The same message's closed unknown class; only joined to a valid
+   * `unknown` rejection class from the authorized command set. */
+  invocationUnknown?: DesktopInvocationUnknownDiagnostic;
+  /** The native stream fence's first origin; only joined to a valid
+   * authorized `lifecycle_stop_unconfirmed` unknown class. Its cleanup
+   * failure is reported only for `owner_stop_requested` on an acknowledged
+   * terminal. Beside its `cancel_ipc` stop request source, a runless
+   * command's renderer cancel attempt pair rides the same carrier. A Darwin
+   * stop's source and final group probe ride it only beside `tree_unconfirmed`. */
+  streamFence?: DesktopStreamFenceDiagnostic &
+    Partial<DesktopStreamFenceRendererCancelDiagnostic>;
 };
 
 const emptyCounts = () => ({
@@ -315,10 +360,58 @@ export class DesktopAckTelemetry {
             result.nativeAuthorizationMitigation,
           )
         : null;
+      const nativeAuthorizationResponseRead =
+        readNativeAuthorizationResponseRead(
+          result.nativeAuthorizationResponseRead,
+          nativeAuthorizationResponse,
+        );
       const terminalError =
         result.terminalType === "error"
           ? readDesktopTerminalErrorDiagnostic(result.terminalError)
           : null;
+      const invocationRejection =
+        terminalError?.desktop_terminal_error_kind === "invocation_rejected"
+          ? readDesktopInvocationRejectionDiagnostic(result.invocationRejection)
+          : null;
+      const nativeAuthorizationResponseReadTiming =
+        readNativeAuthorizationResponseReadTiming(
+          result.nativeAuthorizationResponseReadTiming,
+          nativeAuthorizationResponse,
+          nativeAuthorizationResponseRead,
+          invocationRejection,
+        );
+      const invocationAdmission = readDesktopInvocationAdmissionDiagnostic(
+        result.invocationAdmission,
+        invocationRejection,
+      );
+      const invocationSpawnHint = readDesktopInvocationSpawnHintDiagnostic(
+        result.invocationSpawnHint,
+        invocationRejection,
+      );
+      const invocationUnknown = readDesktopInvocationUnknownDiagnostic(
+        result.invocationUnknown,
+        invocationRejection,
+      );
+      // The acknowledged terminal admits cleanup for a stop or owner timeout.
+      // A tree-only failure can add its Windows taskkill result. Only an
+      // explicit stop can add its first request source, beside a not-found
+      // report, or, exclusively without any Windows property, Darwin's stop
+      // source and final group probe beside its tree-only failure. A
+      // cancellation-wait timeout may instead add the owner phase.
+      const streamFence = readDesktopStreamFenceDiagnostic(
+        result.streamFence,
+        invocationRejection,
+        invocationUnknown,
+        result.terminalAcknowledged === true,
+      );
+      // Only beside that validated `cancel_ipc` source of a command without
+      // any run ID representation, valid or not.
+      const streamFenceRendererCancel =
+        readDesktopStreamFenceRendererCancelDiagnostic(
+          result.streamFence,
+          streamFence,
+          context.triggerRunId === undefined,
+        );
       this.capture(
         "desktop_ack_command_settled",
         {
@@ -359,7 +452,15 @@ export class DesktopAckTelemetry {
           ...nativeAuthorizationConnector,
           ...nativeAuthorizationResponse,
           ...nativeAuthorizationMitigation,
+          ...nativeAuthorizationResponseRead,
+          ...nativeAuthorizationResponseReadTiming,
           ...terminalError,
+          ...invocationRejection,
+          ...invocationAdmission,
+          ...invocationSpawnHint,
+          ...invocationUnknown,
+          ...streamFence,
+          ...streamFenceRendererCancel,
         },
         dedupeKey,
       );

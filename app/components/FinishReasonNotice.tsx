@@ -2,6 +2,11 @@ import type { LimitRescueRequest } from "@/types/chat";
 import { useId, useRef, useState } from "react";
 import { toast } from "sonner";
 import { LOCAL_CONNECTION_LOST_FINISH_REASON } from "@/lib/chat/local-connection-stop";
+import {
+  BROWSER_HANDOFF_ABANDONED_FINISH_REASON,
+  requiresManualAgentResume,
+  type ManualAgentResumeFinishReason,
+} from "@/lib/chat/manual-agent-resume";
 import type { ChatStatus } from "@/types";
 import { ChatMode } from "@/types/chat";
 import { useDataStreamState } from "@/app/components/DataStreamProvider";
@@ -18,11 +23,37 @@ import {
 import type { SelectedModel } from "@/types/chat";
 import { BudgetExhaustedNotice } from "./BudgetExhaustedNotice";
 
+// Each stop needs a person to resume it; the detail names what may not have
+// survived. Streamed output can appear before its server save completes.
+const MANUAL_RESUME_NOTICE_COPY: Record<
+  ManualAgentResumeFinishReason,
+  { reason: string; detail: string }
+> = {
+  [LOCAL_CONNECTION_LOST_FINISH_REASON]: {
+    reason: "Run stopped: lost connection to the selected computer.",
+    detail: "A command that was running may not have finished.",
+  },
+  [BROWSER_HANDOFF_ABANDONED_FINISH_REASON]: {
+    reason: "Browser handoff ended before the Agent continued.",
+    detail: "Browser actions, like signing in, may need to be repeated.",
+  },
+};
+
+type LastSavedStep = "request" | "agent-progress" | "conversation";
+
+const LAST_SAVED_STEP_COPY: Record<LastSavedStep, string> = {
+  request:
+    "Last visible: your request above. No Agent result is shown for this turn.",
+  "agent-progress": "Last visible: Agent progress shown above.",
+  conversation: "Last visible: the conversation shown above.",
+};
+
 interface FinishReasonNoticeProps {
   finishReason?: string;
   continueDisabledReason?: string;
   status?: ChatStatus;
   mode?: ChatMode;
+  lastSavedStep?: LastSavedStep;
   agentRunSpendCapPremiumContinuationAllowed?: boolean;
   onContinue?: (
     selectedModelOverride?: SelectedModel,
@@ -36,6 +67,7 @@ export const FinishReasonNotice = ({
   onContinue,
   continueDisabledReason,
   status,
+  lastSavedStep = "conversation",
 }: FinishReasonNoticeProps) => {
   const { isAutoResuming, isAutoContinuing } = useDataStreamState();
   const pendingRef = useRef(false);
@@ -61,8 +93,9 @@ export const FinishReasonNotice = ({
 
   if (!finishReason) return null;
 
-  if (finishReason === LOCAL_CONNECTION_LOST_FINISH_REASON) {
+  if (requiresManualAgentResume(finishReason)) {
     if (status === "streaming") return null;
+    const copy = MANUAL_RESUME_NOTICE_COPY[finishReason];
     const disabledReason =
       continueDisabledReason ||
       (mode === "ask" ? "Switch to Agent to resume." : undefined);
@@ -71,12 +104,10 @@ export const FinishReasonNotice = ({
       <div className="mt-2 w-full" role="status" aria-live="polite">
         <div className="bg-muted text-muted-foreground rounded-lg px-3 py-2 border border-border flex items-center justify-between gap-3 flex-wrap">
           <div className="min-w-0 flex-1 basis-60">
-            <p>
-              The connection to your computer was lost, so this run stopped.
-            </p>
-            <p className="mt-1 text-sm">
-              Saved progress is available. A command that was running may not
-              have finished.
+            <p className="font-medium text-foreground">{copy.reason}</p>
+            <p className="mt-0.5 text-sm">
+              {LAST_SAVED_STEP_COPY[lastSavedStep]} Only work still visible
+              after reload is confirmed saved. {copy.detail}
             </p>
             {disabledReason && (
               <p id={disabledReasonId} className="mt-1 text-sm text-foreground">

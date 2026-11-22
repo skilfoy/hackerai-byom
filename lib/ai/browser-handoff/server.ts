@@ -1,7 +1,13 @@
 import "server-only";
 import { createHash, randomBytes } from "node:crypto";
 
-import { CommandExitError, Sandbox, TimeoutError } from "@e2b/code-interpreter";
+import {
+  CommandExitError,
+  Sandbox,
+  TimeoutError,
+  type CommandHandle,
+  type CommandResult,
+} from "@e2b/code-interpreter";
 import type { TriggerRunRegion } from "@/lib/api/trigger-region";
 import { getE2BClusterRouting } from "@/lib/ai/tools/utils/e2b-cluster";
 import { browserSessionCommand } from "@/lib/ai/tools/utils/browser-session-program";
@@ -21,12 +27,22 @@ import {
   BROWSER_OPEN_IDLE_ENV_VALUES,
   BROWSER_DAEMON_DEADLINE_PHASES,
   BROWSER_DAEMON_RESPONSE_VALIDATIONS,
+  BROWSER_DAEMON_SCREENSHOT_REFUSALS,
   BROWSER_CLI_AT_PREPARE_STATUSES,
   BROWSER_WRAPPER_PROCESS_VISIBILITIES,
   BROWSER_OPEN_SOCKET_RETURN_STATUSES,
   BROWSER_OPEN_INFO_FLAGS,
+  BROWSER_OPEN_SOCKET_DIRECTORY_DECLARATIONS,
   BROWSER_WRAPPER_COMMAND_CLASSES,
+  BROWSER_WRAPPER_RESULTS,
+  BROWSER_WRAPPER_RESULT_ELAPSED,
   BROWSER_DAEMON_VERSION_FILE_STATUSES,
+  BROWSER_CLOSE_PROOF_FAILURES,
+  BROWSER_DAEMON_WAIT_DEFERRED,
+  BROWSER_DAEMON_OPEN_DEFERRED,
+  BROWSER_DAEMON_SESSION_CLOSED,
+  BROWSER_DAEMON_PROGRESS_FRAMES,
+  BROWSER_DAEMON_PROGRESS_SEQUENCES,
 } from "./daemon-program";
 import {
   browserRelayProgram,
@@ -50,6 +66,19 @@ export type BrowserSessionLocation = {
 export class BrowserPreviewUnavailable extends Error {
   constructor(readonly state: "loading" | "disconnected" | "closed") {
     super(`Browser preview ${state}`);
+  }
+}
+
+/**
+ * An opted-in fresh capture yielded to the selected session's verified active
+ * WAIT, or its status lookup reached the original deadline behind a verified
+ * still-running plain OPEN (reason "open"). Carries no frame, freshness or
+ * failure context; only the opted-in passive GET may present it, and nothing
+ * else should treat it as a capture.
+ */
+export class BrowserPreviewRefreshDeferred extends Error {
+  constructor(readonly reason: "wait" | "open" = "wait") {
+    super("Browser preview refresh deferred");
   }
 }
 
@@ -116,6 +145,18 @@ export function browserRelayRenewFailureContext(error: unknown) {
 }
 
 const returnedRelayStopExits = new WeakMap<object, number | "other">();
+/** The daemon helper's closed exit3 deadline tuple; any other shape is unmeasured. */
+const daemonDeadlinePhase = (parsed: unknown) => {
+  const deadline = (parsed as { deadline?: unknown } | null | undefined)
+    ?.deadline;
+  return Array.isArray(deadline) &&
+    deadline.length === 2 &&
+    deadline[0] === 1 &&
+    BROWSER_DAEMON_DEADLINE_PHASES.includes(deadline[1])
+    ? (deadline[1] as (typeof BROWSER_DAEMON_DEADLINE_PHASES)[number])
+    : undefined;
+};
+
 const exitStatus = (value: unknown) =>
   typeof value === "number" &&
   Number.isInteger(value) &&
@@ -226,7 +267,10 @@ function relayStopReceipt(
 }
 
 /** Read an own data property of a result; anything else throws to the caller. */
-function ownResultValue(result: unknown, key: "exitCode" | "stdout") {
+function ownResultValue(
+  result: unknown,
+  key: "exitCode" | "stdout" | "stderr",
+) {
   if (typeof result !== "object" || result === null)
     throw new TypeError("Unreadable command result");
   const descriptor = Object.getOwnPropertyDescriptor(result, key);
@@ -344,6 +388,29 @@ export function browserSessionReadFailureContext(error: unknown) {
 
 const SESSION_NAME_RE = /^[^/\u0000\r\n]{1,80}$/;
 
+type SandboxIdentityGuardReason =
+  "not_running" | "user_mismatch" | "cluster_mismatch" | "template_mismatch";
+
+// Keyed only by the identity guard's own rejection; holds the closed reason,
+// never the compared metadata or the session's identifiers.
+const sandboxIdentityGuardFailures = new WeakMap<
+  object,
+  SandboxIdentityGuardReason
+>();
+
+/** The first identity guard that refused this rejection, else nothing; never throws. */
+export function browserSandboxIdentityFailureContext(error: unknown) {
+  const reason =
+    typeof error === "object" && error !== null
+      ? sandboxIdentityGuardFailures.get(error)
+      : undefined;
+  if (reason === undefined) return undefined;
+  return {
+    sandbox_identity_guard_version: 1,
+    sandbox_identity_guard_reason: reason,
+  } as const;
+}
+
 /** Connect only to the exact running, user-owned cloud workspace. */
 export async function connectBrowserSandbox(session: BrowserSessionLocation) {
   const region = session.triggerRegion as TriggerRunRegion | null;
@@ -359,17 +426,25 @@ export async function connectBrowserSandbox(session: BrowserSessionLocation) {
     console.warn("[browser-preview] sandbox lookup unavailable");
     throw new BrowserPreviewUnavailable("disconnected");
   }
-  if (
-    info.state !== "running" ||
-    info.metadata?.userID !== session.userId ||
-    // Older reusable sandboxes predate cluster metadata. The selected E2B
-    // account and endpoint still bind discovery to the intended region.
-    (info.metadata?.e2bCluster != null &&
-      info.metadata.e2bCluster !== cluster.cluster) ||
-    info.metadata?.template !== cluster.template
-  ) {
+  // The first failing guard in the original short-circuit order, with the same reads.
+  const mismatch: SandboxIdentityGuardReason | undefined =
+    info.state !== "running"
+      ? "not_running"
+      : info.metadata?.userID !== session.userId
+        ? "user_mismatch"
+        : // Older reusable sandboxes predate cluster metadata. The selected E2B
+          // account and endpoint still bind discovery to the intended region.
+          info.metadata?.e2bCluster != null &&
+            info.metadata.e2bCluster !== cluster.cluster
+          ? "cluster_mismatch"
+          : info.metadata?.template !== cluster.template
+            ? "template_mismatch"
+            : undefined;
+  if (mismatch !== undefined) {
     console.warn("[browser-preview] sandbox identity mismatch");
-    throw new BrowserPreviewUnavailable("disconnected");
+    const unavailable = new BrowserPreviewUnavailable("disconnected");
+    sandboxIdentityGuardFailures.set(unavailable, mismatch);
+    throw unavailable;
   }
   return Sandbox.connect(session.sandboxId, {
     ...options,
@@ -402,30 +477,190 @@ export async function getActiveBrowserSessionName(
 }
 
 /**
+ * A rejected status command: the SDK returned no process-start handle (start),
+ * or returned one whose wait then failed (wait). Acknowledgement latency is not
+ * spawn time, and neither phase identifies a provider or daemon cause.
+ */
+type StatusCommandRejection = {
+  error: unknown;
+  phase: "start" | "wait";
+  startAckMs?: number;
+  progress?: StatusWaitProgress;
+};
+
+type StatusProgressLabel =
+  | (typeof BROWSER_DAEMON_PROGRESS_SEQUENCES)[keyof typeof BROWSER_DAEMON_PROGRESS_SEQUENCES]
+  | "unrecognized"
+  | "unreadable";
+type StatusElapsedLabel =
+  "lt1s" | "lt3s" | "lt6s" | "lt7s" | "gte7s" | "unmeasured";
+type StatusWaitProgress = `${StatusProgressLabel}:${StatusElapsedLabel}`;
+
+const monotonicNow = () => {
+  try {
+    return performance.now();
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * The opted-in helper's delivered progress before this handle's wait rejected,
+ * plus coarse total elapsed from before the start request to that rejection
+ * (not acknowledgement, daemon or exit time). Only an exact complete frame
+ * sequence counts; output is never retained, and nothing proves undelivered
+ * frames were not written. Never throws.
+ */
+function statusWaitProgress(
+  readStderr: () => unknown,
+  startedAt: number | undefined,
+  rejectedAt: number | undefined,
+): StatusWaitProgress {
+  let label: StatusProgressLabel = "unreadable";
+  try {
+    const stderr = readStderr();
+    if (typeof stderr === "string") {
+      label = "unrecognized";
+      // At most four six-character frames; never match against longer output.
+      if (stderr.length <= 24 && BROWSER_DAEMON_PROGRESS_FRAMES.test(stderr)) {
+        let letters = "";
+        for (let index = 4; index < stderr.length; index += 6)
+          letters += stderr[index];
+        if (Object.hasOwn(BROWSER_DAEMON_PROGRESS_SEQUENCES, letters))
+          label =
+            BROWSER_DAEMON_PROGRESS_SEQUENCES[
+              letters as keyof typeof BROWSER_DAEMON_PROGRESS_SEQUENCES
+            ];
+      }
+    }
+  } catch {
+    label = "unreadable";
+  }
+  const elapsed =
+    typeof startedAt === "number" && typeof rejectedAt === "number"
+      ? rejectedAt - startedAt
+      : Number.NaN;
+  return `${label}:${
+    !Number.isFinite(elapsed) || elapsed < 0
+      ? "unmeasured"
+      : elapsed < 1_000
+        ? "lt1s"
+        : elapsed < 3_000
+          ? "lt3s"
+          : elapsed < 6_000
+            ? "lt6s"
+            : elapsed < 7_000
+              ? "lt7s"
+              : "gte7s"
+  }`;
+}
+
+/**
  * Only a non-fresh preview passes ownedListener: the helper may then return a
  * port its daemon provably listens on without waiting behind serialized daemon
- * work, and otherwise sends this same status request.
+ * work, and otherwise sends this same status request. Only a fresh passive
+ * preview may request WAIT or OPEN deferral. The helper's corresponding
+ * literal rejects with BrowserPreviewRefreshDeferred.
+ * Independently, only the Browser Preview GET passes recognizeClosed: an absent
+ * owned socket with the wrapper's verified close of the still-current selection
+ * then rejects with the existing closed state instead of the missing-socket exit.
+ * Only that GET also passes observeProgress with onRejected: the helper then
+ * writes fixed stderr progress frames, read only after this handle's wait
+ * rejects without an exit.
  */
 export async function getPrivateStreamPort(
   sandbox: Sandbox,
   session: BrowserSessionLocation,
   browserSessionName: string,
   ownedListener = false,
+  onRejected?: (rejection: StatusCommandRejection) => void,
+  deferDuringWait = false,
+  recognizeClosed = false,
+  observeProgress = false,
+  deferDuringOpen = false,
 ) {
-  const result = await sandbox.commands.run(
-    browserDaemonCommand(
-      session.directory,
-      browserSessionName,
-      ownedListener
-        ? { action: "stream_status", owned_port: true }
-        : { action: "stream_status" },
-    ),
-    {
-      ...buildSandboxCommandOptions(sandbox),
-      timeoutMs: 7_000,
-    },
+  const observed = observeProgress && onRejected !== undefined;
+  const closed: { recognize_closed?: true; observe_progress?: true } = {
+    ...(recognizeClosed && { recognize_closed: true }),
+    ...(observed && { observe_progress: true }),
+  };
+  const deferOpen = deferDuringOpen && !ownedListener;
+  const command = browserDaemonCommand(
+    session.directory,
+    browserSessionName,
+    ownedListener
+      ? { action: "stream_status", owned_port: true, ...closed }
+      : {
+          action: "stream_status",
+          ...(deferDuringWait && { defer_wait: true as const }),
+          ...(deferOpen && { defer_open: true as const }),
+          ...closed,
+        },
   );
+  const options = { ...buildSandboxCommandOptions(sandbox), timeoutMs: 7_000 };
+  let result: CommandResult;
+  if (!onRejected) result = await sandbox.commands.run(command, options);
+  else {
+    // The SDK's foreground run is exactly this start then the same handle's
+    // wait: one request, deadline, handshake timer and signal, no new timer.
+    const report = (rejection: StatusCommandRejection) => {
+      try {
+        onRejected(rejection);
+      } catch {
+        /* Observers cannot replace the SDK rejection. */
+      }
+    };
+    const startedAt = monotonicNow();
+    let handle: CommandHandle;
+    try {
+      handle = await sandbox.commands.run(command, {
+        ...options,
+        background: true,
+      });
+    } catch (error) {
+      report({ error, phase: "start" });
+      throw error;
+    }
+    const acknowledgedAt = monotonicNow();
+    try {
+      result = await handle.wait();
+    } catch (error) {
+      let progress: StatusWaitProgress | undefined;
+      try {
+        // A delivered exit is authoritative; only an SDK-only rejection.
+        if (observed && !(error instanceof CommandExitError))
+          progress = statusWaitProgress(
+            () => handle.stderr,
+            startedAt,
+            monotonicNow(),
+          );
+      } catch {
+        /* Optional progress cannot replace the SDK rejection. */
+      }
+      report({
+        error,
+        phase: "wait",
+        ...(typeof startedAt === "number" &&
+          typeof acknowledgedAt === "number" && {
+            startAckMs: acknowledgedAt - startedAt,
+          }),
+        ...(progress !== undefined && { progress }),
+      });
+      throw error;
+    }
+  }
   if (result.exitCode !== 0) throw new BrowserPreviewUnavailable("closed");
+  // Only the requested helper-only literals; never a parsed daemon reply field.
+  if (recognizeClosed && result.stdout === BROWSER_DAEMON_SESSION_CLOSED)
+    throw new BrowserPreviewUnavailable("closed");
+  if (
+    deferDuringWait &&
+    !ownedListener &&
+    result.stdout === BROWSER_DAEMON_WAIT_DEFERRED
+  )
+    throw new BrowserPreviewRefreshDeferred();
+  if (deferOpen && result.stdout === BROWSER_DAEMON_OPEN_DEFERRED)
+    throw new BrowserPreviewRefreshDeferred("open");
   let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(result.stdout) as Record<string, unknown>;
@@ -659,6 +894,10 @@ export type BrowserCaptureFailureContext = FrameCaptureDiagnostic & {
   // Absent means unmeasured (older writer or budget).
   capture_response_diagnostic_version?: 1;
   capture_response_validation?: (typeof BROWSER_DAEMON_RESPONSE_VALIDATIONS)[number];
+  // Fresh screenshot success_false only: the error's fixed upstream message
+  // family, not a transport, errno or cause. Absent means unmeasured.
+  capture_screenshot_refusal_version?: 1;
+  capture_screenshot_refusal?: (typeof BROWSER_DAEMON_SCREENSHOT_REFUSALS)[number];
   capture_cli_at_prepare_diagnostic_version?: 1;
   capture_cli_at_prepare_status?: (typeof BROWSER_CLI_AT_PREPARE_STATUSES)[number];
   capture_cli_at_prepare_major?: number;
@@ -677,6 +916,15 @@ export type BrowserCaptureFailureContext = FrameCaptureDiagnostic & {
   // command or a cause. Absent means unmeasured (older writer or budget).
   capture_wrapper_command_version?: 1;
   capture_wrapper_command_class?: (typeof BROWSER_WRAPPER_COMMAND_CLASSES)[number];
+  // Selected session only: its latest returned wrapped CLI process (the receipt's
+  // own wrapper when COMPLETED, the immediately preceding one when STARTED) and its
+  // wrapper-measured elapsed bucket. Not a compound shell result, daemon/CDP state
+  // or capture cause. Absent means unmeasured (older writer, budget, or a preceding
+  // wrapper that ended without a completion record or for another session).
+  capture_wrapper_result_version?: 1;
+  capture_wrapper_result_scope?: "latest_wrapper" | "previous_wrapper";
+  capture_wrapper_result?: (typeof BROWSER_WRAPPER_RESULTS)[number];
+  capture_wrapper_result_elapsed?: (typeof BROWSER_WRAPPER_RESULT_ELAPSED)[number];
   capture_wrapper_history_version?: 1;
   capture_wrapper_history_scope?: "handoff_root";
   // Other than a recognized version-only invocation; leading options stay ambiguous.
@@ -709,6 +957,10 @@ export type BrowserCaptureFailureContext = FrameCaptureDiagnostic & {
   // its effective CLI result or daemon state. Absent means unmeasured, never none.
   capture_open_info_version?: 1;
   capture_open_info_flags?: (typeof BROWSER_OPEN_INFO_FLAGS)[number];
+  // Status exit2 socket_stat missing only, beside that matching OPEN's missing
+  // at-return socket and no informational tokens: its own AGENT_BROWSER_SOCKET_DIR
+  // declaration class. Never the value or effective routing; absent is unmeasured.
+  capture_open_socket_directory_v1?: (typeof BROWSER_OPEN_SOCKET_DIRECTORY_DECLARATIONS)[number];
   // The selected daemon's .version sidecar declaration beside that matching OPEN's
   // socket; not a verified daemon version, identity or health. Absent is unmeasured.
   capture_daemon_version_file_version?: 1;
@@ -716,6 +968,35 @@ export type BrowserCaptureFailureContext = FrameCaptureDiagnostic & {
   capture_daemon_version_file_major?: number;
   capture_daemon_version_file_minor?: number;
   capture_daemon_version_file_patch?: number;
+  // Exit3 awaiting_response beside that matching successful OPEN, or beside the same
+  // selected plain OPEN whose exact wrapper is still started and visible: selected-path stream
+  // connections visible beside the selected daemon's own listener at the deadline,
+  // sampled before the helper closes its own connection, so they may include it;
+  // each saturated at 15. Pending were not yet accepted;
+  // held are accepted connections that daemon PID holds. Not request acceptance,
+  // the lock holder, Chromium state or a cause. Absent is unmeasured.
+  capture_daemon_socket_queue_version?: 1;
+  capture_daemon_socket_pending_count?: number;
+  capture_daemon_socket_held_count?: number;
+  // Fresh screenshot only, beside that queue for the still-started plain OPEN: whether
+  // that OPEN's wrapper STARTED record precedes or follows the screenshot helper's local
+  // write attempt on the same guest's millisecond clock. Not daemon receipt or order,
+  // file state or a cause; a sent screenshot can still write after cleanup. Absent is
+  // unmeasured (older helper, tie, budget or any other stage).
+  capture_open_start_write_order_v1?: "before_write" | "after_write";
+  // Opted-in passive status only, beside that queue for the still-started plain OPEN
+  // with exactly one held and at least one pending connection: whether that held
+  // connection's inode was already held in one sample taken before the helper connected
+  // (same socket, daemon PID, listener and OPEN invocation). Not which client it is,
+  // request acceptance or a cause. Absent is unmeasured (older helper, any unverified
+  // sample, other counts, budget or any other stage).
+  capture_open_preconnect_held_v1?: "present" | "absent";
+  // Opted-in passive status only, beside that queue for the matching successful OPEN
+  // with none pending and at least two held: the selected session's live STARTED other
+  // wrapper (its exact incarnation, reread after the sample) declared a plain eval.
+  // A declaration, not the daemon's active command, its progress or a cause. Absent is
+  // unmeasured (older writer or helper, any other argv, count or stage, or budget).
+  capture_active_other_command_v1?: "eval";
   capture_close_receipt_version?: 1;
   capture_close_receipt_status?:
     "unavailable" | "not_observed" | "unreadable" | "recorded";
@@ -724,11 +1005,115 @@ export type BrowserCaptureFailureContext = FrameCaptureDiagnostic & {
   capture_close_scope?: "selected_session" | "other_session" | "all_sessions";
   capture_close_age?: (typeof BROWSER_WRAPPER_AGES)[number];
   capture_close_open_order?: "after" | "before" | "same_time" | "unavailable";
+  // Status exit2 socket_stat missing only, for the Browser Preview GET's own fresh
+  // recognizeClosed lookup: the first check of the existing close-proof verification
+  // that refused it. Proves neither that a close ran nor its absence, and is no cause.
+  // Absent is unmeasured (older helper, budget or an unclassified error).
+  capture_close_proof_failure_v1?: (typeof BROWSER_CLOSE_PROOF_FAILURES)[number];
+  // Stream-status SDK rejection without an exit only: start means no process
+  // handle was returned; wait means one was, with its acknowledgement latency.
+  capture_sdk_command_diagnostic_version?: 1;
+  capture_sdk_command_phase?: "start" | "wait";
+  capture_sdk_start_ack_latency?: "lt1s" | "lt3s" | "lt6s" | "gte6s";
+  // Opted-in GET wait rejection only: "<helper progress>:<total elapsed>". The
+  // exact helper frame sequence delivered to this handle: entry, socket path,
+  // local write-attempt boundary (not daemon receipt) and helper-selected
+  // disposition (not actual exit delivery). Frames can be dropped, so
+  // none_delivered or unrecognized/unreadable output never proves the helper
+  // did not run. Elapsed is from before the start request, not acknowledgement.
+  capture_sdk_wait_progress_v1?: StatusWaitProgress;
+  // Fresh_read only: the SDK read call or converting its result, with the SDK
+  // projection only for sdk_read. Absent means unmeasured (other stages, older
+  // builds, or a cleanup exception that replaced the failure), never none.
+  capture_fresh_read_diagnostic_version?: 1;
+  capture_fresh_read_phase?: "sdk_read" | "bytes_convert";
+  capture_fresh_read_error_kind?: string;
+  capture_fresh_read_http_status?: number | "none" | "other";
+  capture_fresh_read_type_error_signal?:
+    "fetch_failed" | "other_type_error" | "unreadable";
+  capture_fresh_read_transport_code?: string;
 };
+
+/** The whole version-1 group; only an SDK read carries the bounded SDK labels. */
+function freshReadContext(
+  phase: "sdk_read" | "bytes_convert",
+  error: unknown,
+): Pick<
+  BrowserCaptureFailureContext,
+  Extract<keyof BrowserCaptureFailureContext, `capture_fresh_read_${string}`>
+> {
+  const group = {
+    capture_fresh_read_diagnostic_version: 1,
+    capture_fresh_read_phase: phase,
+  } as const;
+  if (phase === "bytes_convert") return group;
+  const cloud = checkpointCloudErrorContext(error);
+  return {
+    ...group,
+    capture_fresh_read_error_kind: cloud.cloud_error_kind,
+    capture_fresh_read_http_status: cloud.cloud_http_status,
+    ...(cloud.cloud_type_error_signal === undefined
+      ? {}
+      : {
+          capture_fresh_read_type_error_signal: cloud.cloud_type_error_signal,
+          capture_fresh_read_transport_code: cloud.cloud_transport_code,
+        }),
+  };
+}
+
+/** The whole version-1 group, or nothing when a wait latency is unusable. */
+function statusSdkPhaseContext({
+  phase,
+  startAckMs,
+}: StatusCommandRejection): Pick<
+  BrowserCaptureFailureContext,
+  | "capture_sdk_command_diagnostic_version"
+  | "capture_sdk_command_phase"
+  | "capture_sdk_start_ack_latency"
+> {
+  if (phase === "start")
+    return {
+      capture_sdk_command_diagnostic_version: 1,
+      capture_sdk_command_phase: "start",
+    };
+  if (
+    phase !== "wait" ||
+    typeof startAckMs !== "number" ||
+    !Number.isFinite(startAckMs) ||
+    startAckMs < 0
+  )
+    return {};
+  return {
+    capture_sdk_command_diagnostic_version: 1,
+    capture_sdk_command_phase: "wait",
+    capture_sdk_start_ack_latency:
+      startAckMs < 1_000
+        ? "lt1s"
+        : startAckMs < 3_000
+          ? "lt3s"
+          : startAckMs < 6_000
+            ? "lt6s"
+            : "gte6s",
+  };
+}
+
 /**
  * Capture a validated frame, requesting a separate screenshot when freshness is required.
  * The optional failure observer receives only bounded context; observer failures
  * cannot replace the original rejection or change capture, cleanup, or retry behavior.
+ * Only the passive preview GET opts into deferDuringWait for a fresh capture that
+ * looks up its own port; its status or later screenshot may then reject with
+ * BrowserPreviewRefreshDeferred, which is not a capture failure, returns no
+ * frame and reaches no observer. Without verified WAIT and listener proof the
+ * original strict capture runs unchanged. That GET may independently opt into
+ * deferDuringOpen for the same fresh own-port capture: only its status lookup
+ * (never the fresh screenshot) may then reject with
+ * BrowserPreviewRefreshDeferred("open") at the unchanged deadline. Only that GET
+ * also opts into recognizeClosed when it looks up its own port: a verified close
+ * of the absent selected socket, at status or during the fresh screenshot,
+ * then rejects with the existing closed state.
+ * With onFailure, only that GET opts into observeStatusProgress for its own
+ * port lookup, adding one bounded progress field to an SDK wait rejection.
  */
 export async function captureBrowserFrame(
   sandbox: Sandbox,
@@ -737,10 +1122,31 @@ export async function captureBrowserFrame(
   requireFresh = false,
   streamPort?: number,
   onFailure?: (context: BrowserCaptureFailureContext) => void,
+  options?: {
+    deferDuringWait?: boolean;
+    deferDuringOpen?: boolean;
+    recognizeClosed?: boolean;
+    observeStatusProgress?: boolean;
+  },
 ) {
   let stage: BrowserCaptureFailureContext["capture_stage"] = "stream_status";
   let decodeDiagnostic: FrameDecodeDiagnostic = {};
   let returnedBridgeFailure: unknown;
+  let statusRejection: StatusCommandRejection | undefined;
+  let freshReadPhase: "sdk_read" | "bytes_convert" | undefined;
+  const deferDuringWait =
+    requireFresh &&
+    streamPort === undefined &&
+    options?.deferDuringWait === true;
+  const deferDuringOpen =
+    requireFresh &&
+    streamPort === undefined &&
+    options?.deferDuringOpen === true;
+  // Also exactly the own status lookup that opts in without owned_port.
+  const screenshotRecognizesClosed =
+    requireFresh &&
+    streamPort === undefined &&
+    options?.recognizeClosed === true;
   try {
     const port =
       streamPort ??
@@ -749,6 +1155,14 @@ export async function captureBrowserFrame(
         session,
         browserSessionName,
         !requireFresh,
+        onFailure &&
+          ((rejection) => {
+            statusRejection = rejection;
+          }),
+        deferDuringWait,
+        options?.recognizeClosed === true,
+        options?.observeStatusProgress === true,
+        deferDuringOpen,
       ));
     stage = "frame_bridge";
     const result = await sandbox.commands.run(
@@ -811,6 +1225,9 @@ export async function captureBrowserFrame(
       // screenshot proves freshness without assigning a new age to that cache.
       const path = `${session.directory}/preview-${randomBytes(16).toString("hex")}.jpg`;
       capturedAt = Date.now();
+      // A WAIT can start after status answered; the same opt-in lets the
+      // screenshot yield to it, and the helper otherwise sends it unchanged.
+      let screenshotDeferred = false;
       try {
         stage = "fresh_screenshot";
         const screenshot = await sandbox.commands.run(
@@ -819,6 +1236,10 @@ export async function captureBrowserFrame(
             path,
             format: "jpeg",
             quality: 65,
+            ...(deferDuringWait && { defer_wait: true as const }),
+            ...(screenshotRecognizesClosed && {
+              recognize_closed: true as const,
+            }),
           }),
           {
             ...buildSandboxCommandOptions(sandbox),
@@ -827,6 +1248,22 @@ export async function captureBrowserFrame(
         );
         if (screenshot.exitCode !== 0)
           throw new BrowserPreviewUnavailable("disconnected");
+        // The selected session closed after status answered. The daemon may
+        // already have written the file, so the cleanup below still runs.
+        if (
+          screenshotRecognizesClosed &&
+          screenshot.stdout === BROWSER_DAEMON_SESSION_CLOSED
+        )
+          throw new BrowserPreviewUnavailable("closed");
+        // Only the requested helper-only literal; never a parsed daemon reply field.
+        if (
+          deferDuringWait &&
+          screenshot.stdout === BROWSER_DAEMON_WAIT_DEFERRED
+        ) {
+          // The helper sent no screenshot, so no file can exist to remove.
+          screenshotDeferred = true;
+          throw new BrowserPreviewRefreshDeferred();
+        }
         stage = "fresh_stat";
         const info = await sandbox.files.getInfo(path, {
           user: "root",
@@ -835,13 +1272,14 @@ export async function captureBrowserFrame(
         if (info.size < 4 || info.size > 675_000)
           throw new BrowserPreviewUnavailable("disconnected");
         stage = "fresh_read";
-        const fresh = Buffer.from(
-          await sandbox.files.read(path, {
-            format: "bytes",
-            user: "root",
-            requestTimeoutMs: 4_000,
-          }),
-        );
+        freshReadPhase = "sdk_read";
+        const bytes = await sandbox.files.read(path, {
+          format: "bytes",
+          user: "root",
+          requestTimeoutMs: 4_000,
+        });
+        freshReadPhase = "bytes_convert";
+        const fresh = Buffer.from(bytes);
         stage = "fresh_validation";
         if (
           fresh.byteLength < 4 ||
@@ -853,9 +1291,17 @@ export async function captureBrowserFrame(
         imageUrl = `data:image/jpeg;base64,${fresh.toString("base64")}`;
       } finally {
         // The private memory-backed run directory is also erased at run cleanup.
-        await sandbox.files
-          .remove(path, { user: "root", requestTimeoutMs: 4_000 })
-          .catch(() => undefined);
+        if (!screenshotDeferred) {
+          try {
+            await sandbox.files
+              .remove(path, { user: "root", requestTimeoutMs: 4_000 })
+              .catch(() => undefined);
+          } catch (error) {
+            // This cleanup exception replaces any read failure; never attribute it.
+            freshReadPhase = undefined;
+            throw error;
+          }
+        }
       }
     }
     return {
@@ -866,6 +1312,16 @@ export async function captureBrowserFrame(
       browserSessionName,
     };
   } catch (error) {
+    // An explicit deferral outcome, never a failure: no diagnostics or relabeling.
+    if (
+      error instanceof BrowserPreviewRefreshDeferred &&
+      (error.reason === "open"
+        ? deferDuringOpen && stage === "stream_status"
+        : error.reason === "wait" &&
+          deferDuringWait &&
+          (stage === "stream_status" || stage === "fresh_screenshot"))
+    )
+      throw error;
     if (onFailure) {
       let kind: BrowserCaptureFailureContext["capture_error_kind"] =
         "unreadable";
@@ -885,6 +1341,10 @@ export async function captureBrowserFrame(
         | "capture_wrapper_process_visibility"
         | "capture_wrapper_command_version"
         | "capture_wrapper_command_class"
+        | "capture_wrapper_result_version"
+        | "capture_wrapper_result_scope"
+        | "capture_wrapper_result"
+        | "capture_wrapper_result_elapsed"
         | "capture_wrapper_history_version"
         | "capture_wrapper_history_scope"
         | "capture_wrapper_other_cli_completed"
@@ -893,6 +1353,8 @@ export async function captureBrowserFrame(
         | "capture_deadline_phase"
         | "capture_response_diagnostic_version"
         | "capture_response_validation"
+        | "capture_screenshot_refusal_version"
+        | "capture_screenshot_refusal"
         | "capture_cli_at_prepare_diagnostic_version"
         | "capture_cli_at_prepare_status"
         | "capture_cli_at_prepare_major"
@@ -913,11 +1375,18 @@ export async function captureBrowserFrame(
         | "capture_open_socket_return_status"
         | "capture_open_info_version"
         | "capture_open_info_flags"
+        | "capture_open_socket_directory_v1"
         | "capture_daemon_version_file_version"
         | "capture_daemon_version_file_status"
         | "capture_daemon_version_file_major"
         | "capture_daemon_version_file_minor"
         | "capture_daemon_version_file_patch"
+        | "capture_daemon_socket_queue_version"
+        | "capture_daemon_socket_pending_count"
+        | "capture_daemon_socket_held_count"
+        | "capture_open_start_write_order_v1"
+        | "capture_open_preconnect_held_v1"
+        | "capture_active_other_command_v1"
         | "capture_close_receipt_version"
         | "capture_close_receipt_status"
         | "capture_close_phase"
@@ -925,6 +1394,7 @@ export async function captureBrowserFrame(
         | "capture_close_scope"
         | "capture_close_age"
         | "capture_close_open_order"
+        | "capture_close_proof_failure_v1"
       > = {};
       try {
         if (error instanceof CommandExitError) {
@@ -984,16 +1454,11 @@ export async function captureBrowserFrame(
                   precondition.capture_cli_at_prepare_patch = cli[2] % 1000;
                 }
               }
-              const deadline = parsed?.deadline;
-              if (
-                code === 3 &&
-                Array.isArray(deadline) &&
-                deadline.length === 2 &&
-                deadline[0] === 1 &&
-                BROWSER_DAEMON_DEADLINE_PHASES.includes(deadline[1])
-              ) {
+              const deadline =
+                code === 3 ? daemonDeadlinePhase(parsed) : undefined;
+              if (deadline) {
                 precondition.capture_deadline_diagnostic_version = 1;
-                precondition.capture_deadline_phase = deadline[1];
+                precondition.capture_deadline_phase = deadline;
               }
               const validation = parsed?.r1;
               if (
@@ -1008,6 +1473,21 @@ export async function captureBrowserFrame(
                 precondition.capture_response_diagnostic_version = 1;
                 precondition.capture_response_validation =
                   BROWSER_DAEMON_RESPONSE_VALIDATIONS[validation[1]];
+              }
+              const refusal = parsed?.s1;
+              if (
+                stage === "fresh_screenshot" &&
+                precondition.capture_response_validation === "success_false" &&
+                Array.isArray(refusal) &&
+                refusal.length === 2 &&
+                refusal[0] === 1 &&
+                Number.isInteger(refusal[1]) &&
+                refusal[1] >= 0 &&
+                refusal[1] < BROWSER_DAEMON_SCREENSHOT_REFUSALS.length
+              ) {
+                precondition.capture_screenshot_refusal_version = 1;
+                precondition.capture_screenshot_refusal =
+                  BROWSER_DAEMON_SCREENSHOT_REFUSALS[refusal[1]];
               }
               const reason = parsed?.diagnostic_reason;
               if (
@@ -1070,6 +1550,30 @@ export async function captureBrowserFrame(
                 precondition.capture_wrapper_command_version = 1;
                 precondition.capture_wrapper_command_class =
                   BROWSER_WRAPPER_COMMAND_CLASSES[command];
+              }
+              const wrapperResult = parsed?.l1;
+              if (
+                precondition.capture_wrapper_receipt_version === 1 &&
+                precondition.capture_wrapper_session_matches === true &&
+                Array.isArray(wrapperResult) &&
+                wrapperResult.length === 3 &&
+                wrapperResult[0] === 1 &&
+                Number.isInteger(wrapperResult[1]) &&
+                wrapperResult[1] >= 0 &&
+                wrapperResult[1] < BROWSER_WRAPPER_RESULTS.length &&
+                Number.isInteger(wrapperResult[2]) &&
+                wrapperResult[2] >= 0 &&
+                wrapperResult[2] < BROWSER_WRAPPER_RESULT_ELAPSED.length
+              ) {
+                precondition.capture_wrapper_result_version = 1;
+                precondition.capture_wrapper_result_scope =
+                  precondition.capture_wrapper_phase === "completed"
+                    ? "latest_wrapper"
+                    : "previous_wrapper";
+                precondition.capture_wrapper_result =
+                  BROWSER_WRAPPER_RESULTS[wrapperResult[1]];
+                precondition.capture_wrapper_result_elapsed =
+                  BROWSER_WRAPPER_RESULT_ELAPSED[wrapperResult[2]];
               }
               const history = parsed?.h1;
               if (history === 0 || history === 1 || history === 3) {
@@ -1173,6 +1677,36 @@ export async function captureBrowserFrame(
                 precondition.capture_open_info_flags =
                   BROWSER_OPEN_INFO_FLAGS[openInfo];
               }
+              const socketDirectory = parsed?.sd1;
+              if (
+                stage === "stream_status" &&
+                code === 2 &&
+                precondition.capture_precondition_reason === "socket_stat" &&
+                precondition.capture_precondition_error === "missing" &&
+                precondition.capture_open_socket_return_status === "missing" &&
+                precondition.capture_open_info_flags === "none" &&
+                Number.isInteger(socketDirectory) &&
+                socketDirectory >= 0 &&
+                socketDirectory <
+                  BROWSER_OPEN_SOCKET_DIRECTORY_DECLARATIONS.length
+              )
+                precondition.capture_open_socket_directory_v1 =
+                  BROWSER_OPEN_SOCKET_DIRECTORY_DECLARATIONS[socketDirectory];
+              // Only this request's own fresh recognizeClosed lookup, which never
+              // sends owned_port; the fresh screenshot and timeouts never parse it.
+              const closeProof = parsed?.cp1;
+              if (
+                stage === "stream_status" &&
+                code === 2 &&
+                screenshotRecognizesClosed &&
+                precondition.capture_precondition_reason === "socket_stat" &&
+                precondition.capture_precondition_error === "missing" &&
+                Number.isInteger(closeProof) &&
+                closeProof >= 0 &&
+                closeProof < BROWSER_CLOSE_PROOF_FAILURES.length
+              )
+                precondition.capture_close_proof_failure_v1 =
+                  BROWSER_CLOSE_PROOF_FAILURES[closeProof];
               const daemonVersion = parsed?.dv;
               if (
                 precondition.capture_open_receipt_status === "recorded" &&
@@ -1204,6 +1738,72 @@ export async function captureBrowserFrame(
                   precondition.capture_daemon_version_file_patch =
                     daemonVersion[2] % 1000;
                 }
+              }
+              const queue = parsed?.q1;
+              if (
+                code === 3 &&
+                precondition.capture_deadline_phase === "awaiting_response" &&
+                precondition.capture_open_receipt_status === "recorded" &&
+                precondition.capture_open_session_matches === true &&
+                ((precondition.capture_open_phase === "completed" &&
+                  precondition.capture_open_exit_code === 0) ||
+                  // The helper also matches this OPEN to the latest wrapper's
+                  // exact record and requires a plain OPEN; neither is exported.
+                  (precondition.capture_open_phase === "started" &&
+                    precondition.capture_wrapper_action === "open" &&
+                    precondition.capture_wrapper_phase === "started" &&
+                    precondition.capture_wrapper_session_matches === true &&
+                    precondition.capture_wrapper_process_visibility ===
+                      "same_incarnation_visible")) &&
+                Array.isArray(queue) &&
+                queue.length === 3 &&
+                queue[0] === 1 &&
+                [queue[1], queue[2]].every(
+                  (count) =>
+                    Number.isInteger(count) && count >= 0 && count <= 15,
+                )
+              ) {
+                precondition.capture_daemon_socket_queue_version = 1;
+                precondition.capture_daemon_socket_pending_count = queue[1];
+                precondition.capture_daemon_socket_held_count = queue[2];
+                // Only the still-started OPEN branch above scopes this order.
+                const order = parsed?.ot1;
+                if (
+                  stage === "fresh_screenshot" &&
+                  precondition.capture_open_phase === "started" &&
+                  (order === 1 || order === 2)
+                )
+                  precondition.capture_open_start_write_order_v1 =
+                    order === 1 ? "before_write" : "after_write";
+                // Only this request's own OPEN opt-in, at its status lookup.
+                const preconnectHeld = parsed?.ph1;
+                if (
+                  stage === "stream_status" &&
+                  deferDuringOpen &&
+                  precondition.capture_open_phase === "started" &&
+                  queue[1] >= 1 &&
+                  queue[2] === 1 &&
+                  (preconnectHeld === 1 || preconnectHeld === 2)
+                )
+                  precondition.capture_open_preconnect_held_v1 =
+                    preconnectHeld === 1 ? "present" : "absent";
+                // Only this request's own OPEN opt-in, at its status lookup, beside the
+                // completed OPEN branch above and the live STARTED other wrapper.
+                if (
+                  stage === "stream_status" &&
+                  deferDuringOpen &&
+                  precondition.capture_open_phase === "completed" &&
+                  precondition.capture_wrapper_action === "other" &&
+                  precondition.capture_wrapper_phase === "started" &&
+                  precondition.capture_wrapper_session_matches === true &&
+                  precondition.capture_wrapper_process_visibility ===
+                    "same_incarnation_visible" &&
+                  precondition.capture_wrapper_command_class === "other" &&
+                  queue[1] === 0 &&
+                  queue[2] >= 2 &&
+                  parsed?.e1 === 1
+                )
+                  precondition.capture_active_other_command_v1 = "eval";
               }
               const openIdle = parsed?.open_idle;
               if (
@@ -1284,6 +1884,35 @@ export async function captureBrowserFrame(
       } catch {
         /* Optional transport metadata cannot replace the original rejection. */
       }
+      let sdkPhase: ReturnType<typeof statusSdkPhaseContext> = {};
+      let sdkProgress: Pick<
+        BrowserCaptureFailureContext,
+        "capture_sdk_wait_progress_v1"
+      > = {};
+      try {
+        // Only this exact SDK rejection; an exit already proves a returned handle.
+        if (
+          stage === "stream_status" &&
+          statusRejection &&
+          statusRejection.error === error &&
+          !(error instanceof CommandExitError)
+        ) {
+          sdkPhase = statusSdkPhaseContext(statusRejection);
+          if (statusRejection.progress !== undefined)
+            sdkProgress = {
+              capture_sdk_wait_progress_v1: statusRejection.progress,
+            };
+        }
+      } catch {
+        /* An unreadable phase omits the group and keeps the original rejection. */
+      }
+      let freshRead: ReturnType<typeof freshReadContext> = {};
+      try {
+        if (stage === "fresh_read" && freshReadPhase)
+          freshRead = freshReadContext(freshReadPhase, error);
+      } catch {
+        /* An unreadable projection omits the group and keeps the rejection. */
+      }
       try {
         onFailure({
           capture_stage: stage,
@@ -1292,6 +1921,9 @@ export async function captureBrowserFrame(
           ...precondition,
           ...decodeDiagnostic,
           ...bridgeDiagnostic,
+          ...sdkPhase,
+          ...sdkProgress,
+          ...freshRead,
         });
       } catch {
         /* Observers cannot change capture behavior. */
@@ -1314,6 +1946,21 @@ export async function captureBrowserFrame(
   }
 }
 
+export type BrowserViewportFailureContext = {
+  viewport_diagnostic_version: 1;
+  // The viewport daemon command, or the strict fresh capture that follows it.
+  viewport_failure_phase: "resize_command" | "capture_frame";
+  viewport_error_kind:
+    | ReturnType<
+        typeof browserRelayRenewFailureContext
+      >["relay_renew_error_kind"]
+    | "preview_unavailable";
+  viewport_command_exit_code: number | "none" | "other";
+  // Resize command exit3 only: the helper's own 6s deadline phase, not a cause.
+  // Absent means unmeasured (other exit, older writer or unreadable packet).
+  viewport_deadline_phase?: (typeof BROWSER_DAEMON_DEADLINE_PHASES)[number];
+};
+
 /** Resize only the currently granted session; callers hold the input lease. */
 export async function resizeBrowserViewport(
   sandbox: Sandbox,
@@ -1321,6 +1968,7 @@ export async function resizeBrowserViewport(
   browserSessionName: string,
   width: number,
   height: number,
+  onFailure?: (context: BrowserViewportFailureContext) => void,
 ) {
   if (
     ![width, height].every(
@@ -1328,29 +1976,102 @@ export async function resizeBrowserViewport(
     )
   )
     throw new Error("Invalid browser viewport");
-  const result = await sandbox.commands.run(
-    browserDaemonCommand(session.directory, browserSessionName, {
-      action: "viewport",
-      width,
-      height,
-      deviceScaleFactor: 1,
-    }),
-    {
-      ...buildSandboxCommandOptions(sandbox),
-      timeoutMs: 7_000,
-    },
-  );
-  if (result.exitCode !== 0)
-    throw new BrowserPreviewUnavailable("disconnected");
-  const frame = await captureBrowserFrame(
-    sandbox,
-    session,
-    browserSessionName,
-    true,
-  );
-  // The fresh screenshot uses the new viewport, but the stream can replay
-  // metadata from before the resize. Keep input coordinates in the new space.
-  return { ...frame, width, height };
+  let phase: BrowserViewportFailureContext["viewport_failure_phase"] =
+    "resize_command";
+  let returnedExitCode: number | "other" | undefined;
+  let timeoutResult: unknown;
+  try {
+    const result = await sandbox.commands.run(
+      browserDaemonCommand(session.directory, browserSessionName, {
+        action: "viewport",
+        width,
+        height,
+        deviceScaleFactor: 1,
+      }),
+      {
+        ...buildSandboxCommandOptions(sandbox),
+        timeoutMs: 7_000,
+      },
+    );
+    const exitCode = result.exitCode;
+    if (exitCode !== 0) {
+      returnedExitCode = exitStatus(exitCode);
+      if (exitCode === 3) timeoutResult = result;
+      throw new BrowserPreviewUnavailable("disconnected");
+    }
+    phase = "capture_frame";
+    const frame = await captureBrowserFrame(
+      sandbox,
+      session,
+      browserSessionName,
+      true,
+    );
+    // The fresh screenshot uses the new viewport, but the stream can replay
+    // metadata from before the resize. Keep input coordinates in the new space.
+    return { ...frame, width, height };
+  } catch (error) {
+    if (onFailure) {
+      let kind: BrowserViewportFailureContext["viewport_error_kind"] =
+        "unreadable";
+      let exitCode: number | "none" | "other" = "other";
+      try {
+        if (returnedExitCode !== undefined) {
+          kind = "command_exit";
+          exitCode = returnedExitCode;
+        } else {
+          const command = browserRelayRenewFailureContext(error);
+          kind =
+            command.relay_renew_error_kind === "other_error" &&
+            error instanceof BrowserPreviewUnavailable
+              ? "preview_unavailable"
+              : command.relay_renew_error_kind;
+          exitCode = command.relay_renew_command_exit_code;
+        }
+      } catch {
+        // An unreadable result or value keeps the phase and original error.
+      }
+      let deadline: Pick<
+        BrowserViewportFailureContext,
+        "viewport_deadline_phase"
+      > = {};
+      try {
+        if (phase === "resize_command" && exitCode === 3) {
+          // Returned or SDK-owned result data only; never output accessors.
+          const result =
+            timeoutResult ??
+            (error instanceof CommandExitError
+              ? Object.getOwnPropertyDescriptor(error, "result")?.value
+              : undefined);
+          const stdout =
+            result && typeof result === "object"
+              ? Object.getOwnPropertyDescriptor(result, "stdout")?.value
+              : undefined;
+          // The daemon emits packets no larger than 544 bytes.
+          const value =
+            typeof stdout === "string" &&
+            stdout.length <= 544 &&
+            Buffer.byteLength(stdout) <= 544
+              ? daemonDeadlinePhase(JSON.parse(stdout))
+              : undefined;
+          if (value) deadline = { viewport_deadline_phase: value };
+        }
+      } catch {
+        // A malformed packet omits only this optional field.
+      }
+      try {
+        onFailure({
+          viewport_diagnostic_version: 1,
+          viewport_failure_phase: phase,
+          viewport_error_kind: kind,
+          viewport_command_exit_code: exitCode,
+          ...deadline,
+        });
+      } catch {
+        // Observers cannot replace the original error or retry the resize.
+      }
+    }
+    throw error;
+  }
 }
 
 export type BrowserInputFailureContext = {
@@ -1445,6 +2166,75 @@ export async function sendBrowserInput(
   }
 }
 
+type BrowserPauseFailureContext = {
+  pause_diagnostic_version: 1;
+  pause_error_kind:
+    | "gate_busy"
+    | "transport"
+    | ReturnType<
+        typeof browserRelayRenewFailureContext
+      >["relay_renew_error_kind"];
+  pause_command_exit_code: number | "none" | "other";
+  pause_http_status: number | "none" | "other";
+};
+
+const returnedPauseFailures = new WeakMap<
+  BrowserPreviewUnavailable,
+  BrowserPauseFailureContext
+>();
+
+function pauseCommandOutcome(result: unknown): BrowserPauseFailureContext {
+  const exitCode = exitStatus(ownResultValue(result, "exitCode"));
+  const stderr = ownResultValue(result, "stderr");
+  // The pause program raises this fixed exception after its local lock deadline.
+  const gateBusy =
+    exitCode === 1 &&
+    typeof stderr === "string" &&
+    /(?:^|\n)RuntimeError: Browser command is busy\r?\n?$/.test(
+      stderr.slice(-96),
+    );
+  return {
+    pause_diagnostic_version: 1,
+    pause_error_kind: gateBusy ? "gate_busy" : "command_exit",
+    pause_command_exit_code: exitCode,
+    pause_http_status: "none",
+  };
+}
+
+/** Project the failed pause's bounded SDK or local program outcome. */
+export function browserPauseFailureContext(
+  error: unknown,
+): BrowserPauseFailureContext {
+  try {
+    if (error instanceof BrowserPreviewUnavailable) {
+      const returned = returnedPauseFailures.get(error);
+      if (returned) return returned;
+    }
+    if (error instanceof CommandExitError) {
+      return pauseCommandOutcome(
+        Object.getOwnPropertyDescriptor(error, "result")?.value,
+      );
+    }
+    const cloud = checkpointCloudErrorContext(error);
+    return {
+      pause_diagnostic_version: 1,
+      pause_error_kind:
+        cloud.cloud_type_error_signal === "fetch_failed"
+          ? "transport"
+          : browserRelayRenewFailureContext(error).relay_renew_error_kind,
+      pause_command_exit_code: "none",
+      pause_http_status: cloud.cloud_http_status,
+    };
+  } catch {
+    return {
+      pause_diagnostic_version: 1,
+      pause_error_kind: "unreadable",
+      pause_command_exit_code: "other",
+      pause_http_status: "none",
+    };
+  }
+}
+
 export async function setAgentBrowserPaused(
   sandbox: Sandbox,
   session: BrowserSessionLocation,
@@ -1458,6 +2248,15 @@ export async function setAgentBrowserPaused(
     ),
     { ...buildSandboxCommandOptions(sandbox), timeoutMs: 10_000 },
   );
-  if (result.exitCode !== 0)
-    throw new BrowserPreviewUnavailable("disconnected");
+  if (result.exitCode !== 0) {
+    const error = new BrowserPreviewUnavailable("disconnected");
+    if (paused) {
+      try {
+        returnedPauseFailures.set(error, pauseCommandOutcome(result));
+      } catch {
+        // Optional attribution preserves the original failure.
+      }
+    }
+    throw error;
+  }
 }

@@ -2,10 +2,12 @@ import { NextRequest, NextResponse } from "next/server";
 import { ApiError, runs } from "@trigger.dev/sdk";
 
 import { getUserIDAndPro, type AuthSessionPhase } from "@/lib/auth/get-user-id";
+import { ChatSDKError } from "@/lib/errors";
 import { handleAgentRouteError } from "@/lib/api/agent-route-errors";
 import type { AgentApiEndpoint } from "@/lib/api/agent-endpoints";
 import { closeAgentApprovalSession } from "@/lib/api/agent-approval-session";
 import { getChatById, setActiveTriggerRun } from "@/lib/db/actions";
+import { withAgentConvexScope } from "@/lib/api/agent-convex";
 
 import { recoverCrashedAgentRun } from "./agent-crash-recovery";
 import { AgentCrashRecoveryReplayLimitError } from "./agent-crash-recovery-error";
@@ -22,6 +24,9 @@ type TriggerRunStatus = {
   tags?: string[];
 };
 
+// One attempt per poll, aborted at the deadline (the pinned core patch passes
+// this read's signal to its fetch): the browser's next poll is the retry.
+const TRIGGER_RUN_READ_DEADLINE_MS = 5_000;
 const MISSING_RUN_STATUSES = new Set([400, 404, 410, 422]);
 const TERMINAL_RUN_STATUSES = new Set([
   "COMPLETED",
@@ -59,29 +64,35 @@ const clearTerminalAgentRun = async ({
   userId: string;
   runId: string;
   recoveredCrash?: boolean;
-}) => {
-  const chat = await getChatById({ id: chatId });
-  if (
-    !chat ||
-    chat.user_id !== userId ||
-    chat.active_trigger_run_id !== runId
-  ) {
-    return "stale" as const;
-  }
+}) =>
+  // A fresh bounded client: the ownership read's budget is already spent, and
+  // a stalled cleanup must still end as a retryable failure before Vercel's.
+  withAgentConvexScope("statusTerminalCleanup", async (convex) => {
+    const chat = await getChatById({ id: chatId }, convex);
+    if (
+      !chat ||
+      chat.user_id !== userId ||
+      chat.active_trigger_run_id !== runId
+    ) {
+      return "stale" as const;
+    }
 
-  await closeAgentApprovalSession(
-    chat.active_agent_approval_session_id,
-    "agent-run-terminal",
-  );
-  return await setActiveTriggerRun({
-    chatId,
-    triggerRunId: null,
-    approvalSessionId: null,
-    expectedRunId: runId,
-    ...(recoveredCrash ? { recoveredCrash } : {}),
-    clearApprovalPending: true,
+    await closeAgentApprovalSession(
+      chat.active_agent_approval_session_id,
+      "agent-run-terminal",
+    );
+    return await setActiveTriggerRun(
+      {
+        chatId,
+        triggerRunId: null,
+        approvalSessionId: null,
+        expectedRunId: runId,
+        ...(recoveredCrash ? { recoveredCrash } : {}),
+        clearApprovalPending: true,
+      },
+      convex,
+    );
   });
-};
 
 export const createAgentStatusPost =
   ({ endpoint }: { endpoint: AgentApiEndpoint }) =>
@@ -160,7 +171,13 @@ export const createAgentStatusPost =
       userId = authContext.userId;
 
       stage = "get_chat";
-      const chat = await getChatById({ id: chatId });
+      // Bound the ownership read, including a connection that never returns
+      // headers. Its typed 503 is nonterminal: the browser keeps this run and
+      // polls again, and nothing about the run is read or changed first.
+      const ownedChatId = chatId;
+      const chat = await withAgentConvexScope("statusOwnershipRead", (convex) =>
+        getChatById({ id: ownedChatId }, convex),
+      );
       if (!chat) {
         return new NextResponse("Chat not found", { status: 404 });
       }
@@ -178,11 +195,71 @@ export const createAgentStatusPost =
 
       ownedRun = { chatId: chat.id, runId: chat.active_trigger_run_id };
       stage = "retrieve_trigger_run";
-      triggerRunRead = createTriggerRunReadDiagnostics();
-      const run = (await runs.retrieve(
-        runId,
-        triggerRunRead.requestOptions,
-      )) as TriggerRunStatus;
+      const read = createTriggerRunReadDiagnostics({ runId });
+      triggerRunRead = read;
+      const readRunId = runId;
+      let run: TriggerRunStatus;
+      let readDeadline: ReturnType<typeof setTimeout> | undefined;
+      const readAbort = new AbortController();
+      const readOptions = {
+        ...read.requestOptions,
+        retry: { maxAttempts: 1 },
+        signal: readAbort.signal,
+        // Status, tags and metadata are all this route reads. Skip the SDK's
+        // presigned payload/output downloads, which this signal cannot stop.
+        prepareData: <T>(data: T) => data,
+      };
+      try {
+        // A late result or rejection is consumed by the race and ignored. The
+        // typed 503 is nonterminal: the run, its association and approval
+        // session stay untouched, and the browser polls this run again.
+        run = (await Promise.race([
+          read.run(() => runs.retrieve(readRunId, readOptions)),
+          new Promise<never>((_, reject) => {
+            readDeadline = setTimeout(() => {
+              // Settle with the typed 503 before aborting, so the aborted
+              // fetch's own rejection cannot replace the retry semantics.
+              reject(
+                new ChatSDKError(
+                  "offline:api",
+                  "Agent run status is temporarily unavailable. Retry the status check shortly.",
+                ),
+              );
+              try {
+                console.warn(
+                  JSON.stringify({
+                    timestamp: new Date().toISOString(),
+                    level: "warn",
+                    event: "agent_status_trigger_read_deadline",
+                    service: "hackerai-web",
+                    environment:
+                      process.env.VERCEL_ENV ??
+                      process.env.NODE_ENV ??
+                      "unknown",
+                    endpoint,
+                    user_id: userId,
+                    chat_id: ownedRun?.chatId,
+                    trigger_run_id: ownedRun?.runId,
+                    stage,
+                    ...read.snapshot(),
+                    elapsed_ms: Date.now() - requestStartedAt,
+                    trigger_run_read_deadline_ms: TRIGGER_RUN_READ_DEADLINE_MS,
+                  }),
+                );
+              } catch {
+                // Optional diagnostics must not replace the deadline response.
+              }
+              // After the snapshot: stop this expired request, including a
+              // response body still being held.
+              readAbort.abort();
+            }, TRIGGER_RUN_READ_DEADLINE_MS);
+          }),
+        ])) as TriggerRunStatus;
+      } finally {
+        clearTimeout(readDeadline);
+        // Keep the last state for warnings; ignore events after settlement.
+        read.finish();
+      }
       if (!runBelongsToChatOwner(run, { chatId, userId })) {
         const metadataRecord =
           run.metadata != null &&
@@ -262,6 +339,7 @@ export const createAgentStatusPost =
                 chat_id: chatId.slice(0, 128),
                 user_id: userId.slice(0, 128),
                 trigger_run_id: runId.slice(0, 128),
+                ...error.context,
               }),
             );
             // Report the real terminal state so clients stop polling. Preserve

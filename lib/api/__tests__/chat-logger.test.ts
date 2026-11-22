@@ -859,6 +859,84 @@ describe("captureAgentRun", () => {
     );
   });
 
+  it("adds reporter recovery history beside the existing disconnect-only fields", () => {
+    const capture = jest.fn();
+    const posthog = { capture } as any;
+    const reporting = createAgentRunReporting({
+      posthog,
+      runId: "run_recovered",
+      userId: "user_123",
+      chatId: "chat_123",
+      subscription: "ultra",
+      endpoint: "/api/agent",
+    });
+    reporting.recordModelRecovery({
+      reason: "content_filter",
+      retryModel: "model-deepseek-v4.1-flash-1017-pro",
+      failure: { category: "content_blocked", model: "x-ai/grok-4.6" },
+    });
+    reporting.captureTerminal(captureAgentCompletionAnalytics, {
+      posthog,
+      userId: "user_123",
+      chatId: "chat_123",
+      endpoint: "/api/agent",
+      mode: "agent",
+      subscription: "ultra",
+      sandboxInfo: { type: "cloud" },
+      outcome: "success",
+      hasResponseContent: true,
+      chatLogger: undefined,
+      selectedModel: "model-grok-4.6",
+      configuredModelId: "x-ai/grok-4.6",
+      responseModel: "deepseek/deepseek-v4.1-flash-20261017",
+      finishReason: "stop",
+      triggerRunId: "run_recovered",
+      abliteratedProviderSummary: undefined,
+      // The refusal was not a disconnect, so the existing fields stay empty.
+      providerRecoveryAttempts: 0,
+      providerRecoveryModels: [],
+      providerRecoverySucceeded: false,
+    });
+    const [run] = capture.mock.calls
+      .map(([event]: any) => event)
+      .filter((event: any) => event.event === "hackerai-agent_run");
+    expect(run.properties).toMatchObject({
+      outcome: "success",
+      provider_recovery_attempts: 0,
+      provider_recovery_succeeded: false,
+      model_recovery_version: 1,
+      model_recovery_attempts: 1,
+      model_recovery_models: ["model-deepseek-v4.1-flash-1017-pro"],
+      model_recovery_reasons: ["content_filter"],
+      model_recovery_succeeded: true,
+      initial_provider_failure_category: "content_blocked",
+      initial_provider_failure_model: "x-ai/grok-4.6",
+    });
+  });
+
+  it("adds no recovery history fields for a caller-supplied object", () => {
+    const capture = jest.fn();
+    captureAgentRun({
+      posthog: { capture } as any,
+      userId: "user_123",
+      chatId: "chat_123",
+      mode: "agent",
+      subscription: "ultra",
+      sandboxInfo: null,
+      outcome: "success",
+      selectedModel: "model-grok-4.6",
+      configuredModelId: "x-ai/grok-4.6",
+      modelRecoveryHistory: {
+        attempts: 1,
+        models: ["PRIVATE"],
+        reasons: ["content_filter"],
+      },
+    });
+    expect(JSON.stringify(capture.mock.calls)).not.toMatch(
+      /model_recovery_|initial_provider_failure_|PRIVATE/,
+    );
+  });
+
   it("does not capture agent run events for ask mode", () => {
     const capture = jest.fn();
 
@@ -897,6 +975,7 @@ describe("resolveAgentAbortSource", () => {
       { stopSource: "wait_for_user_timeout", requestCancelled: true },
     ],
     ["user_wait_failed", { stopSource: "wait_for_user" }],
+    ["approval_timeout", { stopSource: "approval_timeout" }],
     ["user_stop", { userStopRequested: true }],
     ["request_cancel", { requestCancelled: true }],
     ["unknown", {}],
@@ -1467,21 +1546,16 @@ describe("captureAgentCompletionAnalytics", () => {
 
 describe("captureUsageCost", () => {
   it.each(["ask", "agent"])(
-    "records %s regional policy without contaminating the ended experiment",
+    "attributes free %s cost to its experiment without retired regional quota fields",
     (mode) => {
       const capture = jest.fn();
       captureUsageCost({
         posthog: { capture } as any,
-        userId: "regional-user",
+        userId: "free-user",
         subscription: "free",
-        chatId: "regional-chat",
+        chatId: "free-chat",
         endpoint: mode === "ask" ? "/api/chat" : "/api/agent-long",
         mode,
-        regionalFreeLimits: {
-          country: "NG",
-          dailyRequests: 3,
-          monthlyCostDollars: 0.1,
-        },
         experiment: { key: "separate-model-test", variant: "control" },
         usage: {
           model: "auto",
@@ -1504,15 +1578,12 @@ describe("captureUsageCost", () => {
       });
       const properties = capture.mock.calls[0][0].properties;
       expect(properties).toMatchObject({
-        regional_free_policy_version: 1,
-        regional_free_country: "NG",
-        regional_free_daily_requests: 3,
-        regional_free_monthly_cost_dollars: 0.1,
         experiment_key: "separate-model-test",
         experiment_variant: "control",
       });
-      expect(properties).not.toHaveProperty("regional_free_variant");
-      expect(properties).not.toHaveProperty("$feature/regional_free_limits_v1");
+      expect(
+        Object.keys(properties).filter((key) => key.includes("regional_free")),
+      ).toEqual([]);
     },
   );
 
@@ -1601,12 +1672,12 @@ describe("captureUsageCost", () => {
         included_points_deducted: 1000,
         extra_usage_points_deducted: 3200,
         usage_economics_version: 2,
-        usage_pricing_version: "request-1.20-extra-1.20-v2",
-        request_usage_multiplier: 1.2,
-        included_usage_multiplier: 1.2,
-        extra_usage_multiplier: 1.2,
+        usage_pricing_version: "request-1.30-extra-1.30-v2",
+        request_usage_multiplier: 1.3,
+        included_usage_multiplier: 1.3,
+        extra_usage_multiplier: 1.3,
         extra_usage_balance_multiplier: 1.5,
-        effective_extra_usage_multiplier: 1.8,
+        effective_extra_usage_multiplier: 1.95,
         included_usage_value_dollars: 0.1,
         extra_usage_charge_dollars: 0.48,
         covered_usage_value_dollars: 0.58,
@@ -1895,12 +1966,12 @@ describe("captureUsageSettlement", () => {
         usage_deduction_failed: true,
         usage_deduction_failure_reason: "monthly_cap_exceeded",
         forced: false,
-        usage_pricing_version: "request-1.20-extra-1.20-v2",
-        request_usage_multiplier: 1.2,
-        included_usage_multiplier: 1.2,
-        extra_usage_multiplier: 1.2,
+        usage_pricing_version: "request-1.30-extra-1.30-v2",
+        request_usage_multiplier: 1.3,
+        included_usage_multiplier: 1.3,
+        extra_usage_multiplier: 1.3,
         extra_usage_balance_multiplier: 1.5,
-        effective_extra_usage_multiplier: 1.8,
+        effective_extra_usage_multiplier: 1.95,
         settlement_capture_reason: "anomaly",
         settlement_run_sampled:
           isUsageSettlementSuccessSampled("settlement_123"),

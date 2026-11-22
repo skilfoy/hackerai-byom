@@ -403,7 +403,9 @@ describe("agent-long-transport — direct UI stream reader", () => {
     expect(triggerBrowserRealtimeSrc).toMatch(/method:\s*"POST"/);
     expect(triggerBrowserRealtimeSrc).not.toMatch(/\/api\/v1\/runs/);
     expect(transportSrc).toMatch(/statusEndpoint/);
-    expect(statusSrc).toMatch(/runs\.retrieve\(\s*runId\s*[,)]/);
+    // The server reads the run itself; agent-status-route.test.ts verifies it
+    // retrieves exactly the chat's owned active run with unchanged options.
+    expect(statusSrc).toMatch(/runs\.retrieve\(/);
     expect(statusSrc).toMatch(/ApiError/);
     expect(statusSrc).toMatch(/MISSING_RUN_STATUSES/);
     expect(statusSrc).toMatch(/Run not found/);
@@ -1198,11 +1200,7 @@ describe("agent-long task — Trigger.dev dashboard error visibility", () => {
     );
   });
 
-  test("agent approval waits without a wall-clock expiry", () => {
-    expect(approvalRuntimeSrc).not.toMatch(/AGENT_APPROVAL_TIMEOUT/);
-    expect(approvalRuntimeSrc).toMatch(
-      /\.wait<AgentToolApprovalInputRecord>\(\)/,
-    );
+  test("agent approval suspension is excluded from active runtime", () => {
     expect(approvalRuntimeSrc).toMatch(/activeRuntimeBudget\.pause\(\)/);
     expect(approvalRuntimeSrc).toMatch(/activeRuntimeBudget\.resume\(\)/);
     expect(approvalRuntimeSrc).toMatch(
@@ -1805,10 +1803,10 @@ describe("agent-long task — Trigger.dev dashboard error visibility", () => {
       /const providerDisconnectContinuation\s*=\s*!uncertainToolOutcome &&/,
     );
     expect(taskSrc).toMatch(
-      /hasCandidate:\s*!confirmedFailureLoop &&\s*!uncertainToolOutcome &&/,
+      /hasCandidate:\s*!isTrustedBrowserHandoffReadFailure\(\s*streamError,\s*state\.providerError,\s*\) &&\s*!confirmedFailureLoop &&\s*!uncertainToolOutcome &&/,
     );
     expect(taskSrc).toMatch(
-      /const nextContinuation\s*=\s*isTerminalProviderStreamError\(state\)[\s\S]{0,350}!hasUncertainProviderToolOutcome\(\s*normalizedRetryMessages\.findLast/,
+      /const nextContinuation\s*=\s*!isTrustedBrowserHandoffReadFailure\(\s*streamError,\s*state\.providerError,\s*\) &&\s*isTerminalProviderStreamError\(state\)[\s\S]{0,350}!hasUncertainProviderToolOutcome\(\s*normalizedRetryMessages\.findLast/,
     );
     expect(taskSrc).toMatch(
       /isRetriableProviderStreamDisconnectError\(\s*state\.providerError/,
@@ -1846,7 +1844,7 @@ describe("agent-long task — Trigger.dev dashboard error visibility", () => {
       /const uncertainToolOutcome\s*=\s*hasUncertainProviderToolOutcome\(\s*lastAssistantMessageParts/,
     );
     expect(chatHandlerSrc).toMatch(
-      /if \(\s*!uncertainToolOutcome &&\s*\(!loopTriggeredRetry \|\| loopContinuation !== undefined\) &&\s*\(shouldRecoverAbliterationStreamError/,
+      /primaryProviderRecovery: if \(\s*!isTrustedBrowserHandoffReadFailure\(\s*state\.providerError,\s*\) &&\s*!uncertainToolOutcome &&\s*\(!loopTriggeredRetry \|\| loopContinuation !== undefined\) &&\s*\(shouldRecoverAbliterationStreamError/,
     );
   });
 
@@ -2644,12 +2642,10 @@ describe("agent-long task — Trigger.dev dashboard error visibility", () => {
       /acquireFreeRunConcurrencyLock\(\s*freeUsageSubject/,
     );
     expect(taskSrc).toMatch(
-      /checkFreeMonthlyCostLimit\(\s*freeUsageSubject,\s*freeLimits,?\s*\)/,
+      /checkFreeMonthlyCostLimit\(\s*freeUsageSubject\s*\)/,
     );
     expect(
-      taskSrc.match(
-        /checkFreeMonthlyCostLimit\(\s*freeUsageSubject,\s*freeLimits,?\s*\)/g,
-      ),
+      taskSrc.match(/checkFreeMonthlyCostLimit\(\s*freeUsageSubject\s*\)/g),
     ).toHaveLength(5); // Includes revalidation after wait_for_user resumes.
 
     expect(taskSrc).not.toMatch(

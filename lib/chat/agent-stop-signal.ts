@@ -1,12 +1,14 @@
 type DirectStopSource =
   | "local_connection_lost"
   | "browser_ownership_lost"
+  | "browser_handoff_abandoned"
   | "wait_for_user"
   | "wait_for_user_timeout"
   | "trigger_platform"
   | "active_runtime_budget"
   | "auto_review_circuit_breaker"
   | "post_wait_authorization_denied"
+  | "approval_timeout"
   | "usage_settlement_uncovered";
 
 type StreamStopSource = "agent_run_spend_cap" | "budget_monitor";

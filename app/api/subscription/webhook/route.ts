@@ -6,6 +6,7 @@ import Stripe from "stripe";
 import {
   freezeRateLimitBucketForDelinquency,
   resetRateLimitBucketAfterPayment,
+  restoreAnnualAllowanceSchedule,
   stashTierChangeBucketState,
   applyProratedTierChangeBucket,
   clearOrgRemovedUsage,
@@ -16,7 +17,10 @@ import {
   isCheckoutPaymentAnalyticsEvent,
 } from "@/lib/billing/checkout-payment-analytics";
 import { resolveUserIdsFromCustomer as resolveStripeCustomerUsers } from "@/lib/billing/resolve-customer-users";
-import { getInvoicePaidBucketResetMode } from "@/lib/billing/subscription-invoice-reset";
+import {
+  getInvoicePaidBucketResetMode,
+  replacedSubscriptionPeriodFromUpdateInvoice,
+} from "@/lib/billing/subscription-invoice-reset";
 import {
   priceBillingInterval,
   subscriptionMrrDollars,
@@ -44,7 +48,12 @@ import {
 } from "@/lib/billing/subscription-payment-failure";
 import { includedUsagePointsForStripePrice } from "@/lib/billing/included-usage";
 import { subscriptionTierFromPrice } from "@/lib/billing/current-subscription";
-import { recoverSubscriptionPayment } from "@/lib/billing/payment-method-recovery";
+import {
+  markPaymentMethodRecoveryStep,
+  paymentMethodRecoveryFailureFields,
+  recoverSubscriptionPayment,
+  type PaymentMethodRecoveryDiagnostic,
+} from "@/lib/billing/payment-method-recovery";
 import { voidUnpaidCanceledRenewalInvoice } from "@/lib/billing/canceled-renewal-invoice";
 import { requireLatePaymentReview } from "@/lib/billing/late-payment-review";
 import {
@@ -391,6 +400,146 @@ async function applyTierChangeBuckets({
       : `[Subscription Webhook] ${source}: no tier-change state found; skipping bucket reset`,
   );
   return appliedCount;
+}
+
+type AnnualAllowanceTransition = {
+  replacedPeriodEndMs: number;
+  creditedInvoiceId?: string;
+  cycleAllocationPoints?: number;
+};
+
+function isSingleIntervalPrice(
+  price: Stripe.Price | undefined,
+  interval: "month" | "year",
+): boolean {
+  return (
+    priceBillingInterval(price) === interval &&
+    (price?.recurring?.interval_count ?? 1) === 1
+  );
+}
+
+/**
+ * Verify, from the paid invoice lines and the current subscription, that this
+ * update replaced a same-tier monthly period of the same subscription with
+ * its current annual item. Returns the monthly deadline that the invoice
+ * credited. Tier changes keep using their stashed migration.
+ *
+ * The current item, not the invoice's first priced line, identifies the new
+ * Price: an all-proration update invoice lists the old Price first.
+ */
+async function sameTierMonthlyToAnnualTransition({
+  invoice,
+  subscription,
+  subscriptionId,
+  tier,
+}: {
+  invoice: Stripe.Invoice;
+  subscription: Stripe.Subscription;
+  subscriptionId: string;
+  tier: SubscriptionTier;
+}): Promise<AnnualAllowanceTransition | { skipReason: string } | null> {
+  if (tier === "team") return null;
+  const items = subscription.items;
+  const item = items?.data[0];
+  const annualPrice = item?.price;
+  if (!annualPrice || !isSingleIntervalPrice(annualPrice, "year")) return null;
+
+  if (items?.has_more || items?.data.length !== 1) {
+    return { skipReason: "current_items_ambiguous" };
+  }
+  if (invoice.status !== "paid") return { skipReason: "invoice_not_paid" };
+  if (subscriptionTierFromPrice(annualPrice) !== tier) {
+    return { skipReason: "annual_price_tier_unverified" };
+  }
+
+  const replaced = replacedSubscriptionPeriodFromUpdateInvoice({
+    lines: (await invoiceLineItems(invoice)).map((line) => ({
+      subscriptionId: invoiceLineSubscriptionId(line),
+      priceId: invoiceLinePriceId(line),
+      proration: invoiceLineIsProration(line),
+      amount: line.amount,
+      periodStartSeconds: line.period?.start,
+      periodEndSeconds: line.period?.end,
+      creditedInvoiceId:
+        line.parent?.subscription_item_details?.proration_details
+          ?.credited_items?.invoice ?? undefined,
+    })),
+    subscriptionId,
+    newPriceId: annualPrice.id,
+    newPeriodEndSeconds: (item as { current_period_end?: number })
+      .current_period_end,
+  });
+  if (replaced.kind !== "replaced") return { skipReason: replaced.reason };
+
+  // Let Stripe retry a lookup failure before any paid side effects run.
+  const replacedPrice = await stripe.prices.retrieve(replaced.replacedPriceId);
+  if (!isSingleIntervalPrice(replacedPrice, "month")) {
+    return { skipReason: "replaced_price_not_monthly" };
+  }
+  if (subscriptionTierFromPrice(replacedPrice) !== tier) {
+    return { skipReason: "tier_changed" };
+  }
+  return {
+    replacedPeriodEndMs: replaced.replacedPeriodEndMs,
+    creditedInvoiceId: replaced.creditedInvoiceId,
+    cycleAllocationPoints: includedUsagePointsForStripePrice(annualPrice.id),
+  };
+}
+
+async function restoreAnnualAllowanceSchedules({
+  userIds,
+  tier,
+  subscriptionId,
+  invoice,
+  transition,
+  customerId,
+  orgId,
+}: {
+  userIds: string[];
+  tier: SubscriptionTier;
+  subscriptionId: string;
+  invoice: Stripe.Invoice;
+  transition: AnnualAllowanceTransition;
+  customerId: string;
+  orgId?: string;
+}): Promise<void> {
+  const transitionAtMs = invoicePaidAtMs(invoice);
+  const { replacedPeriodEndMs, creditedInvoiceId } = transition;
+  const outcomes = await Promise.all(
+    userIds.map((userId) =>
+      restoreAnnualAllowanceSchedule(userId, tier, {
+        subscriptionId,
+        invoiceId: invoice.id,
+        occurredAtMs: transitionAtMs,
+        ...transition,
+      }),
+    ),
+  );
+  const needsReview = outcomes.some(
+    (outcome) =>
+      outcome === "held" ||
+      outcome === "other_subscription" ||
+      outcome === "stale" ||
+      outcome === "deadline_mismatch",
+  );
+  const properties = {
+    userId: userIds[0],
+    user_ids: userIds,
+    org_id: orgId,
+    stripe_customer_id: customerId,
+    stripe_subscription_id: subscriptionId,
+    stripe_invoice_id: invoice.id,
+    subscription_tier: tier,
+    transition_at_ms: transitionAtMs,
+    replaced_period_end_ms: replacedPeriodEndMs,
+    credited_invoice_id: creditedInvoiceId,
+    outcomes,
+  };
+  if (needsReview) {
+    phLogger.warn("billing_annual_allowance_schedule_unchanged", properties);
+  } else if (outcomes.includes("applied") || outcomes.includes("recorded")) {
+    phLogger.info("billing_annual_allowance_schedule_restored", properties);
+  }
 }
 
 async function getPaidTierChangeInvoice(
@@ -1266,6 +1415,15 @@ async function handleInvoicePaid(
   const includedUsagePoints = includedUsagePointsForStripePrice(
     entitlementPrice?.id,
   );
+  const annualTransition =
+    resetMode.mode === "subscription_update_proration"
+      ? await sameTierMonthlyToAnnualTransition({
+          invoice,
+          subscription,
+          subscriptionId,
+          tier,
+        })
+      : null;
 
   await setReferralCodesPaidEligibility({
     userIds,
@@ -1319,10 +1477,29 @@ async function handleInvoicePaid(
     return;
   }
 
-  // Mid-cycle tier change: apply only a previously stashed bucket migration.
-  // Missing state is intentionally a no-op so quantity/anchor changes cannot
-  // mint a fresh monthly allocation.
+  // A verified same-tier switch only changes the allowance schedule. Tier
+  // changes still require an existing stash to update the remaining allocation.
   if (resetMode.mode === "subscription_update_proration") {
+    if (annualTransition && "replacedPeriodEndMs" in annualTransition) {
+      await restoreAnnualAllowanceSchedules({
+        userIds,
+        tier,
+        subscriptionId,
+        invoice,
+        transition: annualTransition,
+        customerId,
+        orgId: orgId ?? undefined,
+      });
+      return;
+    }
+    if (annualTransition) {
+      phLogger.info("billing_annual_allowance_transition_not_applicable", {
+        stripe_subscription_id: subscriptionId,
+        stripe_invoice_id: invoice.id,
+        subscription_tier: tier,
+        skip_reason: annualTransition.skipReason,
+      });
+    }
     await applyTierChangeBuckets({
       userIds,
       tier,
@@ -1760,10 +1937,13 @@ async function handlePaymentMethodUpdated(args: {
   eventOccurredAtMs: number;
   paymentMethodId: string;
   subscriptionId?: string;
+  diagnostic?: PaymentMethodRecoveryDiagnostic;
 }): Promise<void> {
+  const { diagnostic } = args;
   // Webhooks can arrive out of order. Only act on a default that is still
   // selected, never on an attachment or an older customer-update payload.
   if (!args.subscriptionId) {
+    markPaymentMethodRecoveryStep(diagnostic, "retrieve_customer");
     const customer = await stripe.customers.retrieve(args.customerId);
     if (
       customer.deleted ||
@@ -1772,6 +1952,7 @@ async function handlePaymentMethodUpdated(args: {
     )
       return;
   }
+  markPaymentMethodRecoveryStep(diagnostic, "resolve_customer_users");
   const customerResult = await resolveUserIdsFromCustomer(args.customerId);
   const { userIds, orgId } = customerResult;
   if (customerResult.reason === "lookup_failed") {
@@ -1784,6 +1965,7 @@ async function handlePaymentMethodUpdated(args: {
     return;
   }
 
+  markPaymentMethodRecoveryStep(diagnostic, "check_user_suspensions");
   const activeSuspensions = await Promise.all(
     userIds.map((userId) => hasActiveSuspensionForUser(userId)),
   );
@@ -1798,6 +1980,7 @@ async function handlePaymentMethodUpdated(args: {
   if (args.subscriptionId) {
     subscriptionIds.push(args.subscriptionId);
   } else {
+    markPaymentMethodRecoveryStep(diagnostic, "list_subscriptions");
     let startingAfter: string | undefined;
     do {
       const page = await stripe.subscriptions.list({
@@ -1818,6 +2001,7 @@ async function handlePaymentMethodUpdated(args: {
   }
 
   for (const subscriptionId of subscriptionIds) {
+    markPaymentMethodRecoveryStep(diagnostic, "resolve_subscription");
     const resolved = await resolveSubscription(subscriptionId, true);
     if (!resolved || resolved.kind === "legacy_pentestgpt") continue;
     const { subscription, tier } = resolved;
@@ -1836,6 +2020,7 @@ async function handlePaymentMethodUpdated(args: {
     const price = subscription.items?.data[0]?.price;
     // This is a card-selection event, not proof of payment or restored access.
     // Emit even if invoice.paid arrived first or there is no failure-ledger row.
+    markPaymentMethodRecoveryStep(diagnostic, "emit_payment_method_updated");
     for (const uid of userIds) {
       phLogger.event(
         PAID_FUNNEL_EVENTS.paymentMethodUpdated,
@@ -1860,6 +2045,7 @@ async function handlePaymentMethodUpdated(args: {
     }
 
     if (!invoiceId) continue;
+    markPaymentMethodRecoveryStep(diagnostic, "retrieve_invoice");
     const failureContext = await retrieveInvoiceForFailureAnalytics(invoiceId);
     if (!failureContext)
       throw new Error("Payment recovery invoice lookup failed");
@@ -1868,6 +2054,7 @@ async function handlePaymentMethodUpdated(args: {
       lifecycle: "invoice_payment_failed",
       paymentIntent: failureContext.paymentIntent,
     });
+    markPaymentMethodRecoveryStep(diagnostic, "record_involuntary_churn_event");
     await recordInvoluntaryChurnEvent({
       stripeEventId: args.stripeEventId,
       stripeEventType: args.stripeEventType,
@@ -1881,6 +2068,7 @@ async function handlePaymentMethodUpdated(args: {
       price,
       failureProperties,
     });
+    markPaymentMethodRecoveryStep(diagnostic, "recover_subscription_payment");
     await recoverSubscriptionPayment({
       stripe,
       subscription,
@@ -1891,6 +2079,7 @@ async function handlePaymentMethodUpdated(args: {
       customerEventCreated: args.subscriptionId
         ? undefined
         : Math.floor(args.eventOccurredAtMs / 1000),
+      diagnostic,
     });
   }
 }
@@ -2241,7 +2430,105 @@ async function handleCheckoutSessionCompleted(
   });
 }
 
-/** Handle customer.subscription.updated — reset old tier's buckets on plan change. */
+/**
+ * Stripe does not order webhooks. If invoice.paid ran while the subscription
+ * still exposed the monthly item, the applied month-to-year update finishes the
+ * same verified schedule restore. The event only selects candidates; live
+ * Stripe state and the paid latest invoice decide.
+ */
+async function restoreAnnualScheduleAfterSubscriptionUpdate({
+  subscription: eventSubscription,
+  previousItems,
+  tier,
+}: {
+  subscription: Stripe.Subscription;
+  previousItems: Partial<Stripe.ApiList<Stripe.SubscriptionItem>>;
+  tier: SubscriptionTier;
+}): Promise<void> {
+  const previousItem = previousItems.data?.[0];
+  const eventItem = eventSubscription.items?.data[0];
+  const customerId = stripeObjectId(eventSubscription.customer);
+  if (
+    tier === "free" ||
+    tier === "team" ||
+    !customerId ||
+    previousItems.data?.length !== 1 ||
+    eventSubscription.items?.data.length !== 1 ||
+    !eventItem ||
+    !previousItem?.id ||
+    previousItem.id !== eventItem.id ||
+    !isSingleIntervalPrice(previousItem.price, "month") ||
+    !isSingleIntervalPrice(eventItem.price, "year")
+  ) {
+    return;
+  }
+
+  const resolved = await resolveSubscription(eventSubscription.id, true);
+  if (resolved?.kind !== "resolved") return;
+  const live = resolved.subscription;
+  const liveItem = live.items?.data[0];
+  if (
+    resolved.tier !== tier ||
+    live.id !== eventSubscription.id ||
+    stripeObjectId(live.customer) !== customerId ||
+    !ENTITLED_SUBSCRIPTION_STATUSES.has(live.status) ||
+    live.pending_update ||
+    live.items?.has_more ||
+    live.items?.data.length !== 1 ||
+    liveItem?.id !== eventItem.id ||
+    liveItem.price?.id !== eventItem.price.id
+  ) {
+    return;
+  }
+
+  const invoice = await getPaidTierChangeInvoice(live);
+  if (
+    !invoice ||
+    invoiceSubscriptionId(invoice) !== live.id ||
+    stripeObjectId(invoice.customer) !== customerId
+  ) {
+    return;
+  }
+
+  const customerResult = await resolveUserIdsFromCustomer(customerId);
+  if (customerResult.reason === "lookup_failed") {
+    throw new Error("Subscription update customer lookup failed");
+  }
+  if (
+    customerResult.reason === "legacy_user_metadata" ||
+    customerResult.userIds.length === 0
+  ) {
+    return;
+  }
+
+  const transition = await sameTierMonthlyToAnnualTransition({
+    invoice,
+    subscription: live,
+    subscriptionId: live.id,
+    tier,
+  });
+  if (!transition) return;
+  if ("skipReason" in transition) {
+    phLogger.info("billing_annual_allowance_transition_not_applicable", {
+      stripe_subscription_id: live.id,
+      stripe_invoice_id: invoice.id,
+      subscription_tier: tier,
+      skip_reason: transition.skipReason,
+    });
+    return;
+  }
+  await restoreAnnualAllowanceSchedules({
+    userIds: customerResult.userIds,
+    tier,
+    subscriptionId: live.id,
+    invoice,
+    transition,
+    customerId,
+    orgId: customerResult.orgId ?? undefined,
+  });
+}
+
+/** Reconcile usage after an applied subscription change. */
 async function handleSubscriptionUpdated(
   subscription: Stripe.Subscription,
   previousAttributes: Partial<Stripe.Subscription> | undefined,
@@ -2308,7 +2595,7 @@ async function handleSubscriptionUpdated(
   }
 
   // Only act if the subscription items actually changed (plan change)
-  const previousItems = (previousAttributes as any)?.items;
+  const previousItems = previousAttributes?.items;
   if (!previousItems) return;
 
   const currentPrice = subscription.items?.data[0]?.price;
@@ -2330,12 +2617,20 @@ async function handleSubscriptionUpdated(
 
   const previousPriceId = previousItems?.data?.[0]?.price?.id;
   const previousTier =
-    subscriptionTierFromPrice(
-      previousItems?.data?.[0]?.price as Stripe.Price | undefined,
-    ) ?? null;
+    subscriptionTierFromPrice(previousItems?.data?.[0]?.price) ?? null;
 
-  // If tiers are the same, invoice.paid will handle the reset
-  if (currentTier === previousTier) return;
+  // If tiers are the same, invoice.paid will handle the reset. A month-to-year
+  // switch may have been paid before this item change became visible.
+  if (currentTier === previousTier) {
+    if (currentTier) {
+      await restoreAnnualScheduleAfterSubscriptionUpdate({
+        subscription,
+        previousItems,
+        tier: currentTier,
+      });
+    }
+    return;
+  }
 
   const customerId =
     typeof subscription.customer === "string"
@@ -2580,11 +2875,30 @@ async function markRetentionPauseEffective(
   }
 }
 
+/**
+ * Last boundary entered by handleSubscriptionDeleted, for failure diagnostics
+ * only. It does not mean that step's write committed or that it caused the
+ * failure. The one synchronous step separates the handler's own missing-invoice
+ * throw from the preceding referral update, which swallows its own errors.
+ */
+type SubscriptionDeletedStep =
+  | "void_unpaid_canceled_renewal_invoice"
+  | "resolve_subscription"
+  | "resolve_user_ids_from_customer"
+  | "record_cancellation_completed"
+  | "mark_retention_pause_effective"
+  | "set_referral_codes_paid_eligibility"
+  | "require_payment_failed_invoice_id"
+  | "retrieve_invoice_for_failure_analytics"
+  | "record_involuntary_churn_event"
+  | "emit_billing_payment_failed";
+
 /** Handle customer.subscription.deleted — emit churn analytics for the lapsed paid users. */
 async function handleSubscriptionDeleted(
   subscription: Stripe.Subscription,
   stripeEventId: string,
   eventOccurredAtMs: number,
+  diagnostic: { subscriptionDeletedStep?: SubscriptionDeletedStep },
 ): Promise<void> {
   const customerId =
     typeof subscription.customer === "string"
@@ -2599,6 +2913,7 @@ async function handleSubscriptionDeleted(
       subscription.cancellation_details?.reason ?? "",
     )
   ) {
+    diagnostic.subscriptionDeletedStep = "void_unpaid_canceled_renewal_invoice";
     const renewalResult = await voidUnpaidCanceledRenewalInvoice(
       stripe,
       subscription,
@@ -2617,6 +2932,7 @@ async function handleSubscriptionDeleted(
   let tier: SubscriptionTier | null = null;
 
   if (!lookupKey) {
+    diagnostic.subscriptionDeletedStep = "resolve_subscription";
     const resolved = await resolveSubscription(subscription.id);
     if (!resolved) {
       console.info(
@@ -2644,6 +2960,7 @@ async function handleSubscriptionDeleted(
     }
   }
 
+  diagnostic.subscriptionDeletedStep = "resolve_user_ids_from_customer";
   const { userIds, orgId, reason } =
     await resolveUserIdsFromCustomer(customerId);
   if (userIds.length === 0) {
@@ -2669,6 +2986,7 @@ async function handleSubscriptionDeleted(
     `[Subscription Webhook] subscription.deleted: tier ${tier ?? "unknown"} cancelled for ${userIds.length} user(s) (reason: ${cancellationReason ?? "none"})`,
   );
 
+  diagnostic.subscriptionDeletedStep = "record_cancellation_completed";
   await recordCancellationCompleted({
     subscription,
     customerId,
@@ -2679,6 +2997,7 @@ async function handleSubscriptionDeleted(
     completionType: "deleted",
     eventOccurredAtMs,
   });
+  diagnostic.subscriptionDeletedStep = "mark_retention_pause_effective";
   await markRetentionPauseEffective(subscription, eventOccurredAtMs);
   const pauseProperties = retentionPauseProperties(subscription);
 
@@ -2700,6 +3019,7 @@ async function handleSubscriptionDeleted(
     });
   }
 
+  diagnostic.subscriptionDeletedStep = "set_referral_codes_paid_eligibility";
   await setReferralCodesPaidEligibility({
     userIds,
     active: false,
@@ -2707,12 +3027,14 @@ async function handleSubscriptionDeleted(
 
   if (cancellationReason !== "payment_failed") return;
 
+  diagnostic.subscriptionDeletedStep = "require_payment_failed_invoice_id";
   const latestInvoiceId = stripeObjectId(subscription.latest_invoice);
   if (!latestInvoiceId) {
     throw new Error(
       `Payment-failed subscription ${subscription.id} is missing its latest invoice`,
     );
   }
+  diagnostic.subscriptionDeletedStep = "retrieve_invoice_for_failure_analytics";
   const failureContext =
     await retrieveInvoiceForFailureAnalytics(latestInvoiceId);
   if (!failureContext) {
@@ -2728,6 +3050,7 @@ async function handleSubscriptionDeleted(
     paymentIntent: failureContext.paymentIntent,
   });
 
+  diagnostic.subscriptionDeletedStep = "record_involuntary_churn_event";
   await recordInvoluntaryChurnEvent({
     stripeEventId,
     stripeEventType: "customer.subscription.deleted",
@@ -2742,6 +3065,7 @@ async function handleSubscriptionDeleted(
     failureProperties,
   });
 
+  diagnostic.subscriptionDeletedStep = "emit_billing_payment_failed";
   await emitBillingPaymentFailed({
     stripeEventId,
     stripeEventType: "customer.subscription.deleted",
@@ -2775,7 +3099,7 @@ async function handleSubscriptionDeleted(
  */
 async function handleSubscriptionWebhook(
   req: NextRequest,
-  diagnostic: { phase: SubscriptionWebhookPhase },
+  diagnostic: SubscriptionWebhookDiagnostic,
 ) {
   const body = await req.text();
   const signature = req.headers.get("stripe-signature");
@@ -2934,6 +3258,7 @@ async function handleSubscriptionWebhook(
         ) &&
         stripeObjectId(previous.default_payment_method) !== paymentMethodId
       ) {
+        diagnostic.paymentMethodRecovery = {};
         await handlePaymentMethodUpdated({
           customerId,
           subscriptionId: updated.id,
@@ -2941,7 +3266,10 @@ async function handleSubscriptionWebhook(
           stripeEventId: event.id,
           stripeEventType: "customer.subscription.updated",
           eventOccurredAtMs: stripeEventOccurredAtMs(event),
+          diagnostic: diagnostic.paymentMethodRecovery,
         });
+        // A later subscription-update failure must not inherit this step.
+        diagnostic.paymentMethodRecovery = undefined;
       }
       await handleSubscriptionUpdated(
         event.data.object as Stripe.Subscription,
@@ -2957,6 +3285,7 @@ async function handleSubscriptionWebhook(
         event.data.object as Stripe.Subscription,
         event.id,
         stripeEventOccurredAtMs(event),
+        diagnostic,
       );
       break;
     }
@@ -2974,13 +3303,16 @@ async function handleSubscriptionWebhook(
           paymentMethodId,
         )
       ) {
+        diagnostic.paymentMethodRecovery = {};
         await handlePaymentMethodUpdated({
           customerId: updated.id,
           paymentMethodId,
           stripeEventId: event.id,
           stripeEventType: "customer.updated",
           eventOccurredAtMs: stripeEventOccurredAtMs(event),
+          diagnostic: diagnostic.paymentMethodRecovery,
         });
+        diagnostic.paymentMethodRecovery = undefined;
       }
       break;
     }
@@ -3037,6 +3369,14 @@ type SubscriptionWebhookPhase =
   | "mark_processed"
   | "respond";
 
+/** Request-local failure location; never shared between deliveries. */
+type SubscriptionWebhookDiagnostic = {
+  phase: SubscriptionWebhookPhase;
+  subscriptionDeletedStep?: SubscriptionDeletedStep;
+  /** Set only while a default-card recovery handler is running or has thrown. */
+  paymentMethodRecovery?: PaymentMethodRecoveryDiagnostic;
+};
+
 /** Drain failure context without creating a second error during request teardown. */
 async function flushWebhookFailureContext() {
   try {
@@ -3048,9 +3388,7 @@ async function flushWebhookFailureContext() {
 
 /** Add only the last entered phase; Next retains the original error report. */
 export async function POST(req: NextRequest) {
-  const diagnostic: { phase: SubscriptionWebhookPhase } = {
-    phase: "read_body",
-  };
+  const diagnostic: SubscriptionWebhookDiagnostic = { phase: "read_body" };
   try {
     return await handleSubscriptionWebhook(req, diagnostic);
   } catch (error) {
@@ -3060,6 +3398,14 @@ export async function POST(req: NextRequest) {
       phLogger.warn("subscription_webhook_failure_context", {
         diagnostic_version: 1,
         webhook_phase: diagnostic.phase,
+        ...(diagnostic.phase === "subscription_deleted" &&
+        diagnostic.subscriptionDeletedStep
+          ? { subscription_deleted_step: diagnostic.subscriptionDeletedStep }
+          : {}),
+        ...(diagnostic.phase === "customer_updated" ||
+        diagnostic.phase === "subscription_updated"
+          ? paymentMethodRecoveryFailureFields(diagnostic.paymentMethodRecovery)
+          : {}),
         ...(requestId &&
         /^(?:[a-z0-9-]{1,32}::){0,2}[a-z0-9]{3,12}-\d{13}-[a-f0-9]{12,64}$/.test(
           requestId,
