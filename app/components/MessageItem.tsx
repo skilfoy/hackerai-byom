@@ -1,3 +1,4 @@
+import { isAgentSteerPart } from "@/lib/chat/agent-steer";
 import type { LimitRescueRequest } from "@/types/chat";
 import { GoalTargetIcon } from "@/components/icons/goal-target";
 import { memo, useMemo, useCallback, Fragment, useState } from "react";
@@ -20,7 +21,15 @@ import {
   WorkedForContent,
   WorkedForTrigger,
 } from "@/components/ai-elements/worked-for";
-import { ChevronDown, ChevronUp, FileSearch, CircleCheck } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronUp,
+  FileSearch,
+  CircleCheck,
+  CircleStop,
+} from "lucide-react";
+import { requiresManualAgentResume } from "@/lib/chat/manual-agent-resume";
+import { CLIENT_SAVED_FINISH_REASON } from "@/lib/chat/stop-conditions";
 import {
   extractMessageText,
   hasTextContent,
@@ -68,6 +77,8 @@ interface MessageItemProps {
   tempChatFileDetails?: Map<string, FileDetails[]>;
   finishReason?: string;
   continueDisabledReason?: string;
+  /** The stopped run's own computer is connected again. */
+  stoppedComputerReconnected?: boolean;
   mode?: ChatMode;
   branchedFromChatId?: string;
   branchedFromChatTitle?: string;
@@ -119,6 +130,8 @@ function areMessageItemPropsEqual(
   if (prev.lastUserMessageIndex !== next.lastUserMessageIndex) return false;
   if (prev.finishReason !== next.finishReason) return false;
   if (prev.continueDisabledReason !== next.continueDisabledReason) return false;
+  if (prev.stoppedComputerReconnected !== next.stoppedComputerReconnected)
+    return false;
   if (prev.onContinue !== next.onContinue) return false;
   if (prev.mode !== next.mode) return false;
   if (prev.agentRunSpendCapWarning !== next.agentRunSpendCapWarning)
@@ -169,6 +182,10 @@ function areMessageItemPropsEqual(
     )
       return false;
     if (
+      prev.message.metadata?.userStopped !== next.message.metadata?.userStopped
+    )
+      return false;
+    if (
       prev.message.metadata?.goal?.sent !== next.message.metadata?.goal?.sent ||
       prev.message.metadata?.goal?.achievedElapsedMs !==
         next.message.metadata?.goal?.achievedElapsedMs
@@ -196,6 +213,7 @@ export const MessageItem = memo(function MessageItem({
   tempChatFileDetails,
   finishReason,
   continueDisabledReason,
+  stoppedComputerReconnected,
   mode,
   branchedFromChatId,
   branchedFromChatTitle,
@@ -361,9 +379,32 @@ export const MessageItem = memo(function MessageItem({
     />
   );
 
-  const renderWorkParts = () => (
+  // Steers stay visible once a finished run collapses its work: they show
+  // between Worked for and the answer instead of inside the collapsed work.
+  const steerActivities = workProjection.activities.filter(({ part }) =>
+    isAgentSteerPart(part),
+  );
+  // Only steers would be left inside Worked for: show them without it.
+  const hasCollapsibleWork =
+    steerActivities.length === 0 ||
+    workProjection.activities.length > steerActivities.length;
+  const renderSteers = () =>
+    steerActivities.length > 0 ? (
+      <div key="steers">
+        {steerActivities.map(({ part, partIndex }) =>
+          renderAssistantPart(part, partIndex),
+        )}
+      </div>
+    ) : null;
+
+  const renderWorkParts = (omitSteers = false) => (
     <>
-      {workProjection.activities.map(({ id, part, partIndex, groupedParts }) =>
+      {(omitSteers
+        ? workProjection.activities.filter(
+            ({ part }) => !isAgentSteerPart(part),
+          )
+        : workProjection.activities
+      ).map(({ id, part, partIndex, groupedParts }) =>
         groupedParts ? (
           <SubagentToolGroup
             key={id}
@@ -445,6 +486,15 @@ export const MessageItem = memo(function MessageItem({
   if (isLastAssistantMessage && !hasAnyContent && showingLoadingIndicator) {
     return null;
   }
+
+  const showsUserStop =
+    message.metadata?.userStopped === true &&
+    !(isLastMessage && (status === "streaming" || status === "submitted"));
+  // The divider explains a manual Stop; keep notices that need recovery.
+  const userStopOwnsFinishNotice =
+    showsUserStop &&
+    !requiresManualAgentResume(finishReason) &&
+    finishReason !== CLIENT_SAVED_FINISH_REASON;
 
   return (
     <Fragment>
@@ -598,7 +648,7 @@ export const MessageItem = memo(function MessageItem({
                   </>
                 ) : (
                   <>
-                    {workParts.length > 0 && (
+                    {workParts.length > 0 && hasCollapsibleWork && (
                       <WorkedFor
                         key="work"
                         hasWork={workProjection.hasExpandableWork}
@@ -606,10 +656,11 @@ export const MessageItem = memo(function MessageItem({
                       >
                         <WorkedForTrigger durationMs={generationTimeMs} />
                         <WorkedForContent lazy>
-                          {renderWorkParts}
+                          {() => renderWorkParts(true)}
                         </WorkedForContent>
                       </WorkedFor>
                     )}
+                    {renderSteers()}
                     {trailingTextParts.length > 0 && (
                       <div
                         className={
@@ -726,7 +777,8 @@ export const MessageItem = memo(function MessageItem({
         {/* Finish reason notice under last assistant message */}
         {isLastAssistantMessage &&
           index > (lastUserMessageIndex ?? -1) &&
-          status !== "streaming" && (
+          status !== "streaming" &&
+          !userStopOwnsFinishNotice && (
             <FinishReasonNotice
               finishReason={finishReason}
               lastSavedStep={
@@ -739,6 +791,7 @@ export const MessageItem = memo(function MessageItem({
                   : "conversation"
               }
               continueDisabledReason={continueDisabledReason}
+              stoppedComputerReconnected={stoppedComputerReconnected}
               status={status}
               mode={mode}
               agentRunSpendCapPremiumContinuationAllowed={
@@ -800,6 +853,34 @@ export const MessageItem = memo(function MessageItem({
           </div>
         )}
       </div>
+
+      {showsUserStop && (
+        <div
+          data-testid="user-stop-divider"
+          className="mt-2 flex items-center gap-2 py-3 text-sm sm:gap-4"
+        >
+          <div
+            aria-hidden
+            className="h-px min-w-2 flex-1 bg-border sm:min-w-4"
+          />
+          <div className="flex min-w-0 flex-wrap items-center justify-center gap-x-1.5 gap-y-0.5">
+            <span className="inline-flex items-center gap-1.5 whitespace-nowrap font-medium text-foreground/80">
+              <CircleStop
+                aria-hidden
+                className="size-4 shrink-0 text-muted-foreground"
+              />
+              Run interrupted
+            </span>{" "}
+            <span className="whitespace-nowrap text-muted-foreground">
+              <span aria-hidden>· </span>Stopped by user
+            </span>
+          </div>
+          <div
+            aria-hidden
+            className="h-px min-w-2 flex-1 bg-border sm:min-w-4"
+          />
+        </div>
+      )}
 
       {/* Branch indicator - show after the branched message */}
       {shouldShowBranchIndicator && (

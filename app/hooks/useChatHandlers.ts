@@ -62,6 +62,15 @@ import { isPastedTextAttachmentAvailableInMode } from "@/lib/utils/pasted-text-a
 import { sanitizeForConvexValue } from "@/lib/db/convex-value-sanitizer";
 import { reconcileSidebarContentAfterRegeneration } from "@/lib/utils/sidebar-utils";
 import { v4 as uuidv4 } from "uuid";
+import { AGENT_STEER_MAX_TEXT_LENGTH } from "@/lib/chat/agent-steer";
+import {
+  rememberSteerSentHere,
+  rememberStoppedRun,
+} from "@/app/hooks/useUnreadSteerRequeue";
+import {
+  isAlternateSubmit,
+  resolveFollowUpBehavior,
+} from "@/lib/chat/follow-up-behavior";
 import {
   captureAuthenticatedEvent,
   captureQueuedAuthenticatedEvent,
@@ -193,6 +202,7 @@ export const useChatHandlers = ({
     messageQueue,
     removeQueuedMessage,
     queueBehavior,
+    agentSteeringEnabled,
     editingQueuedMessageId,
     sandboxPreference,
     desktopEnvironmentId,
@@ -215,6 +225,7 @@ export const useChatHandlers = ({
   // values.
   const requestSelectedModelRef = useCommittedRef(requestSelectedModel);
   const chatModeRef = useCommittedRef(chatMode);
+  const messageQueueRef = useLatestRef(messageQueue);
   const sandboxPreferenceRef = useCommittedRef(sandboxPreference);
   const desktopEnvironmentIdRef = useCommittedRef(desktopEnvironmentId);
   const agentPermissionModeRef = useCommittedRef(agentPermissionMode);
@@ -309,6 +320,9 @@ export const useChatHandlers = ({
   );
   const cancelStreamMutation = useMutation(
     api.chatStreams.cancelStreamFromClient,
+  );
+  const markMessageUserStopped = useMutation(
+    api.chatStreams.markMessageUserStopped,
   );
   /** Prepare storage-only parts without awaiting code needed by backend Stop. */
   const getStopSnapshot = (message: ChatMessage): StopSnapshot => {
@@ -522,12 +536,12 @@ export const useChatHandlers = ({
     skipSave?: boolean;
     requireCancelSuccess?: boolean;
     requireSaveSuccess?: boolean;
-  }): Promise<ChatMessage[]> => {
+  }): Promise<boolean> => {
     // Stop the stream immediately (client-side abort)
     stop();
 
     // Early return if no messages to process
-    if (messages.length === 0) return messages;
+    if (messages.length === 0) return false;
 
     // Normalize messages to mark incomplete tools as interrupted/completed
     const { messages: normalizedMessages, hasChanges } = normalizeMessages(
@@ -651,7 +665,7 @@ export const useChatHandlers = ({
       // filtered subset or an invented empty list would overwrite progress.
       ...(isTodoSnapshotForCancellation(todos) ? { todos } : {}),
     });
-    await Promise.all([
+    const [wasRunning] = await Promise.all([
       options?.requireCancelSuccess
         ? cancelPromise
         : cancelPromise.catch((error) => {
@@ -660,7 +674,7 @@ export const useChatHandlers = ({
       savePromise,
     ]);
 
-    return normalizedMessages;
+    return wasRunning === true;
   };
 
   const stopActiveRunForReplacement = async (
@@ -696,10 +710,60 @@ export const useChatHandlers = ({
     return true;
   };
 
+  const createAgentSteer = useMutation(api.agentSteers.create);
+  /**
+   * Send text into the running Agent's next step. False means it could not
+   * steer (no Trigger run yet or any more, too long, or the store refused it)
+   * and the caller should queue it instead.
+   */
+  const steerActiveRun = async (
+    text: string,
+    sentAt = Date.now(),
+    /** A queued message leaving the queue with this steer. */
+    queuedId?: string,
+  ): Promise<boolean> => {
+    const trimmed = text.trim();
+    if (
+      !agentSteeringEnabled ||
+      chatModeRef.current !== "agent" ||
+      !activeTriggerRunRef?.current ||
+      !trimmed ||
+      trimmed.length > AGENT_STEER_MAX_TEXT_LENGTH
+    )
+      return false;
+    const id = uuidv4();
+    // Before the write: the run can end and recovery start while it is pending.
+    rememberSteerSentHere(id);
+    try {
+      return (
+        (await createAgentSteer({
+          chatId,
+          id,
+          text: trimmed,
+          sentAt,
+          ...(queuedId ? { queuedId } : {}),
+          // Kept with the steer in case it returns to the queue unread.
+          settings: {
+            agentPermissionMode: agentPermissionModeRef.current,
+            sandboxPreference: sandboxPreferenceRef.current,
+            ...(requestSelectedModelRef.current
+              ? { selectedModel: requestSelectedModelRef.current }
+              : {}),
+          },
+        })) === "pending"
+      );
+    } catch (error) {
+      console.warn("Could not steer the Agent run; queueing instead", error);
+      return false;
+    }
+  };
+
   const stopActiveRunForSteer = async (
     action: "stop_and_send" | "send_now",
   ): Promise<boolean> => {
     const requestGeneration = getAgentRunRequestGeneration?.();
+    if (activeTriggerRunRef?.current)
+      rememberStoppedRun(activeTriggerRunRef.current);
     // Persist the latest message and todo snapshot before canceling the Trigger
     // run. The next run reads the persisted todo snapshot.
     // Capture a pending start now, before the todo save can outlive its response.
@@ -1192,18 +1256,62 @@ export const useChatHandlers = ({
       }
     }
 
+    // The server is starting a queued message as the next turn: a new
+    // message waits behind it in the queue, so the queue keeps its order.
+    // Read the latest queue: a claim can land while validation awaits above.
+    const serverSendingQueued = messageQueueRef.current.some(
+      (queued) => queued.dispatching,
+    );
     // While an Agent run is starting or streaming, honor the queue behavior.
     if (
       !stoppedGoalForMessage &&
-      (status === "streaming" || status === "submitted")
+      (status === "streaming" || status === "submitted" || serverSendingQueued)
     ) {
       const validFiles = uploadedFiles
         .filter(isSendableUploadedFile)
         .map(createFileMessagePartFromUploadedFile)
         .filter((part): part is NonNullable<typeof part> => part !== null);
 
-      const deferForSummary = wasSummarizing || isSummarizingRef.current;
-      if (deferForSummary || queueBehavior === "queue") {
+      let followUpBehavior = serverSendingQueued
+        ? "queue"
+        : resolveFollowUpBehavior(
+            queueBehavior,
+            agentSteeringEnabled && isAlternateSubmit(e),
+          );
+      // A steer that cannot join the run is only queued. It must never turn
+      // into the stop-and-send that summarization applies to other follow-ups.
+      let steerFellBackToQueue = false;
+      if (followUpBehavior === "steer") {
+        // Attachments cannot join a running step. Queue them rather than
+        // cancelling work the user did not ask to stop.
+        if (validFiles.length > 0) {
+          followUpBehavior = "queue";
+          steerFellBackToQueue = true;
+        } else {
+          const steered = await steerActiveRun(input);
+          if (steered) {
+            captureAuthenticatedEvent("chat_user_submission", {
+              definition_version: 1,
+              mode: currentChatMode,
+              subscription_tier: subscription,
+              steered: true,
+            });
+            clearSubmittedDraft();
+            return true;
+          }
+          if (currentChatIdRef.current !== chatId) return false;
+          followUpBehavior = "queue";
+          steerFellBackToQueue = true;
+        }
+      }
+
+      // Summarization defers a follow-up that will stop the run. With steering
+      // available, a queue choice (including Cmd/Ctrl+Enter) only queues.
+      const deferForSummary =
+        !steerFellBackToQueue &&
+        (wasSummarizing || isSummarizingRef.current) &&
+        (!agentSteeringEnabled || followUpBehavior === "stop-and-send");
+      if (deferForSummary || followUpBehavior === "queue") {
         // During compaction, accept the draft now and steer as soon as the
         // summary settles. Ordinary queue mode waits for the full response.
         const queuedId = queueMessage(input, validFiles);
@@ -1225,7 +1333,7 @@ export const useChatHandlers = ({
         clearSubmittedDraft();
 
         return true;
-      } else if (queueBehavior === "stop-and-send") {
+      } else if (followUpBehavior === "stop-and-send") {
         try {
           if (!(await stopActiveRunForSteer("stop_and_send"))) return false;
         } catch (error) {
@@ -1350,7 +1458,17 @@ export const useChatHandlers = ({
     stopGenerationRef.current += 1;
     const stoppedGeneration = stopGenerationRef.current;
     setSummarySteer(null);
-
+    // Only the composer's explicit Stop records the transcript marker; goal
+    // controls stop a run as a side effect of another action. Capture the
+    // turn now: the partial reply, or the request when nothing has streamed.
+    const lastMessage = messages[messages.length - 1];
+    const stopAnchor =
+      options === undefined &&
+      lastMessage &&
+      (lastMessage.role === "assistant" ||
+        (lastMessage.role === "user" && !lastMessage.metadata?.isAutoContinue))
+        ? { messageId: lastMessage.id, role: lastMessage.role }
+        : undefined;
     const requestGeneration = getAgentRunRequestGeneration?.();
     captureAuthenticatedEvent("chat_response_stop_requested", {
       chat_id: chatId,
@@ -1365,6 +1483,9 @@ export const useChatHandlers = ({
 
     // Set manual stop flag to prevent auto-processing of queue
     hasManuallyStoppedRef.current = true;
+    // Its unread steers must wait for the user, not ride this flag.
+    if (activeTriggerRunRef?.current)
+      rememberStoppedRun(activeTriggerRunRef.current);
 
     // Clear any active status indicators immediately
     onStopCallback?.();
@@ -1391,6 +1512,44 @@ export const useChatHandlers = ({
     ) {
       await recoverStaleAgentRun(triggerCancelResult.value, requestGeneration);
       return false;
+    }
+
+    // Agent needs its exact run acknowledged as canceled; Ask needs Convex to
+    // confirm this Stop ended a running stream. Anything else leaves no marker.
+    const stopAcknowledged =
+      triggerCancelResult.status === "fulfilled" &&
+      (triggerCancelResult.value.outcome === "canceled" ||
+        (triggerCancelResult.value.outcome === "not_applicable" &&
+          streamStopResult.status === "fulfilled" &&
+          streamStopResult.value));
+    if (stopAnchor && stopAcknowledged) {
+      try {
+        const marked = await markMessageUserStopped({
+          chatId,
+          messageId: stopAnchor.messageId,
+          role: stopAnchor.role,
+        });
+        if (
+          marked === true &&
+          currentChatIdRef.current === chatId &&
+          stopGenerationRef.current === stoppedGeneration
+        ) {
+          setMessages((current) =>
+            current.map((message) =>
+              message.id === stopAnchor.messageId &&
+              message.role === stopAnchor.role
+                ? {
+                    ...message,
+                    metadata: { ...message.metadata, userStopped: true },
+                  }
+                : message,
+            ),
+          );
+        }
+      } catch (error) {
+        // The run is already stopped; a missing marker must not undo that.
+        console.error("Failed to record the stopped turn:", error);
+      }
     }
 
     return (
@@ -1811,6 +1970,9 @@ export const useChatHandlers = ({
       updatedMessages[editedMessageIndex] = {
         ...currentMessage,
         parts: buildUpdatedParts(currentMessage.parts),
+        ...(currentMessage.metadata?.userStopped
+          ? { metadata: { ...currentMessage.metadata, userStopped: undefined } }
+          : {}),
       };
 
       return updatedMessages;
@@ -1930,10 +2092,66 @@ export const useChatHandlers = ({
     messageId: string,
     options: RetryOptions = {},
     retryAction?: ReplacementAction,
+    // A follow-up deferred by summarization already chose to stop the run.
+    { allowSteer = true }: { allowSteer?: boolean } = {},
   ) => {
     if (sendDisabledReasonRef.current) return;
     const message = messageQueue.find((m) => m.id === messageId);
     if (!message || message.deliveryStatus === "sending") return;
+    // The server is starting a queued message as the next turn. Nothing else
+    // may start until its run is attached, or the queue would run out of order.
+    if (messageQueue.some((queued) => queued.dispatching)) {
+      toast.info("Sending your queued message first", {
+        description: "Send this one after the Agent starts on it.",
+      });
+      return;
+    }
+    // Goal runs keep the existing pause-and-send path.
+    const goalActive =
+      !!goalStateRef.current &&
+      ["queued", "running", "waiting", "needs_approval"].includes(
+        goalStateRef.current,
+      );
+    if (
+      allowSteer &&
+      agentSteeringEnabled &&
+      chatModeRef.current === "agent" &&
+      !isSendingNowRef.current &&
+      !retryAction &&
+      !goalActive &&
+      !message.deliveryStatus &&
+      !message.files?.length &&
+      hasActiveRunToReplace()
+    ) {
+      // Hold automatic queue delivery while this message moves into the run.
+      isSendingNowRef.current = true;
+      try {
+        // Keep its queue position if the run never reads it.
+        if (await steerActiveRun(message.text, message.timestamp, messageId)) {
+          captureAuthenticatedEvent("agent_follow_up", {
+            telemetry_version: 1,
+            action: "queued_row_steered",
+            from_steer: !!message.fromSteer,
+          });
+          // An edit made while the steer was pending stays queued.
+          const latest = messageQueueRef.current.find(
+            (item) => item.id === messageId,
+          );
+          if (!latest || latest.text === message.text)
+            removeQueuedMessage(messageId);
+        } else if (currentChatIdRef.current === chatId) {
+          // Never fall back to stopping a run the user asked to steer.
+          toast.error("Could not steer the Agent run", {
+            description: "Your message is still queued.",
+          });
+        }
+        return;
+      } finally {
+        isSendingNowRef.current = false;
+        // The ref held automatic delivery; ask the queue to check again.
+        setSendNowReleaseVersion((version) => version + 1);
+      }
+    }
     if (isSummarizingRef.current) {
       hasManuallyStoppedRef.current = false;
       setSummarySteer({ chatId, messageId, options, retryAction });
@@ -1948,6 +2166,14 @@ export const useChatHandlers = ({
 
     // Reset manual stop flag when using Send Now
     hasManuallyStoppedRef.current = false;
+    if (agentSteeringEnabled)
+      captureAuthenticatedEvent("agent_follow_up", {
+        telemetry_version: 1,
+        action: "queued_sent_now",
+        held: !!message.held,
+        from_steer: !!message.fromSteer,
+        run_active: hasActiveRunToReplace(),
+      });
 
     try {
       setIsAutoResuming(false);
@@ -2039,7 +2265,9 @@ export const useChatHandlers = ({
       sendDisabledReason ||
       editingQueuedMessageId != null ||
       hasManuallyStoppedRef.current ||
-      isSendingNowRef.current
+      isSendingNowRef.current ||
+      // Keep the deferred send until the server's queued message has a run.
+      messageQueue.some((queued) => queued.dispatching)
     ) {
       return;
     }
@@ -2055,6 +2283,7 @@ export const useChatHandlers = ({
       message.id,
       summarySteer.options,
       summarySteer.retryAction,
+      { allowSteer: false },
     );
   }, [
     summarySteer,
@@ -2071,6 +2300,8 @@ export const useChatHandlers = ({
 
   return {
     hasPendingSummarySteer: summarySteer?.chatId === chatId,
+    /** Changes when Send Now releases the queue hold. */
+    sendNowReleaseVersion,
     handleSubmit,
     handleStop,
     handleRegenerate,

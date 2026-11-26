@@ -125,7 +125,7 @@ it("correlates provider errors and final outcomes to distinct Agent runs in one 
         Object.assign(new Error("Invalid provider request"), {
           statusCode: 400,
         }),
-        { mode: "agent", model: "model-abliterated" },
+        { mode: "agent", model: "model-inference-cyber" },
       );
       chatLogger.emitSuccess({
         finishReason: "stop",
@@ -166,15 +166,15 @@ it("emits the complete model history in the final request event", () => {
         isNewChat: true,
         notesEnabled: false,
       },
-      "model-abliterated",
+      "model-inference-cyber",
     );
     const first = {
       timestamp: "2026-09-16T16:57:49.280Z",
       generation_step: 1,
-      configured: "model-abliterated",
-      requested: "abliterated-model",
-      actual: "abliterated-model",
-      provider: "abliteration.chat",
+      configured: "model-inference-cyber",
+      requested: "deepseek-v4.1-flash-1017-cyber",
+      actual: "deepseek-v4.1-flash-1017-cyber",
+      provider: "inference.chat",
       outcome: "pending",
     };
     chatLogger.recordProviderModelCall(first);
@@ -203,8 +203,8 @@ it("emits the complete model history in the final request event", () => {
     expect(event.model.history).toEqual([
       expect.objectContaining({
         call_index: 1,
-        provider: "abliteration.chat",
-        actual: "abliterated-model",
+        provider: "inference.chat",
+        actual: "deepseek-v4.1-flash-1017-cyber",
         outcome: "completed",
       }),
       expect.objectContaining({
@@ -914,6 +914,50 @@ describe("captureAgentRun", () => {
     });
   });
 
+  it("adds the local recovery outcome and resumed stop to the completed run event", () => {
+    const capture = jest.fn();
+    const posthog = { capture } as any;
+    const reporting = createAgentRunReporting({
+      posthog,
+      runId: "run_resumed",
+      userId: "user_123",
+      chatId: "chat_123",
+      subscription: "pro",
+      endpoint: "/api/agent",
+      resumeFromFinishReason: "local-connection-lost",
+    });
+    reporting.setLocalRecoverySource(() => ({
+      recoveredOutages: 1,
+      maxRecoveredOutageMs: 70_000,
+    }));
+    reporting.captureTerminal(captureAgentCompletionAnalytics, {
+      posthog,
+      userId: "user_123",
+      chatId: "chat_123",
+      endpoint: "/api/agent",
+      mode: "agent",
+      subscription: "pro",
+      sandboxInfo: { type: "desktop" },
+      outcome: "success",
+      hasResponseContent: true,
+      chatLogger: undefined,
+      selectedModel: "model-grok-4.6",
+      configuredModelId: "x-ai/grok-4.6",
+      finishReason: "stop",
+      triggerRunId: "run_resumed",
+      abliteratedProviderSummary: undefined,
+    });
+    const [run] = capture.mock.calls
+      .map(([event]: any) => event)
+      .filter((event: any) => event.event === "hackerai-agent_run");
+    expect(run.properties).toMatchObject({
+      resume_from_finish_reason: "local-connection-lost",
+      local_recovery_outcome: "recovered",
+      local_recovered_outages: 1,
+      local_recovered_max_outage_bucket: "60s_120s",
+    });
+  });
+
   it("adds no recovery history fields for a caller-supplied object", () => {
     const capture = jest.fn();
     captureAgentRun({
@@ -1274,8 +1318,8 @@ describe("captureAgentCompletionAnalytics", () => {
         mode,
         subscription: "pro",
         outcome: "success",
-        selectedModel: "model-abliterated",
-        configuredModelId: "abliterated-model",
+        selectedModel: "model-inference-cyber",
+        configuredModelId: "deepseek-v4.1-flash-1017-cyber",
         responseModel: "deepseek/deepseek-v4-flash-0731",
         fallbackServed: true,
         sandboxInfo: null,
@@ -1332,8 +1376,8 @@ describe("captureAgentCompletionAnalytics", () => {
         mode,
         subscription: "pro",
         outcome: "success",
-        selectedModel: "model-abliterated",
-        configuredModelId: "abliterated-model",
+        selectedModel: "model-inference-cyber",
+        configuredModelId: "deepseek-v4.1-flash-1017-cyber",
         responseModel: "deepseek/deepseek-v4-flash-0731",
         fallbackServed: true,
         sandboxInfo: { type: "e2b" },
@@ -1396,8 +1440,8 @@ describe("captureAgentCompletionAnalytics", () => {
         subscription: "free",
         outcome: "aborted",
         abortSource: "request_cancel",
-        selectedModel: "model-abliterated",
-        configuredModelId: "abliterated-model-large-flash",
+        selectedModel: "model-inference-cyber",
+        configuredModelId: "deepseek-v4.1-flash-1017-cyber",
         responseModel: "z-ai/glm-5.3-flash",
         fallbackServed: true,
         sandboxInfo: null,
@@ -1672,12 +1716,12 @@ describe("captureUsageCost", () => {
         included_points_deducted: 1000,
         extra_usage_points_deducted: 3200,
         usage_economics_version: 2,
-        usage_pricing_version: "request-1.30-extra-1.30-v2",
-        request_usage_multiplier: 1.3,
-        included_usage_multiplier: 1.3,
-        extra_usage_multiplier: 1.3,
+        usage_pricing_version: "request-1.20-extra-1.20-v2",
+        request_usage_multiplier: 1.2,
+        included_usage_multiplier: 1.2,
+        extra_usage_multiplier: 1.2,
         extra_usage_balance_multiplier: 1.5,
-        effective_extra_usage_multiplier: 1.95,
+        effective_extra_usage_multiplier: 1.8,
         included_usage_value_dollars: 0.1,
         extra_usage_charge_dollars: 0.48,
         covered_usage_value_dollars: 0.58,
@@ -1966,12 +2010,12 @@ describe("captureUsageSettlement", () => {
         usage_deduction_failed: true,
         usage_deduction_failure_reason: "monthly_cap_exceeded",
         forced: false,
-        usage_pricing_version: "request-1.30-extra-1.30-v2",
-        request_usage_multiplier: 1.3,
-        included_usage_multiplier: 1.3,
-        extra_usage_multiplier: 1.3,
+        usage_pricing_version: "request-1.20-extra-1.20-v2",
+        request_usage_multiplier: 1.2,
+        included_usage_multiplier: 1.2,
+        extra_usage_multiplier: 1.2,
         extra_usage_balance_multiplier: 1.5,
-        effective_extra_usage_multiplier: 1.95,
+        effective_extra_usage_multiplier: 1.8,
         settlement_capture_reason: "anomaly",
         settlement_run_sampled:
           isUsageSettlementSuccessSampled("settlement_123"),
@@ -3572,7 +3616,7 @@ it.each(["ask", "agent"] as const)(
         sandboxInfo: null,
         chatLogger: undefined,
         abliteratedProviderSummary: undefined,
-        selectedModel: "model-abliterated",
+        selectedModel: "model-inference-cyber",
         experiment: {
           key: "abliterated_free_three_steps_default_v1",
           variant: "test",

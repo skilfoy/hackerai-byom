@@ -4,8 +4,10 @@ import { api } from "@/convex/_generated/api";
 import { resolveEnvironmentConnection } from "./environment";
 import { CentrifugoSandbox } from "@/lib/ai/tools/utils/centrifugo-sandbox";
 import {
+  filesystemListDiagnostics,
   workspaceReaderCommand,
   WorkspaceFileError,
+  type WorkspaceAccessProgress,
   type WorkspaceRequest,
 } from "./workspace-files";
 import { z } from "zod";
@@ -69,7 +71,9 @@ export async function accessLocalWorkspaceFiles(
   preference: string,
   input: WorkspaceRequest,
   root?: string,
+  progress: WorkspaceAccessProgress = {},
 ) {
+  progress.step = "lookup";
   const serviceKey = process.env.CONVEX_SERVICE_ROLE_KEY;
   const wsUrl = process.env.CENTRIFUGO_WS_URL;
   const tokenSecret = process.env.CENTRIFUGO_TOKEN_SECRET;
@@ -99,15 +103,19 @@ export async function accessLocalWorkspaceFiles(
     throw new WorkspaceFileError("workspace_changed", 409);
   if (connection.osInfo?.platform === "win32")
     return { state: "unsupported" as const, environmentLabel: connection.name };
+  // The saved root is only the reader's argument, never the relay cwd: a moved
+  // folder would otherwise fail spawn before the reader can report not_found.
   const sandbox = new CentrifugoSandbox(
     userId,
     connection,
     { wsUrl, tokenSecret },
-    root,
+    undefined,
     undefined,
     input.chatId,
   );
   try {
+    // The relay connects lazily inside this call.
+    progress.step = "run_reader";
     const result = await sandbox.commands.run(
       workspaceReaderCommand(
         {
@@ -123,6 +131,7 @@ export async function accessLocalWorkspaceFiles(
     );
     if (result.exitCode !== 0)
       throw new WorkspaceFileError("local_reader_unavailable", 503);
+    progress.step = "decode";
     const parsed = JSON.parse(result.stdout);
     if (parsed.error) {
       const allowed = [
@@ -137,6 +146,8 @@ export async function accessLocalWorkspaceFiles(
       ];
       throw new WorkspaceFileError(
         allowed.includes(parsed.error) ? parsed.error : "workspace_unavailable",
+        undefined,
+        filesystemListDiagnostics("local", input.action, parsed),
       );
     }
     const validated = (

@@ -1,11 +1,13 @@
 import {
   afterAll,
+  afterEach,
   beforeEach,
   describe,
   expect,
   it,
   jest,
 } from "@jest/globals";
+import type { AuthkitOptions } from "@workos-inc/authkit-nextjs";
 import type { NextRequest } from "next/server";
 
 const mockAuthkit = jest.fn();
@@ -293,11 +295,24 @@ describe("proxy", () => {
       "https://deployment.vercel.app/callback",
     ],
     ["preview", "untrusted.example", "https://deployment.vercel.app/callback"],
+    // The configured QA alias keeps its own callback; look-alikes do not.
+    ["preview", "preview.hackerai.co", "https://preview.hackerai.co/callback"],
+    [
+      "preview",
+      "preview.hackerai.co.evil.example",
+      "https://deployment.vercel.app/callback",
+    ],
     ["production", "qa-branch.vercel.app", undefined],
+    ["production", "preview.hackerai.co", undefined],
   ])(
     "keeps auth on a trusted Preview branch origin (%s / %s)",
     async (environment, host, redirectUri) => {
-      const keys = ["VERCEL_ENV", "VERCEL_URL", "VERCEL_BRANCH_URL"] as const;
+      const keys = [
+        "VERCEL_ENV",
+        "VERCEL_URL",
+        "VERCEL_BRANCH_URL",
+        "PREVIEW_QA_HOST",
+      ] as const;
       const previous = Object.fromEntries(
         keys.map((key) => [key, process.env[key]]),
       );
@@ -305,6 +320,7 @@ describe("proxy", () => {
         VERCEL_ENV: environment,
         VERCEL_URL: "deployment.vercel.app",
         VERCEL_BRANCH_URL: "qa-branch.vercel.app",
+        PREVIEW_QA_HOST: "preview.hackerai.co",
       });
       mockAuthkit.mockResolvedValue({
         session: { user: { id: "user" } },
@@ -968,7 +984,7 @@ describe("proxy", () => {
   );
 
   it.each([true, false])(
-    "logs AuthKit's transient classification (%s) without changing its response",
+    "logs AuthKit's transient classification (%s) and keeps a transient session retryable",
     async (isTransient) => {
       const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
       const sessionCookie = isTransient
@@ -1020,13 +1036,16 @@ describe("proxy", () => {
         expect(String(warnSpy.mock.calls[0][0])).not.toContain(
           "private-refresh-cause",
         );
+        // A transient failure is not a session expiry, so it must not read as signed out.
         expect(mockNextResponseJson).toHaveBeenCalledWith(
-          {
-            code: "unauthorized:auth",
-            message: "You need to sign in before continuing.",
-            cause: "Session expired or invalid",
-          },
-          expect.objectContaining({ status: 401 }),
+          isTransient
+            ? { code: "rate_limited", message: "Please retry shortly." }
+            : {
+                code: "unauthorized:auth",
+                message: "You need to sign in before continuing.",
+                cause: "Session expired or invalid",
+              },
+          expect.objectContaining({ status: isTransient ? 503 : 401 }),
         );
         const responseInit = mockNextResponseJson.mock.calls[0][1] as {
           headers: Headers;
@@ -1355,6 +1374,121 @@ describe("proxy", () => {
     }
   });
 
+  describe("refresh that WorkOS could not answer", () => {
+    let warn: ReturnType<typeof jest.spyOn>;
+    beforeEach(() => {
+      warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    });
+    afterEach(() => warn.mockRestore());
+
+    // AuthKit's shape after the bounded SDK gives up on a stalled refresh: no
+    // session, only its PKCE cookie, and the session cookie left in place.
+    function mockTransientRefresh(isTransient: boolean) {
+      mockAuthkit.mockImplementation((_request, options: any) => {
+        options.onSessionRefreshError({
+          error: Object.assign(new Error("Error: Request timeout"), {
+            name: "OauthException",
+            status: 408,
+            error: "Request timeout",
+          }),
+          isTransient,
+          refreshStage: "refresh_request",
+        });
+        return Promise.resolve({
+          session: { user: null },
+          headers: new Headers({
+            "x-workos-middleware": "true",
+            "set-cookie": "wos-auth-verifier=sealed-state; Path=/; HttpOnly",
+          }),
+          authorizationUrl: "https://auth.hackerai.co/login",
+        });
+      });
+    }
+
+    function expectSessionCookieKept(response: any, init: any) {
+      expect(response.cookies.delete).not.toHaveBeenCalledWith("wos-session");
+      expect(init.headers.get("set-cookie") ?? "").not.toContain(
+        "wos-session=",
+      );
+    }
+
+    it.each([
+      ["a JSON client", "application/json"],
+      ["a client that accepts HTML", "text/html,*/*"],
+    ])(
+      "asks %s of an API to retry instead of answering 401",
+      async (_c, accept) => {
+        mockTransientRefresh(true);
+        const { default: proxy } = await import("../proxy");
+
+        const response = await proxy(
+          createRequest({ pathname: "/api/agent", accept, hasSession: true }),
+        );
+
+        expect(mockNextResponseJson).toHaveBeenCalledTimes(1);
+        const [body, init] = mockNextResponseJson.mock.calls[0] as [
+          unknown,
+          { status: number; headers: Headers },
+        ];
+        expect(body).toEqual({
+          code: "rate_limited",
+          message: "Please retry shortly.",
+        });
+        expect(init.status).toBe(503);
+        expect(init.headers.get("retry-after")).toBe("5");
+        expectSessionCookieKept(response, init);
+        // The existing categorical refresh diagnostic identifies the timeout.
+        const fields = JSON.parse(warn.mock.calls[0][0] as string);
+        expect(fields).toMatchObject({
+          event: "auth.session_refresh_failed",
+          is_transient: true,
+          auth_refresh_error_kind: "OauthException",
+          auth_refresh_error_status: 408,
+          auth_refresh_stage: "refresh_request",
+        });
+      },
+    );
+
+    it("lets a browser page load without a login redirect", async () => {
+      mockTransientRefresh(true);
+      const { default: proxy } = await import("../proxy");
+
+      const response = await proxy(
+        createRequest({
+          pathname: "/c/chat-1",
+          accept: "text/html",
+          hasSession: true,
+          userAgent: "Mozilla/5.0",
+          // A caller replaying its own sealed session must not become authenticated.
+          headers: { "x-workos-session": "caller-supplied-sealed-session" },
+        }),
+      );
+
+      expect(mockNextResponseRedirect).not.toHaveBeenCalled();
+      expect(mockNextResponseNext).toHaveBeenCalledTimes(1);
+      const init = mockNextResponseNext.mock.calls[0][0] as {
+        request: { headers: Headers };
+        headers: Headers;
+      };
+      // No session context is forwarded, so the page stays unauthenticated.
+      expect(init.request.headers.get("x-workos-session")).toBeNull();
+      expect(init.request.headers.get("x-workos-middleware")).toBe("true");
+      expectSessionCookieKept(response, init);
+    });
+
+    it("still answers 401 when the refresh failure is terminal", async () => {
+      mockTransientRefresh(false);
+      const { default: proxy } = await import("../proxy");
+
+      await proxy(createRequest({ pathname: "/api/agent", hasSession: true }));
+
+      expect(mockNextResponseJson).toHaveBeenCalledWith(
+        expect.objectContaining({ code: "unauthorized:auth" }),
+        expect.objectContaining({ status: 401 }),
+      );
+    });
+  });
+
   describe("malformed session cookie recovery", () => {
     const invalidCookie = "bad*1*a*b*c*d*e*f";
 
@@ -1520,6 +1654,159 @@ describe("proxy", () => {
         expect(mockNextResponseNext).not.toHaveBeenCalled();
       },
     );
+  });
+
+  describe("Desktop sign-in proxy handoff", () => {
+    const requestId = "iad1::fra1::abc12-1794282623256-a92d4497977c";
+    const privateMarker = "private-sign-in-canary";
+    const anonymousAuthkit = {
+      session: { user: null },
+      headers: new Headers(),
+    };
+
+    it.each([
+      ["/desktop-login", "desktop_login", "authkit_pass_through"],
+      [
+        "/api/auth/desktop-callback",
+        "desktop_oauth_callback",
+        "authkit_pass_through",
+      ],
+      ["/desktop-login", "desktop_login", "ended_session"],
+      [
+        "/api/auth/desktop-callback",
+        "desktop_oauth_callback",
+        "anonymous_context_retry",
+      ],
+    ])(
+      "records only bounded join fields for %s through %s (%s)",
+      async (pathname, routeKind, branch) => {
+        const info = jest.spyOn(console, "info").mockImplementation(() => {});
+        const warning = jest
+          .spyOn(console, "warn")
+          .mockImplementation(() => {});
+        const env = jest.replaceProperty(process, "env", {
+          ...process.env,
+          VERCEL_GIT_COMMIT_SHA: "B".repeat(40),
+        });
+        try {
+          mockAuthkit.mockResolvedValue(anonymousAuthkit);
+          if (branch === "ended_session") {
+            mockAuthkit.mockRejectedValueOnce({
+              name: "TokenRefreshError",
+              isTransient: false,
+              cause: {
+                status: 400,
+                error: "invalid_grant",
+                errorDescription: "Invalid refresh token.",
+              },
+            });
+          } else if (branch === "anonymous_context_retry") {
+            mockAuthkit.mockRejectedValueOnce(new Error("Wrong mac prefix"));
+          }
+
+          const { default: proxy } = await import("../proxy");
+          const response = await proxy(
+            createRequest({
+              pathname: `${pathname}?code=${privateMarker}&state=${privateMarker}`,
+              headers: {
+                "x-vercel-id": requestId,
+                "x-unrelated": privateMarker,
+              },
+              cookieValues: { "wos-session": privateMarker },
+            }),
+          );
+
+          expect(response).toBe(mockNextResponseNext.mock.results[0]?.value);
+          expect(info).toHaveBeenCalledTimes(1);
+          const encoded = info.mock.calls[0][0] as string;
+          expect(encoded).not.toContain(privateMarker);
+          expect(JSON.parse(encoded)).toEqual({
+            event: "desktop_sign_in_proxy_handoff",
+            diagnostic_version: 1,
+            boundary: "proxy",
+            route_kind: routeKind,
+            branch,
+            vercel_request_id: requestId,
+            web_build_commit: "b".repeat(40),
+          });
+        } finally {
+          env.restore();
+          warning.mockRestore();
+          info.mockRestore();
+        }
+      },
+    );
+
+    it.each([
+      { pathname: "/desktop-login", method: "POST", id: requestId },
+      { pathname: "/desktop-callback", method: "GET", id: requestId },
+      {
+        pathname: "/api/auth/desktop-callback",
+        method: "GET",
+        id: privateMarker,
+      },
+    ])(
+      "does not log an unrelated or unjoinable $method $pathname",
+      async ({ pathname, method, id }) => {
+        const info = jest.spyOn(console, "info").mockImplementation(() => {});
+        try {
+          mockAuthkit.mockResolvedValue(anonymousAuthkit);
+          const { default: proxy } = await import("../proxy");
+          await proxy(
+            createRequest({ pathname, method, headers: { "x-vercel-id": id } }),
+          );
+          expect(info).not.toHaveBeenCalled();
+        } finally {
+          info.mockRestore();
+        }
+      },
+    );
+
+    it("keeps a proxy throw distinct from a completed handoff", async () => {
+      const info = jest.spyOn(console, "info").mockImplementation(() => {});
+      const warning = jest.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const error = new Error("AuthKit unavailable");
+        mockAuthkit.mockRejectedValue(error);
+        const { default: proxy } = await import("../proxy");
+        await expect(
+          proxy(
+            createRequest({
+              pathname: "/api/auth/desktop-callback",
+              headers: { "x-vercel-id": requestId },
+            }),
+          ),
+        ).rejects.toBe(error);
+        expect(mockNextResponseNext).not.toHaveBeenCalled();
+        expect(info).not.toHaveBeenCalled();
+        expect(warning.mock.calls[0]?.[0]).toContain(
+          "proxy_authkit_failure_context",
+        );
+      } finally {
+        warning.mockRestore();
+        info.mockRestore();
+      }
+    });
+
+    it("preserves the pass-through response when logging throws", async () => {
+      const info = jest.spyOn(console, "info").mockImplementation(() => {
+        throw new Error("logger unavailable");
+      });
+      try {
+        mockAuthkit.mockResolvedValue(anonymousAuthkit);
+        const { default: proxy } = await import("../proxy");
+        const response = await proxy(
+          createRequest({
+            pathname: "/desktop-login",
+            headers: { "x-vercel-id": requestId },
+          }),
+        );
+        expect(info).toHaveBeenCalledTimes(1);
+        expect(response).toBe(mockNextResponseNext.mock.results[0]?.value);
+      } finally {
+        info.mockRestore();
+      }
+    });
   });
 
   describe("public page auth context provenance", () => {
@@ -1831,5 +2118,320 @@ describe("proxy", () => {
     expect(mockNextResponseRedirect).toHaveBeenCalledWith(
       new URL("/login", "https://hackerai.co/dashboard"),
     );
+  });
+
+  describe("pending AuthKit warning", () => {
+    const requestId = "iad1::fra1::abc12-1794282623256-a92d4497977c";
+    const privateMarker = "private-pending-marker";
+    const signedInAuthkit = {
+      session: { user: { id: "user" } },
+      headers: new Headers(),
+    };
+
+    /** An AuthKit call the test settles explicitly. */
+    function deferredAuthkit() {
+      let resolve!: (value: unknown) => void;
+      let reject!: (error: unknown) => void;
+      const promise = new Promise((onResolve, onReject) => {
+        resolve = onResolve;
+        reject = onReject;
+      });
+      return { promise, resolve, reject };
+    }
+
+    /** Pass any phase, including values outside the typed set, to the proxy's observer. */
+    function reportPhases(options: unknown, phases: unknown[]) {
+      const observe = (options as AuthkitOptions).onSessionPhase as
+        ((phase: unknown) => void) | undefined;
+      for (const phase of phases) observe?.(phase);
+    }
+
+    function pendingWarnings(warning: { mock: { calls: unknown[][] } }) {
+      return warning.mock.calls
+        .map(([message]) => message)
+        .filter(
+          (message): message is string =>
+            typeof message === "string" &&
+            message.includes('"event":"proxy_authkit_pending"'),
+        );
+    }
+
+    beforeEach(() => {
+      jest.useFakeTimers();
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it("warns once with the latest phase while a session-cookie AuthKit call is pending", async () => {
+      const warning = jest.spyOn(console, "warn").mockImplementation(() => {});
+      const env = jest.replaceProperty(process, "env", {
+        ...process.env,
+        VERCEL_ENV: "production",
+        VERCEL_GIT_COMMIT_SHA: "C".repeat(40),
+      });
+      const pending = deferredAuthkit();
+      try {
+        mockAuthkit.mockImplementationOnce(
+          (_request: unknown, options: unknown) => {
+            reportPhases(options, [
+              "verify_access_token",
+              "refresh_request",
+              privateMarker,
+            ]);
+            return pending.promise;
+          },
+        );
+        const { default: proxy } = await import("../proxy");
+        const response = proxy(
+          createRequest({
+            pathname: `/c/${privateMarker}?secret=${privateMarker}`,
+            method: "POST",
+            accept: "text/html",
+            userAgent: `Mozilla/5.0 ${privateMarker}`,
+            hasSession: true,
+            headers: {
+              "x-vercel-id": requestId,
+              authorization: privateMarker,
+            },
+            cookieValues: { unrelated: privateMarker },
+          }),
+        );
+
+        await jest.advanceTimersByTimeAsync(9_999);
+        expect(warning).not.toHaveBeenCalled();
+        await jest.advanceTimersByTimeAsync(1);
+        expect(warning).toHaveBeenCalledTimes(1);
+        const encoded = warning.mock.calls[0][0] as string;
+        expect(encoded).not.toContain(privateMarker);
+        expect(JSON.parse(encoded)).toEqual({
+          event: "proxy_authkit_pending",
+          diagnostic_version: 1,
+          boundary: "proxy",
+          authkit_session_phase: "refresh_request",
+          elapsed_ms: 10_000,
+          warning_threshold_ms: 10_000,
+          timer_lateness_ms: 0,
+          request_method: "POST",
+          route_kind: "chat_page",
+          vercel_request_id: requestId,
+          web_build_commit: "c".repeat(40),
+          environment: "production",
+        });
+
+        await jest.advanceTimersByTimeAsync(60_000);
+        pending.resolve(signedInAuthkit);
+        const result = await response;
+        expect(result).toBe(mockNextResponseNext.mock.results[0]?.value);
+        expect(result).toMatchObject({ kind: "next" });
+        expect(warning).toHaveBeenCalledTimes(1);
+      } finally {
+        env.restore();
+        warning.mockRestore();
+      }
+    });
+
+    it("reports an unobserved phase, drops malformed fields and keeps the AuthKit error", async () => {
+      const warning = jest.spyOn(console, "warn").mockImplementation(() => {});
+      const env = jest.replaceProperty(process, "env", {
+        ...process.env,
+        VERCEL_ENV: privateMarker,
+        VERCEL_GIT_COMMIT_SHA: privateMarker,
+      });
+      const pending = deferredAuthkit();
+      const error = new Error("provider unavailable");
+      try {
+        mockAuthkit.mockImplementationOnce(
+          (_request: unknown, options: unknown) => {
+            reportPhases(options, [privateMarker, undefined]);
+            return pending.promise;
+          },
+        );
+        const { default: proxy } = await import("../proxy");
+        const response = proxy(
+          createRequest({
+            pathname: `/api/${privateMarker}`,
+            method: "PRIVATE-METHOD-MARKER",
+            hasSession: true,
+            headers: { "x-vercel-id": privateMarker },
+          }),
+        );
+
+        await jest.advanceTimersByTimeAsync(10_000);
+        const [encoded] = pendingWarnings(warning);
+        expect(encoded).not.toContain(privateMarker);
+        expect(encoded).not.toContain("PRIVATE-");
+        expect(JSON.parse(encoded)).toEqual({
+          event: "proxy_authkit_pending",
+          diagnostic_version: 1,
+          boundary: "proxy",
+          authkit_session_phase: "not_observed",
+          elapsed_ms: 10_000,
+          warning_threshold_ms: 10_000,
+          timer_lateness_ms: 0,
+          request_method: "OTHER",
+          route_kind: "api",
+          environment: "unknown",
+        });
+
+        pending.reject(error);
+        await expect(response).rejects.toBe(error);
+        expect(mockAuthkit).toHaveBeenCalledTimes(1);
+        expect(pendingWarnings(warning)).toHaveLength(1);
+        expect(warning).toHaveBeenLastCalledWith(
+          expect.stringContaining('"event":"proxy_authkit_failure_context"'),
+        );
+      } finally {
+        env.restore();
+        warning.mockRestore();
+      }
+    });
+
+    it.each([
+      {
+        outcome: "signed-in result",
+        settle: (call: ReturnType<typeof deferredAuthkit>) =>
+          call.resolve(signedInAuthkit),
+        expected: { kind: "next" },
+      },
+      {
+        outcome: "ended-session rejection",
+        settle: (call: ReturnType<typeof deferredAuthkit>) =>
+          call.reject(
+            Object.assign(new Error("invalid_grant"), {
+              name: "TokenRefreshError",
+              cause: {
+                error: "invalid_grant",
+                errorDescription: "Session has already ended.",
+              },
+            }),
+          ),
+        expected: { kind: "json", status: 401 },
+      },
+      {
+        outcome: "unexpected rejection",
+        settle: (call: ReturnType<typeof deferredAuthkit>) =>
+          call.reject(new Error("provider unavailable")),
+        expected: { error: "provider unavailable" },
+      },
+    ])(
+      "does not warn after AuthKit settles before the threshold: $outcome",
+      async ({ settle, expected }) => {
+        const warning = jest
+          .spyOn(console, "warn")
+          .mockImplementation(() => {});
+        const pending = deferredAuthkit();
+        try {
+          mockAuthkit.mockReturnValueOnce(pending.promise);
+          const { default: proxy } = await import("../proxy");
+          const response = proxy(
+            createRequest({ pathname: "/api/example", hasSession: true }),
+          ).then(
+            (value) => value,
+            (error: Error) => ({ error: error.message }),
+          );
+
+          await jest.advanceTimersByTimeAsync(9_999);
+          settle(pending);
+          expect(await response).toMatchObject(expected);
+          await jest.advanceTimersByTimeAsync(60_000);
+          expect(pendingWarnings(warning)).toEqual([]);
+        } finally {
+          warning.mockRestore();
+        }
+      },
+    );
+
+    it("does not time an anonymous AuthKit call", async () => {
+      const warning = jest.spyOn(console, "warn").mockImplementation(() => {});
+      const pending = deferredAuthkit();
+      try {
+        mockAuthkit.mockReturnValueOnce(pending.promise);
+        const { default: proxy } = await import("../proxy");
+        const response = proxy(createRequest({ pathname: "/" }));
+
+        await jest.advanceTimersByTimeAsync(60_000);
+        expect(pendingWarnings(warning)).toEqual([]);
+        pending.resolve({ session: { user: null }, headers: new Headers() });
+        expect(await response).toMatchObject({ kind: "next" });
+      } finally {
+        warning.mockRestore();
+      }
+    });
+
+    it("does not time a bypassed request", async () => {
+      const warning = jest.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const { default: proxy } = await import("../proxy");
+        const response = await proxy(
+          createRequest({ pathname: "/api/health/core", hasSession: true }),
+        );
+        await jest.advanceTimersByTimeAsync(60_000);
+        expect(response).toMatchObject({ kind: "next" });
+        expect(mockAuthkit).not.toHaveBeenCalled();
+        expect(warning).not.toHaveBeenCalled();
+      } finally {
+        warning.mockRestore();
+      }
+    });
+
+    it("does not time the anonymous retry after a malformed session cookie", async () => {
+      const warning = jest.spyOn(console, "warn").mockImplementation(() => {});
+      const retry = deferredAuthkit();
+      try {
+        mockAuthkit
+          .mockRejectedValueOnce(new Error("Wrong mac prefix"))
+          .mockReturnValueOnce(retry.promise);
+        const { default: proxy } = await import("../proxy");
+        const response = proxy(
+          createRequest({
+            pathname: "/",
+            accept: "text/html",
+            cookieValues: { "wos-session": "bad*1*a*b*c*d*e*f" },
+          }),
+        );
+
+        await jest.advanceTimersByTimeAsync(60_000);
+        expect(mockAuthkit).toHaveBeenCalledTimes(2);
+        expect(pendingWarnings(warning)).toEqual([]);
+        retry.resolve({ session: { user: null }, headers: new Headers() });
+        const result = await response;
+        expect(result).toMatchObject({ kind: "next" });
+        expect(result.cookies.delete).toHaveBeenCalledWith("wos-session");
+      } finally {
+        warning.mockRestore();
+      }
+    });
+
+    it("preserves the AuthKit response when the pending warning logger throws", async () => {
+      const warning = jest.spyOn(console, "warn").mockImplementation(() => {
+        throw new Error("logger unavailable");
+      });
+      const pending = deferredAuthkit();
+      const sessionCookie = "wos-session=refreshed; Path=/; HttpOnly";
+      try {
+        mockAuthkit.mockReturnValueOnce(pending.promise);
+        const { default: proxy } = await import("../proxy");
+        const response = proxy(
+          createRequest({ pathname: "/api/example", hasSession: true }),
+        );
+
+        await jest.advanceTimersByTimeAsync(10_000);
+        expect(warning).toHaveBeenCalledTimes(1);
+        pending.resolve({
+          session: { user: { id: "user" } },
+          headers: new Headers({ "set-cookie": sessionCookie }),
+        });
+        const result = await response;
+        expect(result).toBe(mockNextResponseNext.mock.results[0]?.value);
+        const init = mockNextResponseNext.mock.calls[0]?.[0] as {
+          headers: Headers;
+        };
+        expect(init.headers.get("set-cookie")).toBe(sessionCookie);
+      } finally {
+        warning.mockRestore();
+      }
+    });
   });
 });

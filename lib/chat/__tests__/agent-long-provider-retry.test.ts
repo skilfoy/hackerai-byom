@@ -12,7 +12,9 @@ import {
   isConfirmedToolFailureLoopStop,
   isTerminalEmptyAssistantResponse,
   detectAssistantContentLoopFromText,
+  getMaxAgentFirstRecoveryModel,
   getNextProviderDisconnectRetryModel,
+  getProviderRetryUsageOptions,
   prepareProviderDisconnectContinuation,
   shouldRetryAgentLongWithFallback,
   shouldRetryProviderStreamAfterNonDurableOutputLimit,
@@ -20,6 +22,7 @@ import {
   shouldRetryProviderStreamAfterInterruptedToolInput,
 } from "../agent-long-provider-retry";
 import { convertToModelMessages, type UIMessage } from "ai";
+import { UsageTracker } from "@/lib/usage-tracker";
 
 describe("prepareAgentFinishContinuation", () => {
   const completedTool = {
@@ -367,6 +370,24 @@ describe("getNextProviderDisconnectRetryModel", () => {
 });
 
 describe("shouldRetryAgentLongWithFallback", () => {
+  it("treats an interrupted Desktop file write as unsafe to retry", () => {
+    expect(
+      hasUncertainProviderToolOutcome([
+        {
+          type: "tool-file",
+          state: "output-available",
+          output: {
+            error: "File write did not complete: 2 of 5 chunks were confirmed",
+            executionOutcome: "unknown",
+            writeOutcome: "unknown",
+            confirmedChunks: 2,
+            totalChunks: 5,
+          },
+        },
+      ]),
+    ).toBe(true);
+  });
+
   it("treats a completed terminal result with unknown execution as unsafe to retry", () => {
     expect(
       hasUncertainProviderToolOutcome([
@@ -1154,6 +1175,51 @@ describe("Agent Max final recovery admission", () => {
       }
     },
   );
+  it("recovers Max Agent Grok on Bedrock before DeepSeek", () => {
+    expect(
+      getMaxAgentFirstRecoveryModel({
+        mode: "agent",
+        selectedModelOverride: "hackerai-max",
+        baselineModel: "model-grok-4.6",
+      }),
+    ).toBe("model-grok-4.6-bedrock");
+    for (const [mode, selectedModelOverride, baselineModel] of [
+      ["ask", "hackerai-max", "model-grok-4.6"],
+      ["agent", "hackerai-pro", "model-grok-4.6"],
+      ["agent", "hackerai-max", "model-glm-5.3"],
+    ]) {
+      expect(
+        getMaxAgentFirstRecoveryModel({
+          mode,
+          selectedModelOverride,
+          baselineModel,
+        }),
+      ).toBeUndefined();
+    }
+  });
+  // A content-filter retry records no disconnect attempt, so Bedrock's
+  // failure hands off to DeepSeek whichever count it reports.
+  it.each([
+    [0, 256_000, deepSeek],
+    [1, 256_000, deepSeek],
+    [1, 256_001, undefined],
+    [1, undefined, undefined],
+  ])(
+    "hands a failed Bedrock recovery to DeepSeek within its capacity (count=%s, %s tokens)",
+    (completedRetryCount, requiredContextTokens, expected) => {
+      expect(
+        getNextProviderDisconnectRetryModel({
+          originalModel: "model-grok-4.6",
+          failedModel: "model-grok-4.6-bedrock",
+          completedRetryCount,
+          selectedModelOverride: "hackerai-max",
+          agentModelContextEnabled: false,
+          subscription: "ultra",
+          requiredContextTokens,
+        }),
+      ).toBe(expected);
+    },
+  );
   it.each([
     ["a third attempt", deepSeek, 2],
     ["a leg that did not run on DeepSeek", "model-grok-4.6", 1],
@@ -1357,5 +1423,47 @@ describe("prepareAgentLoopContinuation", () => {
         { id: "second", role: "assistant", parts: [missing] } as UIMessage,
       ])?.messages.map((message) => message.id),
     ).toEqual(["primary", "second"]);
+  });
+});
+
+describe("getProviderRetryUsageOptions", () => {
+  const reasoningOnly = [
+    { type: "step-start" },
+    { type: "reasoning", text: "hidden work" },
+  ];
+
+  // Same derivation both Ask and Agent callers use before a full retry.
+  const retryWithFallback = (finishReason: string) => {
+    const tracker = new UsageTracker();
+    tracker.accumulateStep(
+      { inputTokens: 1_000, outputTokens: 8_000, raw: { cost: 0.5 } },
+      "primary",
+    );
+    tracker.prepareModelRetry(
+      getProviderRetryUsageOptions({
+        loopRecovery: false,
+        nonDurableOutputLimit:
+          shouldRetryProviderStreamAfterNonDurableOutputLimit(reasoningOnly, {
+            finishReason,
+          }),
+      }),
+    );
+    tracker.accumulateStep(
+      { inputTokens: 1_000, outputTokens: 100, raw: { cost: 0.1 } },
+      "fallback",
+    );
+    return tracker;
+  };
+
+  it("bills the primary leg that spent its output allowance without durable output", () => {
+    const tracker = retryWithFallback("length");
+    expect(tracker.computeCostDollars("fallback")).toBeCloseTo(0.6);
+    expect(tracker.outputTokens).toBe(8_100);
+  });
+
+  it("replaces the failed leg after an ordinary provider error", () => {
+    const tracker = retryWithFallback("error");
+    expect(tracker.computeCostDollars("fallback")).toBeCloseTo(0.1);
+    expect(tracker.outputTokens).toBe(100);
   });
 });

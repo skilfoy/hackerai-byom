@@ -1,5 +1,6 @@
 import {
   CURL_PROGRESS_WRITE_OUT,
+  getAttachmentDownloadFailureContext,
   recordAttachmentDownloadFailure,
   recordAttachmentDownloadBoundary,
   recordAttachmentCommandReceiver,
@@ -11,6 +12,7 @@ import {
   type AttachmentDownloadShellContextObservation,
 } from "./attachment-download-diagnostics";
 import {
+  AUTHORIZED_FILE_REQUEST_ACL_DENIAL,
   DesktopFileBridgeError,
   desktopFileUnavailableMessage,
   getDesktopFileFailure,
@@ -22,6 +24,7 @@ import {
 
 import { CONNECTED_AGENT_BROWSER_GUIDANCE } from "@/lib/ai/browser-guidance";
 import { phLogger } from "@/lib/posthog/server";
+import { emitPostHogLog } from "@/lib/posthog/logs";
 import { WINDOWS_COMMAND_SHELL_GUIDANCE } from "@/lib/ai/windows-guidance";
 import {
   classifyPersistenceFailure,
@@ -52,8 +55,9 @@ import {
   type PublishedDesktopCommand,
 } from "@/lib/centrifugo/desktop-session";
 import { LocalConnectionLostError } from "@/lib/chat/local-connection-stop";
+import { IncompleteFileWriteError } from "./incomplete-file-write";
 import { EventEmitter } from "events";
-import { Centrifuge, type Subscription } from "centrifuge";
+import { Centrifuge, errorCodes, type Subscription } from "centrifuge";
 
 import { generateCentrifugoToken } from "@/lib/centrifugo/jwt";
 import {
@@ -169,6 +173,31 @@ function nativePathOutputShape(value: string) {
   return "relative_or_other";
 }
 
+const NATIVE_PATH_STDERR_SCAN_CODE_UNITS = 2048;
+
+type NativePathStderrFamily =
+  "empty" | "utility_name_prefix" | "runtime_fatal_shape" | "unknown";
+
+/**
+ * Classify returned conversion stderr by a fixed leading text shape only. A
+ * shape is not proof of its producer or cause, and no text is retained.
+ */
+function nativePathStderrFamily(stderr: string): NativePathStderrFamily {
+  if (stderr.length === 0) return "empty";
+  const line = stderr
+    .slice(0, NATIVE_PATH_STDERR_SCAN_CODE_UNITS)
+    .split(/[\r\n]/, 1)[0];
+  // MSYS2 cygpath.cc leads its own messages with its program name.
+  if (/^cygpath(?:\.exe)?: /.test(line)) return "utility_name_prefix";
+  // MSYS2/Cygwin api_fatal: "<n> [<thread>] <program> (<pid>) <path>: *** fatal error".
+  if (
+    /^ {0,16}\d{1,12} \[[A-Za-z0-9_]{1,32}\] /.test(line) &&
+    line.includes(": *** fatal error")
+  )
+    return "runtime_fatal_shape";
+  return "unknown";
+}
+
 type NativeReceiverErrorClass =
   | "authorization_invalid"
   | "origin_unavailable_or_denied"
@@ -214,10 +243,7 @@ const AUTHORIZED_NATIVE_RECEIVER_ERROR_CLASSES: ReadonlyMap<
   string,
   NativeReceiverErrorClass
 > = new Map([
-  [
-    "Command authorized_desktop_file_request not allowed by ACL",
-    "authorized_ipc_denied",
-  ],
+  [AUTHORIZED_FILE_REQUEST_ACL_DENIAL, "authorized_ipc_denied"],
   ["Invalid Desktop operation", "authorization_message_invalid"],
   ["Desktop operation type is missing", "authorized_file_request_invalid"],
   [
@@ -339,6 +365,38 @@ const redactTransferDetails = (
 
 const isTransientCommandTimeoutError = (error: unknown): boolean =>
   TRANSIENT_COMMAND_TIMEOUT_ERROR_PATTERN.test(getErrorMessage(error));
+
+/**
+ * A command's own relay socket closed before it connected, so the command was
+ * never published. Decided only from this receiver's typed rejection and the
+ * closed snapshot it bound to that rejection; never from error text. Any
+ * connection, subscription, publication or message, a connection-limit
+ * predicate or missing evidence leaves the original failure terminal.
+ */
+const isPreconnectTransportClosure = (error: unknown): boolean => {
+  if (
+    !(error instanceof LocalCommandDispatchError) ||
+    error.dispatched !== false ||
+    error.retryable !== true
+  )
+    return false;
+  const receiver = getAttachmentDownloadFailureContext(error);
+  return (
+    receiver?.attachment_command_receiver_version === 1 &&
+    receiver.attachment_command_receiver_reason === "client_error" &&
+    receiver.attachment_command_receiver_connected_observed === false &&
+    receiver.attachment_command_receiver_subscribed_observed === false &&
+    receiver.attachment_command_receiver_publication_started === false &&
+    receiver.attachment_command_receiver_publish_completed === false &&
+    receiver.attachment_command_receiver_first_message_observed === false &&
+    receiver.attachment_command_receiver_client_error_version === 1 &&
+    receiver.attachment_command_receiver_client_error_type === "transport" &&
+    receiver.attachment_command_receiver_client_error_code ===
+      errorCodes.transportClosed &&
+    receiver.attachment_command_receiver_client_error_connection_limit_predicate ===
+      false
+  );
+};
 
 const delay = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
@@ -633,7 +691,7 @@ export class CentrifugoSandbox extends EventEmitter {
       sender.frozen = true;
       controller.abort();
     }, 3000);
-    let failure: string | undefined;
+    let failure: ReturnType<typeof getLocalFileRequestFailure> | undefined;
     let fileFailure: DesktopFileFailure | undefined;
     let receiverErrorClass: NativeReceiverErrorClass | undefined;
     let receiverDiagnostic: DesktopFileReceiverDiagnostic | undefined;
@@ -648,9 +706,16 @@ export class CentrifugoSandbox extends EventEmitter {
       );
       this.nativeFileRelayConfirmed = true;
     } catch (error) {
-      failure = controller.signal.aborted
-        ? "timeout"
-        : getLocalFileRequestFailure(error);
+      // A matched same-request file_error is final at receipt, even when its
+      // bounded ACK wait outlasts the deadline; only that receipt keeps its
+      // class. Anything else after the deadline remains a timeout.
+      const matchedReceipt =
+        error instanceof LocalFileRequestError &&
+        error.failure === "native_error";
+      failure =
+        controller.signal.aborted && !matchedReceipt
+          ? "timeout"
+          : getLocalFileRequestFailure(error);
       fileFailure =
         error instanceof LocalFileRequestError ? error.fileFailure : undefined;
       // Only the matched file_error's own text; unrecognized text stays "other".
@@ -670,6 +735,12 @@ export class CentrifugoSandbox extends EventEmitter {
       clearTimeout(deadline);
       sender.frozen = true;
     }
+    // Only beside the exact authorized ACL denial: whether the receiver's
+    // own timed-out version IPC settled within its bounded window.
+    const receiverLateLookup =
+      receiverErrorClass === "authorized_ipc_denied"
+        ? receiverDiagnostic?.nativeVersionLateLookup
+        : undefined;
     console.info(
       JSON.stringify({
         event: "desktop_file_capability_probe",
@@ -684,6 +755,7 @@ export class CentrifugoSandbox extends EventEmitter {
         receiver_stage: receiverDiagnostic?.stage,
         receiver_adapter: receiverDiagnostic?.adapter,
         receiver_native_version_lookup: receiverDiagnostic?.nativeVersionLookup,
+        receiver_native_version_late_lookup: receiverLateLookup,
         // Overall-deadline failures only: where the sender was when it expired.
         ...(failure === "timeout" && {
           sender_phase_version: 1,
@@ -695,6 +767,40 @@ export class CentrifugoSandbox extends EventEmitter {
       }),
     );
     if (!this.nativeFileRelayConfirmed) {
+      // Correlate the closed failure taxonomy with the Agent run in PostHog.
+      // The existing Agent log flush handles delivery.
+      const runId = this.triggerRunId;
+      if (typeof runId === "string" && /^run_[a-z0-9]{20,40}$/.test(runId)) {
+        try {
+          emitPostHogLog({
+            level: "warn",
+            event: "desktop_file_capability_probe",
+            body: "desktop_file_capability_probe",
+            attributes: {
+              probe_mirror_version: 1,
+              trigger_run_id: runId,
+              outcome: "unavailable",
+              failure,
+              file_failure: fileFailure,
+              receiver_error_class: receiverErrorClass,
+              receiver_stage_version: receiverDiagnostic?.version,
+              receiver_stage: receiverDiagnostic?.stage,
+              receiver_adapter: receiverDiagnostic?.adapter,
+              receiver_native_version_lookup:
+                receiverDiagnostic?.nativeVersionLookup,
+              receiver_native_version_late_lookup: receiverLateLookup,
+              ...(failure === "timeout" && {
+                sender_phase_version: 1,
+                sender_phase: sender.phase,
+                sender_dispatch_entered: sender.dispatchEntered,
+                sender_publication_started: sender.publicationStarted,
+              }),
+            },
+          });
+        } catch {
+          // Best-effort telemetry cannot replace the unavailable-bridge error.
+        }
+      }
       throw new DesktopFileBridgeError(
         fileFailure ?? "unknown",
         desktopFileUnavailableMessage(fileFailure ?? "unknown"),
@@ -2274,6 +2380,18 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
               terminal_ack_published: receipt?.terminalAckPublished,
               last_received_sequence: receipt?.lastReceivedSequence,
               exit_success: result.exitCode === 0,
+              ...(result.exitCode !== 0 && {
+                exit_observation_version: 1,
+                // Keep only a POSIX status; native error terminals (-1) and
+                // any other returned value collapse to "other".
+                exit_code:
+                  Number.isInteger(result.exitCode) &&
+                  result.exitCode >= 1 &&
+                  result.exitCode <= 255
+                    ? result.exitCode
+                    : "other",
+                stderr_family: nativePathStderrFamily(result.stderr),
+              }),
               ...(failure === "non_absolute_output" && {
                 stdout_shape_version: 1,
                 stdout_shape: nativePathOutputShape(resolved),
@@ -2348,6 +2466,8 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
     signal?: AbortSignal,
     /** Set only by a local copy, to attribute a probe it actually issues. */
     copyRole?: LocalCopyRole,
+    /** Caller-owned; receives only this call's own probe failure outcome. */
+    observation?: AttachmentDownloadShellContextObservation,
   ): Promise<"bash" | "cmd"> {
     signal?.throwIfAborted();
     if (this.shellKind) return this.shellKind;
@@ -2359,12 +2479,23 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
       this.shellKind = "bash";
       return "bash";
     }
-    const probe = await this.runSetupCommand("echo $BASH_VERSION", {
-      signal,
-      displayName: "",
-      copyOwnerStage: copyRole && "shell_detection",
-    });
+    let probe: CommandResult;
+    try {
+      probe = await this.runSetupCommand("echo $BASH_VERSION", {
+        signal,
+        displayName: "",
+        copyOwnerStage: copyRole && "shell_detection",
+      });
+    } catch (error) {
+      if (observation) observation.detectShellResult = "rejected";
+      throw error;
+    }
     if (probe.exitCode !== 0) {
+      if (observation)
+        observation.detectShellResult =
+          probe.exitCode === -1
+            ? "nonzero_exit_minus_one"
+            : "nonzero_exit_other";
       throw persistenceCommandError("Failed to detect local shell", probe);
     }
     this.shellKind = probe.stdout.trim() === "$BASH_VERSION" ? "cmd" : "bash";
@@ -2439,7 +2570,7 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
     escapeValue: (value: string) => string;
   }> {
     if (observation) observation.stage = "detect_shell";
-    const shell = await this.detectShell(signal, copyRole);
+    const shell = await this.detectShell(signal, copyRole, observation);
     signal?.throwIfAborted();
     const useBash = shell === "bash";
     if (observation) observation.stage = "native_path_conversion";
@@ -2959,26 +3090,34 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
     // This avoids per-chunk relay probes without reusing stale mounts on a later
     // operation or replacement connection, or redirecting an append mid-write.
     const nativePaths = new Map<string, string>();
-    for (
-      let offset = 0;
-      offset < encodedContent.length;
-      offset += CentrifugoSandbox.MAX_NATIVE_FILE_MESSAGE_CHARS
-    ) {
-      await this.runFileRequest<FileOkMessage>(
-        {
-          type: offset === 0 ? firstChunkType : "file_append",
-          path: rawPath,
-          content: encodedContent.slice(
-            offset,
-            offset + CentrifugoSandbox.MAX_NATIVE_FILE_MESSAGE_CHARS,
-          ),
-          isBase64: true,
-        },
-        new Set(["file_ok"]),
-        120000,
-        signal,
-        nativePaths,
-      );
+    const chunkSize = CentrifugoSandbox.MAX_NATIVE_FILE_MESSAGE_CHARS;
+    const totalChunks = Math.ceil(encodedContent.length / chunkSize);
+    for (let index = 0; index < totalChunks; index++) {
+      const offset = index * chunkSize;
+      try {
+        await this.runFileRequest<FileOkMessage>(
+          {
+            type: index === 0 ? firstChunkType : "file_append",
+            path: rawPath,
+            content: encodedContent.slice(offset, offset + chunkSize),
+            isBase64: true,
+          },
+          new Set(["file_ok"]),
+          120000,
+          signal,
+          nativePaths,
+        );
+      } catch (error) {
+        // A single message either applied or did not; a sequence that stopped
+        // partway has an unknown result on disk, even at its first chunk.
+        if (totalChunks === 1) throw error;
+        throw new IncompleteFileWriteError(
+          index,
+          totalChunks,
+          firstChunkType === "file_write" ? "write" : "append",
+          { cause: error },
+        );
+      }
     }
   }
 
@@ -3530,14 +3669,19 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
               phase = "check_result";
             } catch (error) {
               throwIfAttachmentAborted(signal, error);
+              // Shares this loop's attempt budget with every other cause.
+              const preconnectClosure = isPreconnectTransportClosure(error);
               if (
                 attempt === MAX_ATTEMPTS ||
-                !isTransientCommandTimeoutError(error)
+                (!preconnectClosure && !isTransientCommandTimeoutError(error))
               ) {
                 throw error;
               }
               console.warn(
-                `[centrifugo-download] command timeout on attempt ${attempt}/${MAX_ATTEMPTS}, retrying: ${redactTransferDetails(getErrorMessage(error), url, [rawPath, path])}`,
+                preconnectClosure
+                  ? // Closed marker only: no error text, URL or path.
+                    `[centrifugo-download] relay transport closed before connecting on attempt ${attempt}/${MAX_ATTEMPTS}, retrying`
+                  : `[centrifugo-download] command timeout on attempt ${attempt}/${MAX_ATTEMPTS}, retrying: ${redactTransferDetails(getErrorMessage(error), url, [rawPath, path])}`,
               );
               phase = "retry_delay";
               await abortableDelay(500 * attempt, signal);
@@ -3637,6 +3781,7 @@ ${CONNECTED_AGENT_BROWSER_GUIDANCE}`;
           attempt: diagnosticAttempt,
           resultState,
           shellContextStage: shellContextObservation.stage,
+          shellContextDetectResult: shellContextObservation.detectShellResult,
         });
         throw error;
       }

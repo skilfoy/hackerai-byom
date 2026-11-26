@@ -63,15 +63,14 @@ export function serviceContext<T extends Context>(ctx: T): T {
   return wrapped;
 }
 
-// Log lines may be visible to the caller. Report only the public-input
-// observation, never the proof, key configuration, scope or arguments.
-function warnServiceProofRejected(
-  observation: ServiceProofObservation | undefined,
-) {
+// Log lines and the rejection message may be visible to the caller. Report
+// only the public-input observation, never the proof, key configuration, scope
+// or arguments.
+function warnServiceProofRejected(observation: ServiceProofObservation) {
   try {
     convexLogger.warn("service_proof_rejected", {
       diagnostic_version: 1,
-      public_input_observation: observation ?? "verification_failed",
+      public_input_observation: observation,
     });
   } catch {
     // Diagnostics must never replace the authorization failure.
@@ -87,12 +86,19 @@ function wrapBuilder<T>(builder: T): T {
         const deployment = process.env.CONVEX_CLOUD_URL;
         if (!deployment || metadata.componentPath)
           throw new Error("Invalid service deployment identity");
-        // Narrow workers get their own key, valid only for their module.
+        // Narrow workers get their own key, valid only for their module. The
+        // review key also authorizes exactly one advisory reassessment action.
         const secret = metadata.name.startsWith("userResearch:")
           ? process.env.CONVEX_USER_RESEARCH_SERVICE_KEY
-          : metadata.name.startsWith("egressAbuseReview:")
+          : metadata.name.startsWith("egressAbuseReview:") ||
+              metadata.name ===
+                "egressAbuseReassessmentActions:readCaseEvidence"
             ? process.env.CONVEX_EGRESS_ABUSE_REVIEW_SERVICE_KEY
-            : process.env.CONVEX_SERVICE_ROLE_KEY;
+            : metadata.name.startsWith("egressAbuseEnforcement:")
+              ? process.env.CONVEX_EGRESS_ABUSE_ENFORCEMENT_SERVICE_KEY
+              : metadata.name.startsWith("abuseBlockNotices:")
+                ? process.env.CONVEX_ABUSE_NOTICE_DISPATCH_SERVICE_KEY
+                : process.env.CONVEX_SERVICE_ROLE_KEY;
         const scope: ServiceScope = {
           deployment,
           name: metadata.name,
@@ -116,8 +122,14 @@ function wrapBuilder<T>(builder: T): T {
             observation = seen;
           }))
         ) {
-          warnServiceProofRejected(observation);
-          throw new Error("Unauthorized: Invalid service request");
+          const reason = observation ?? "verification_failed";
+          warnServiceProofRejected(reason);
+          // Native exception reporting retains the message. Keep its first
+          // line stable for callers and append the bounded observation.
+          throw new Error(
+            "Unauthorized: Invalid service request\n" +
+              `service_proof_rejected diagnostic_version=1 public_input_observation=${reason}`,
+          );
         }
         authorizedArgs = { ...args, serviceKey: secret };
       }
@@ -133,6 +145,8 @@ function wrapBuilder<T>(builder: T): T {
               process.env.CONVEX_SERVICE_ROLE_KEY,
               process.env.CONVEX_USER_RESEARCH_SERVICE_KEY,
               process.env.CONVEX_EGRESS_ABUSE_REVIEW_SERVICE_KEY,
+              process.env.CONVEX_EGRESS_ABUSE_ENFORCEMENT_SERVICE_KEY,
+              process.env.CONVEX_ABUSE_NOTICE_DISPATCH_SERVICE_KEY,
             ]) {
               if (secret) clean = clean.split(secret).join("[Redacted]");
             }

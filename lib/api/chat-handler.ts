@@ -10,7 +10,7 @@ import { markLoopRecoveryCheckpoint } from "@/lib/chat/message-reconciliation";
 import { resolvePaidProAutoModel } from "@/lib/ai/paid-model-routing";
 import { isExpandedAgentContextEligible } from "@/lib/experiments/agent-model-context";
 import { getAgentContextPolicy } from "@/lib/ai/agent-context-budget";
-import { isAbliterationModel } from "@/lib/ai/abliteration";
+import { isInferenceCyberModel } from "@/lib/ai/inference";
 import {
   enforceRegionalSubscriptionFirst,
   subscriptionFirstCountryFromRequest,
@@ -200,15 +200,10 @@ import {
 } from "@/lib/utils/stream-writer-utils";
 import { Id } from "@/convex/_generated/dataModel";
 import { phLogger } from "@/lib/posthog/server";
+import type { ExperimentAnalyticsContext } from "@/lib/analytics/experiment-context";
 import { PAID_FUNNEL_EVENTS } from "@/lib/analytics/paid-funnel";
 import { readAnalyticsRequestContext } from "@/lib/analytics/request-context";
 import { buildAgentStepLimitTelemetry } from "@/lib/analytics/agent-step-limit-telemetry";
-import {
-  captureDeepSeekV4Pro0813ExperimentExposure,
-  evaluateDeepSeekV4Pro0813Experiment,
-  getActiveDeepSeekV4Pro0813ExperimentAssignment,
-  getDeepSeekV4Pro0813ExperimentContext,
-} from "@/lib/experiments/deepseek-v4-pro-0813";
 import {
   evaluateFlashRouting,
   getActiveFlashRoutingAssignment,
@@ -244,6 +239,7 @@ import { isAgentMode } from "@/lib/utils/mode-helpers";
 import {
   createAgentStream,
   initAgentStreamState,
+  recordExplicitModelFallback,
   resetServedModelTelemetryForRetry,
   retryUsesDifferentModel,
   type AgentStreamContext,
@@ -261,6 +257,7 @@ import {
 } from "@/lib/chat/multimodal-tool-result-recovery";
 import {
   detectAssistantContentLoopFromParts,
+  getProviderRetryUsageOptions,
   shouldRetryProviderStreamAfterNonDurableOutputLimit,
   shouldRetryProviderStreamAfterReasoningOnlyOutput,
   shouldRetryProviderStreamAfterInterruptedToolInput,
@@ -678,25 +675,13 @@ export const createChatHandler = () => {
         subscription,
       });
 
-      const deepSeekV4Pro0813Experiment =
-        await evaluateDeepSeekV4Pro0813Experiment({
-          posthog: (posthog ??= PostHogClient()),
-          userId,
-          selectedModel,
-          requestId,
-        });
-      if (deepSeekV4Pro0813Experiment) {
-        selectedModel = deepSeekV4Pro0813Experiment.modelKey;
-      }
       selectedModel = resolvePaidProAutoModel({
         userId,
         subscription,
         selectedModel,
         selectedModelOverride,
         limitRescue: Boolean(limitRescue),
-        modelPolicyActive: Boolean(
-          abliteratedExperiment || deepSeekV4Pro0813Experiment,
-        ),
+        modelPolicyActive: Boolean(abliteratedExperiment),
       });
       let requestHasImages =
         countFileAttachments(fetched.truncatedMessages).imageCount > 0 ||
@@ -709,9 +694,7 @@ export const createChatHandler = () => {
         selectedModel,
         hasImages: requestHasImages,
         limitRescue: Boolean(limitRescue),
-        modelPolicyActive: Boolean(
-          abliteratedExperiment || deepSeekV4Pro0813Experiment,
-        ),
+        modelPolicyActive: Boolean(abliteratedExperiment),
       });
       if (flashRoutingAssignment)
         selectedModel = flashRoutingAssignment.modelKey;
@@ -861,11 +844,6 @@ export const createChatHandler = () => {
         });
       }
 
-      const activeDeepSeekV4Pro0813Experiment =
-        getActiveDeepSeekV4Pro0813ExperimentAssignment(
-          deepSeekV4Pro0813Experiment,
-          selectedModel,
-        );
       const activeFlashRoutingAssignment = getActiveFlashRoutingAssignment(
         flashRoutingAssignment,
         selectedModel,
@@ -884,20 +862,18 @@ export const createChatHandler = () => {
         subscription,
         requestId: assistantMessageId,
       });
-      const routingExperimentContext = activeAbliteratedExperiment
-        ? {
-            key: activeAbliteratedExperiment.key,
-            variant: activeAbliteratedExperiment.variant,
-            requestId: assistantMessageId,
-          }
-        : ((activeFlashRoutingAssignment && {
-            ...activeFlashRoutingAssignment,
-            requestId: assistantMessageId,
-            startedAt: Date.now(),
-          }) ??
-          getDeepSeekV4Pro0813ExperimentContext(
-            activeDeepSeekV4Pro0813Experiment,
-          ));
+      const routingExperimentContext: ExperimentAnalyticsContext | undefined =
+        activeAbliteratedExperiment
+          ? {
+              key: activeAbliteratedExperiment.key,
+              variant: activeAbliteratedExperiment.variant,
+              requestId: assistantMessageId,
+            }
+          : activeFlashRoutingAssignment && {
+              ...activeFlashRoutingAssignment,
+              requestId: assistantMessageId,
+              startedAt: Date.now(),
+            };
 
       usageRefundTracker.recordDeductions(rateLimitInfo);
 
@@ -1341,6 +1317,7 @@ export const createChatHandler = () => {
               paidDailyFreeAllowanceReservation
                 ? createPaidDailyFreeAllowanceBudgetSnapshot(
                     paidDailyFreeAllowanceReservation,
+                    mode,
                   )
                 : null;
             const effectiveBudgetSnapshot =
@@ -1375,7 +1352,7 @@ export const createChatHandler = () => {
             let retryUsedFallbackModel = false;
             const retrySelectionModel =
               abliteratedExperiment &&
-              isAbliterationModel(abliteratedExperiment.modelKey)
+              isInferenceCyberModel(abliteratedExperiment.modelKey)
                 ? abliteratedExperiment.baselineModel
                 : selectedModel;
             const isAutoModel = isAutoModelSelectionForRetry({
@@ -1384,7 +1361,7 @@ export const createChatHandler = () => {
             });
             let fallbackModel =
               abliteratedExperiment &&
-              isAbliterationModel(abliteratedExperiment.modelKey)
+              isInferenceCyberModel(abliteratedExperiment.modelKey)
                 ? abliteratedExperiment.baselineModel
                 : getRetryFallbackModel(
                     maxBaselineModel ?? selectedModel,
@@ -1507,6 +1484,7 @@ export const createChatHandler = () => {
                         configuredModelId,
                         accountingModel: usageRecordArgs.accountingModel,
                         rateLimitInfo,
+                        modelFallback: state.usageModelFallback,
                       });
                       const cutOff = state.stoppedDueToBudgetExhaustion;
                       capturePaidDailyFreeAllowanceServerEvent({
@@ -1623,6 +1601,7 @@ export const createChatHandler = () => {
                         accountingModel: usageRecordArgs.accountingModel,
                         rateLimitInfo,
                         billingBreakdown,
+                        modelFallback: state.usageModelFallback,
                       });
                     }
                     captureUsageCost({
@@ -1847,10 +1826,8 @@ export const createChatHandler = () => {
                 }),
               abliteratedTelemetry,
               ...(activeAbliteratedExperiment &&
-                isAbliterationModel(activeAbliteratedExperiment.modelKey) && {
+                isInferenceCyberModel(activeAbliteratedExperiment.modelKey) && {
                   abliteratedStepRouting: {
-                    inferenceCyberEnabled:
-                      activeAbliteratedExperiment.inferenceCyberEnabled,
                     baselineModel: activeAbliteratedExperiment.baselineModel,
                     generationStepLimit:
                       activeAbliteratedExperiment.generationStepLimit,
@@ -1950,6 +1927,7 @@ export const createChatHandler = () => {
                 preemptiveTimeout?.isPreemptive() ? "timeout" : null,
             };
 
+            let lastStreamModel = selectedModel;
             const createStream = (
               modelName: string,
               excludedProviderModelSlugs?: readonly string[],
@@ -1961,21 +1939,18 @@ export const createChatHandler = () => {
               streamCtx.tools = getToolsForModel(modelName);
               streamCtx.excludedProviderModelSlugs = excludedProviderModelSlugs;
               setCurrentModelName(modelName);
+              if (retryUsesDifferentModel(lastStreamModel, modelName)) {
+                recordExplicitModelFallback(
+                  state,
+                  trackedProvider.languageModel(modelName).modelId,
+                );
+                lastStreamModel = modelName;
+              }
               return createAgentStream(modelName, streamCtx, state);
             };
 
             let result;
             try {
-              captureDeepSeekV4Pro0813ExperimentExposure({
-                posthog,
-                userId,
-                subscription,
-                mode,
-                selectedModelOverride,
-                selectedModel,
-                configuredModel: configuredModelId,
-                assignment: activeDeepSeekV4Pro0813Experiment,
-              });
               result = await createStream(selectedModel);
             } catch (error) {
               const shouldRecoverVisionApiError =
@@ -2545,9 +2520,13 @@ export const createChatHandler = () => {
                             emptyResponseContinuation ??
                             prepareProviderDisconnectContinuation(messages);
                           if (!continuation?.preservedCompletedToolCount) {
-                            usageTracker.prepareModelRetry({
-                              isLoopRecovery: loopTriggeredRetry,
-                            });
+                            usageTracker.prepareModelRetry(
+                              getProviderRetryUsageOptions({
+                                loopRecovery: loopTriggeredRetry,
+                                nonDurableOutputLimit:
+                                  shouldRetryNonDurableOutputLimit,
+                              }),
+                            );
                           }
                           if (
                             continuation &&
@@ -2571,9 +2550,13 @@ export const createChatHandler = () => {
                           }
                         } else if (shouldRetryWithVisionSummary) {
                           state.finalMessages = recoveredVisionMessages!;
-                          usageTracker.prepareModelRetry({
-                            isLoopRecovery: loopTriggeredRetry,
-                          });
+                          usageTracker.prepareModelRetry(
+                            getProviderRetryUsageOptions({
+                              loopRecovery: loopTriggeredRetry,
+                              nonDurableOutputLimit:
+                                shouldRetryNonDurableOutputLimit,
+                            }),
+                          );
                         } else if (shouldRetryWithoutImageToolResults) {
                           state.finalMessages =
                             omitTrailingStepStartAssistantMessage(
@@ -2581,10 +2564,14 @@ export const createChatHandler = () => {
                             );
                         } else {
                           // Ordinary failed-provider retries replace model usage;
-                          // loop recovery retains work already delivered.
-                          usageTracker.prepareModelRetry({
-                            isLoopRecovery: loopTriggeredRetry,
-                          });
+                          // loop recovery and output-limit legs stay billed.
+                          usageTracker.prepareModelRetry(
+                            getProviderRetryUsageOptions({
+                              loopRecovery: loopTriggeredRetry,
+                              nonDurableOutputLimit:
+                                shouldRetryNonDurableOutputLimit,
+                            }),
+                          );
                         }
 
                         abliteratedTelemetry?.setMessageId(retryMessageId);

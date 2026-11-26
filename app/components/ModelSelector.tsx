@@ -91,7 +91,6 @@ export function ModelSelector({ value, onChange, mode }: ModelSelectorProps) {
         {trigger}
         <Sheet open={open} onOpenChange={setOpen}>
           <SheetContent
-            data-chat-input-agent-menu
             side="bottom"
             className="rounded-t-2xl px-3 pb-8 pt-0 overscroll-contain"
           >

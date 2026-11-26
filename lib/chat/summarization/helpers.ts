@@ -1,4 +1,4 @@
-import { isAbliterationModel } from "@/lib/ai/abliteration";
+import { convertToModelMessagesWithSteers } from "@/lib/chat/agent-steer-model-messages";
 import { splitProviderToolCallBatches } from "@/lib/chat/provider-tool-call-batches";
 import {
   getStructuredCompactionPrompt,
@@ -7,7 +7,6 @@ import {
 import {
   UIMessage,
   generateText,
-  convertToModelMessages,
   LanguageModel,
   ToolSet,
   ModelMessage,
@@ -820,7 +819,6 @@ export const generateSummaryText = async (
   generationOptions?: {
     timeout?: number;
     maxRetries?: number;
-    preservePrefix?: boolean;
     structuredSummary?: boolean;
     maxOutputTokens?: number;
     onDiscardedUsage?: (usage: SummarizationUsage) => void;
@@ -853,36 +851,21 @@ export const generateSummaryText = async (
 
   const sourceModelMessages =
     modelMessages ??
-    (await convertToModelMessages(messagesToSummarize, {
+    (await convertToModelMessagesWithSteers(messagesToSummarize, {
       tools: tools ? createPromptSerializationTools(tools) : undefined,
     }));
-  const compactedModelMessages = generationOptions?.preservePrefix
-    ? sourceModelMessages
-    : compactModelMessagesForSummarization(
-        sourceModelMessages as ModelMessage[],
-      );
-  const boundedModelMessages = generationOptions?.preservePrefix
-    ? compactedModelMessages
-    : boundModelMessagesForSummarization(compactedModelMessages, {
-        maxInputTokens: summaryInputMaxTokens,
-      });
-  // Stored assistant turns can contain more calls than Abliteration accepts.
-  // Repair only the outgoing projection, preserving every paired call/result.
-  const summaryModelMessages = isAbliterationModel(
-    getLanguageModelIdentifier(languageModel),
-  )
-    ? splitProviderToolCallBatches(boundedModelMessages).messages
-    : boundedModelMessages;
+  const compactedModelMessages = compactModelMessagesForSummarization(
+    sourceModelMessages as ModelMessage[],
+  );
+  const boundedModelMessages = boundModelMessagesForSummarization(
+    compactedModelMessages,
+    { maxInputTokens: summaryInputMaxTokens },
+  );
+  const summaryModelMessages = boundedModelMessages;
   const estimatedCompactedInputTokens =
     estimateSummaryInputTokens(summaryModelMessages);
   if (sourceModelMessages.length > 0 && summaryModelMessages.length === 0) {
     throw new Error("Summary input budget cannot retain any source history");
-  }
-  if (
-    generationOptions?.preservePrefix &&
-    estimatedCompactedInputTokens > summaryInputMaxTokens
-  ) {
-    throw new Error("Cache-aligned summary exceeds its input budget");
   }
 
   const result = await generateText({

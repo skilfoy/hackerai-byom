@@ -71,6 +71,7 @@ jest.mock("@/app/contexts/GlobalState", () => {
 const mockUseQuery = jest.fn(() => undefined);
 const mockReadGeneratedTextAttachment = jest.fn();
 const mockHandleRemoveFile = jest.fn();
+const mockHandleRetryFile = jest.fn();
 const mockFetch = jest.fn();
 
 const setNavigatorOnline = (isOnline: boolean) => {
@@ -113,6 +114,7 @@ jest.mock("@/app/hooks/useFileUpload", () => ({
     fileInputRef: { current: null },
     handleFileUploadEvent: jest.fn(),
     handleRemoveFile: mockHandleRemoveFile,
+    handleRetryFile: mockHandleRetryFile,
     handleUpdateGeneratedTextFile: jest.fn(),
     handleAttachClick: jest.fn(),
     handlePasteEvent: jest.fn(),
@@ -313,6 +315,89 @@ describe("ChatInput - Integration Tests", () => {
   });
 
   describe("Keyboard and draft edge cases", () => {
+    it.each([
+      { draft: "", retryable: false, recovery: "remove" },
+      { draft: "Keep this draft", retryable: true, recovery: "retry" },
+    ])(
+      "blocks Send after a failed upload and allows sending after $recovery",
+      async ({ draft, retryable, recovery }) => {
+        mockIsMobile = retryable;
+        const file = new File(["report"], "report.txt", { type: "text/plain" });
+        const failed: UploadedFileState = {
+          file,
+          storage: "s3",
+          uploading: false,
+          uploaded: false,
+          error: "Upload failed",
+          retryable,
+        };
+        const recoveredFiles: UploadedFileState[] =
+          recovery === "retry"
+            ? [
+                {
+                  file,
+                  storage: "s3",
+                  uploading: false,
+                  uploaded: true,
+                  fileId: "file_recovered",
+                },
+              ]
+            : [];
+        render(
+          <TestWrapper>
+            <UploadedFilesSetter files={[failed]} label="Fail upload" />
+            <UploadedFilesSetter
+              files={recoveredFiles}
+              label="Recover attachment"
+            />
+            <ChatInput
+              onSubmit={mockOnSubmit}
+              onStop={mockOnStop}
+              status="ready"
+            />
+          </TestWrapper>,
+        );
+
+        const composer = await screen.findByTestId("chat-input");
+        fireEvent.change(composer, { target: { value: draft } });
+        fireEvent.click(screen.getByRole("button", { name: "Fail upload" }));
+        const send = screen.getByRole("button", { name: "Send message" });
+        expect(send).toBeDisabled();
+        const guidance = retryable
+          ? "Retry or remove failed attachments to send."
+          : "Remove failed attachments to send.";
+        expect(screen.getByText(guidance)).toBeVisible();
+        expect(composer).toHaveAccessibleDescription(guidance);
+        fireEvent.click(send);
+        fireEvent.keyDown(composer, { key: "Enter" });
+        expect(mockOnSubmit).not.toHaveBeenCalled();
+        expect(composer).toHaveValue(draft);
+
+        if (retryable) {
+          fireEvent.click(
+            screen.getByRole("button", { name: "Retry upload of report.txt" }),
+          );
+          expect(mockHandleRetryFile).toHaveBeenCalledWith(0);
+        } else {
+          fireEvent.click(screen.getByRole("button", { name: "Remove file" }));
+          expect(mockHandleRemoveFile).toHaveBeenCalledWith(0);
+        }
+        fireEvent.click(
+          screen.getByRole("button", { name: "Recover attachment" }),
+        );
+        expect(screen.queryByText(guidance)).not.toBeInTheDocument();
+        if (!draft) {
+          expect(send).toBeDisabled();
+          fireEvent.change(composer, {
+            target: { value: "Send without file" },
+          });
+        }
+        expect(send).toBeEnabled();
+        fireEvent.keyDown(composer, { key: "Enter" });
+        await waitFor(() => expect(mockOnSubmit).toHaveBeenCalledTimes(1));
+      },
+    );
+
     it.each(["insertText", "deleteContentBackward"])(
       "preserves a burst of native %s edits without exceeding React's update depth",
       async (inputType) => {
@@ -1353,7 +1438,7 @@ describe("ChatInput - Integration Tests", () => {
             onSubmit={mockOnSubmit}
             onStop={mockOnStop}
             status="streaming"
-            hasMessages
+            isNewChat
           />
         </TestWrapper>,
       );
@@ -1403,7 +1488,7 @@ describe("ChatInput - Integration Tests", () => {
             onSubmit={mockOnSubmit}
             onStop={mockOnStop}
             status="ready"
-            hasMessages
+            isNewChat
           />
         </TestWrapper>,
       );
@@ -1446,7 +1531,7 @@ describe("ChatInput - Integration Tests", () => {
             onSubmit={mockOnSubmit}
             onStop={mockOnStop}
             status="ready"
-            hasMessages
+            isNewChat
           />
         </TestWrapper>,
       );
@@ -1516,217 +1601,10 @@ describe("ChatInput - Integration Tests", () => {
       expect(input).not.toHaveFocus();
     });
 
-    it.each([
-      ["add", false],
-      ["permissions", false],
-      ["model", false],
-      ["add", true],
-      ["permissions", true],
-      ["model", true],
-    ] as const)(
-      "keeps mobile Cloud visibility unchanged when opening %s with editor previously focused=%s",
-      async (control, editorPreviouslyFocused) => {
-        mockIsMobile = true;
-        jest.mocked(useAuth).mockReturnValue({
-          user: { id: "toolbar-focus-user" },
-          entitlements: [],
-        } as ReturnType<typeof useAuth>);
-        mockSandboxState = {
-          chatMode: "agent",
-          subscription: "pro",
-          isCheckingProPlan: false,
-        };
-        mockFetch.mockResolvedValue({
-          ok: true,
-          json: async () => ({ enabled: true }),
-        });
-        render(
-          <TestWrapper>
-            <ChatInput
-              onSubmit={mockOnSubmit}
-              status="ready"
-              hasMessages
-              autoFocus={false}
-            />
-          </TestWrapper>,
-        );
-        const input = await screen.findByRole("textbox");
-        const add = await screen.findByRole("button", {
-          name: "Add files or pursue a goal",
-        });
-        const context = screen.getByTestId("chat-input-agent-context");
-        const trigger =
-          control === "add"
-            ? add
-            : screen.getByRole("button", {
-                name:
-                  control === "permissions" ? /^Agent permissions:/ : "Auto",
-              });
-
-        if (editorPreviouslyFocused) act(() => input.focus());
-        act(() => trigger.focus());
-        expect(context.hasAttribute("inert")).toBe(!editorPreviouslyFocused);
-        expect(input).not.toHaveFocus();
-
-        if (control === "add") fireEvent.keyDown(trigger, { key: "Enter" });
-        else fireEvent.click(trigger);
-        const popup = await screen.findByRole(
-          control === "add" ? "menu" : "dialog",
-        );
-        await waitFor(() =>
-          expect(popup).toContainElement(document.activeElement),
-        );
-        expect(context.hasAttribute("inert")).toBe(!editorPreviouslyFocused);
-
-        if (control === "model") {
-          fireEvent.click(within(popup).getByRole("button", { name: /^Auto/ }));
-        } else fireEvent.keyDown(popup, { key: "Escape" });
-        await waitFor(() => expect(popup).not.toBeInTheDocument());
-        expect(context.hasAttribute("inert")).toBe(!editorPreviouslyFocused);
-
-        fireEvent.pointerDown(document.body);
-        expect(context).toHaveAttribute("inert");
-      },
-    );
-
-    it("hides the sandbox after leaving an existing mobile composer but keeps new chats visible", async () => {
-      mockIsMobile = true;
-      jest.mocked(useAuth).mockReturnValue({
-        user: { id: "user_123" },
-        entitlements: [],
-      } as ReturnType<typeof useAuth>);
-      window.localStorage.setItem(CHAT_MODE_STORAGE_KEY, "agent");
-      mockUseQuery.mockImplementation((query) =>
-        [
-          "localSandbox:listConnectionDetails",
-          "localSandbox:getConnectionHeartbeats",
-        ].includes(getFunctionName(query))
-          ? [
-              {
-                connectionId: "local-sandbox",
-                name: "Local sandbox",
-                isDesktop: false,
-              },
-            ]
-          : undefined,
-      );
-
-      const { rerender } = render(
-        <TestWrapper>
-          <ChatInput
-            onSubmit={mockOnSubmit}
-            onStop={mockOnStop}
-            status="ready"
-            hasMessages
-            autoFocus={false}
-          />
-        </TestWrapper>,
-      );
-
-      const context = await screen.findByTestId("chat-input-agent-context");
-      const input = screen.getByTestId("chat-input");
-      expect(context).toHaveAttribute("aria-hidden", "true");
-      expect(context).toHaveAttribute("inert");
-      expect(
-        screen.getByRole("button", { name: /^Agent permissions:/ }),
-      ).toBeInTheDocument();
-
-      fireEvent.focus(input);
-      expect(context).not.toHaveAttribute("aria-hidden", "true");
-      expect(context).not.toHaveAttribute("inert");
-
-      fireEvent.blur(input, { relatedTarget: null });
-      expect(context).toHaveAttribute("aria-hidden", "true");
-      expect(context).toHaveAttribute("inert");
-      fireEvent.focus(input);
-
-      fireEvent.change(input, { target: { value: "A harmless follow-up" } });
-      fireEvent.keyDown(input, { key: "Enter" });
-      await waitFor(() => expect(mockOnSubmit).toHaveBeenCalledTimes(1));
-      expect(context).not.toHaveAttribute("aria-hidden", "true");
-      expect(context).not.toHaveAttribute("inert");
-
-      const sandboxTrigger = screen
-        .getByTestId("chat-input-mobile-sandbox")
-        .querySelector("button");
-      expect(sandboxTrigger).not.toBeNull();
-      act(() => input.focus());
-      fireEvent.pointerDown(sandboxTrigger!, { pointerType: "touch" });
-      jest.useFakeTimers();
-      try {
-        fireEvent.pointerUp(sandboxTrigger!, { pointerType: "touch" });
-        // Safari may deliver compatibility mouse events in a later task,
-        // blurring the textarea without focusing the tapped button.
-        act(() => jest.advanceTimersByTime(0));
-        act(() => input.blur());
-        expect(context).not.toHaveAttribute("aria-hidden", "true");
-        expect(context).not.toHaveAttribute("inert");
-      } finally {
-        jest.useRealTimers();
-      }
-
-      fireEvent.click(sandboxTrigger!);
-      const menu = await waitFor(() => {
-        const openedMenu = document.querySelector(
-          "[data-chat-input-agent-menu]",
-        );
-        expect(openedMenu).toBeInTheDocument();
-        return openedMenu;
-      });
-      jest.useFakeTimers();
-      try {
-        fireEvent.pointerUp(sandboxTrigger!);
-        act(() => jest.runOnlyPendingTimers());
-        expect(context).not.toHaveAttribute("inert");
-      } finally {
-        jest.useRealTimers();
-      }
-      fireEvent.pointerDown(menu!);
-      expect(context).not.toHaveAttribute("aria-hidden", "true");
-      expect(context).not.toHaveAttribute("inert");
-
-      fireEvent.pointerDown(document.body);
-      expect(context).toHaveAttribute("aria-hidden", "true");
-      expect(context).toHaveAttribute("inert");
-
-      fireEvent.pointerDown(input, { pointerType: "touch" });
-      expect(context).toHaveAttribute("inert");
-      fireEvent.focus(input);
-      expect(context).not.toHaveAttribute("aria-hidden", "true");
-      expect(context).not.toHaveAttribute("inert");
-
-      fireEvent.pointerDown(document.body);
-      expect(context).toHaveAttribute("aria-hidden", "true");
-      expect(context).toHaveAttribute("inert");
-      rerender(
-        <TestWrapper>
-          <ChatInput
-            onSubmit={mockOnSubmit}
-            onStop={mockOnStop}
-            status="ready"
-            isNewChat
-            autoFocus={false}
-          />
-        </TestWrapper>,
-      );
-      expect(context).not.toHaveAttribute("aria-hidden", "true");
-      expect(context).not.toHaveAttribute("inert");
-      fireEvent.pointerDown(document.body);
-      expect(context).not.toHaveAttribute("aria-hidden", "true");
-      expect(context).not.toHaveAttribute("inert");
-    });
-
-    it.each([
-      ["sandbox", "pointerup"],
-      ["permissions", "pointercancel"],
-    ])(
-      "keeps %s usable through delayed touch blur until %s",
-      async (target, release) => {
-        mockIsMobile = true;
-        jest.mocked(useAuth).mockReturnValue({
-          user: { id: "user_123" },
-          entitlements: [],
-        } as ReturnType<typeof useAuth>);
+    it.each([true, false])(
+      "offers the environment picker only before a chat's first message (mobile=%s)",
+      async (isMobile) => {
+        mockIsMobile = isMobile;
         window.localStorage.setItem(CHAT_MODE_STORAGE_KEY, "agent");
         mockUseQuery.mockImplementation((query) =>
           [
@@ -1742,7 +1620,24 @@ describe("ChatInput - Integration Tests", () => {
               ]
             : undefined,
         );
-        render(
+        const pickerTestId = isMobile
+          ? "chat-input-mobile-sandbox"
+          : "chat-input-desktop-sandbox";
+
+        const { rerender } = render(
+          <TestWrapper>
+            <ChatInput
+              onSubmit={mockOnSubmit}
+              onStop={mockOnStop}
+              status="ready"
+              isNewChat
+              autoFocus={false}
+            />
+          </TestWrapper>,
+        );
+        expect(await screen.findByTestId(pickerTestId)).toBeInTheDocument();
+
+        rerender(
           <TestWrapper>
             <ChatInput
               onSubmit={mockOnSubmit}
@@ -1753,35 +1648,12 @@ describe("ChatInput - Integration Tests", () => {
             />
           </TestWrapper>,
         );
-        const context = await screen.findByTestId("chat-input-agent-context");
         const input = screen.getByTestId("chat-input");
-        const trigger =
-          target === "sandbox"
-            ? screen
-                .getByTestId("chat-input-mobile-sandbox")
-                .querySelector("button")!
-            : screen.getByRole("button", { name: /^Agent permissions:/ });
-        jest.useFakeTimers();
-        try {
-          act(() => input.focus());
-          fireEvent.pointerDown(input, { pointerType: "touch" });
-          fireEvent.pointerUp(input, { pointerType: "touch" });
-          act(() => jest.runOnlyPendingTimers());
-          expect(context).not.toHaveAttribute("inert");
-
-          fireEvent.pointerDown(trigger, { pointerType: "touch" });
-          act(() => jest.advanceTimersByTime(100));
-          act(() => input.blur());
-          expect(context).not.toHaveAttribute("aria-hidden", "true");
-          expect(context).not.toHaveAttribute("inert");
-
-          fireEvent(document, new Event(release, { bubbles: true }));
-          act(() => jest.runOnlyPendingTimers());
-          expect(context).toHaveAttribute("aria-hidden", "true");
-          expect(context).toHaveAttribute("inert");
-        } finally {
-          jest.useRealTimers();
-        }
+        fireEvent.focus(input);
+        expect(screen.queryByTestId(pickerTestId)).not.toBeInTheDocument();
+        expect(
+          screen.getAllByRole("button", { name: /^Agent permissions:/ }).length,
+        ).toBeGreaterThan(0);
       },
     );
 
@@ -1823,7 +1695,7 @@ describe("ChatInput - Integration Tests", () => {
               onSubmit={mockOnSubmit}
               onStop={mockOnStop}
               status="ready"
-              hasMessages
+              isNewChat
             />
           </TestWrapper>,
         );

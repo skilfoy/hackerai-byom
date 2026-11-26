@@ -1,14 +1,14 @@
 import {
-  INFERENCE_CYBER_MODEL_KEY,
   INFERENCE_MAX_IMAGES_PER_REQUEST,
   isInferenceCyberModel,
 } from "@/lib/ai/inference";
-import {
-  shouldDeferInferenceRejectionToSizeRecovery,
-  withInferenceFallback,
-} from "@/lib/ai/inference-fallback";
+import { convertToModelMessagesWithSteers } from "@/lib/chat/agent-steer-model-messages";
 import { getSandboxBrowserGuidance } from "@/lib/ai/browser-guidance";
 import { createBrowserHandoffNoteProjector } from "@/lib/ai/browser-handoff/context";
+import {
+  createAgentSteerPart,
+  type AgentSteerInbox,
+} from "@/lib/chat/agent-steer";
 import { recoverBrowserHandoffCompletion } from "@/lib/ai/browser-handoff/completion-recovery";
 import {
   getAgentContextBudget,
@@ -23,7 +23,10 @@ import {
   getAgentModelContextFlag,
   type AgentModelContextVariant,
 } from "@/lib/experiments/agent-model-context";
-import { DEEPSEEK_1017_MODEL_KEY } from "@/lib/experiments/paid-deepseek-1017";
+import {
+  DEEPSEEK_1017_MODEL_KEY,
+  DEEPSEEK_1017_SLUG,
+} from "@/lib/experiments/paid-deepseek-1017";
 import type { AuxiliaryVisionDescriptionCacheWriter } from "@/lib/chat/auxiliary-vision";
 import {
   LocalConnectionLostError,
@@ -41,11 +44,6 @@ import {
   resolveAbliterationModelForGenerationStep,
   type AbliterationGenerationStepLimit,
 } from "@/lib/experiments/abliterated-model-steps";
-import {
-  isAbliterationModel,
-  ABLITERATION_MODEL_KEY,
-  ABLITERATION_LARGE_V2_MODEL_KEY,
-} from "@/lib/ai/abliteration";
 import { CompactionModelPolicy } from "@/lib/chat/summarization/compaction-policy";
 import { withProviderModelHistory } from "@/lib/ai/provider-model-history";
 import { getProviderRequestMediaCounts } from "@/lib/ai/provider-request-media";
@@ -55,7 +53,6 @@ import {
   AbliterationVisionError,
   createAbliterationVisionPreprocessor,
 } from "@/lib/chat/abliteration-vision";
-import { createAbliterationMediaRecovery } from "@/lib/chat/abliteration-media-recovery";
 import {
   getProviderToolCallDiagnostics,
   splitProviderToolCallBatches,
@@ -76,7 +73,6 @@ import {
  */
 
 import {
-  convertToModelMessages,
   asSchema,
   streamText,
   type LanguageModel,
@@ -203,6 +199,7 @@ import {
 import {
   buildContextBudgetProjectionDiagnostics,
   CONTEXT_BUDGET_DECISION_NOT_EVALUATED,
+  projectWithoutOrphanedFileAnnotations,
   type ContextBudgetDecision,
 } from "@/lib/chat/summarization/context-budget-diagnostics";
 import {
@@ -250,6 +247,11 @@ import {
 } from "@/lib/utils/error-utils";
 import { createProviderContentBlockedRefundLifecycle } from "@/lib/api/provider-content-blocked-refund";
 import type { UsageTracker } from "@/lib/usage-tracker";
+import {
+  observeServedModelFallback,
+  recordRequestedModelFallback,
+  type ObservedModelFallback,
+} from "@/convex/lib/usageModelSelection";
 import type {
   BudgetAbortDetails,
   BudgetMonitor,
@@ -394,8 +396,7 @@ export const resolveAgentModelForImageToolResults = (
     if (
       selectedModelOverride === "hackerai-pro" ||
       (!selectedModelOverride &&
-        (modelName === "model-deepseek-v4-pro" ||
-          modelName === "model-deepseek-v4-pro-0813" ||
+        (modelName === "model-deepseek-v4-pro-0813" ||
           modelName === PRO_AGENT_GLM_VISION_MODEL ||
           modelName === PRO_AGENT_DEEPSEEK_VISION_MODEL))
     ) {
@@ -405,9 +406,7 @@ export const resolveAgentModelForImageToolResults = (
   }
   if (
     selectedModelOverride === "hackerai-pro" ||
-    (!selectedModelOverride &&
-      (modelName === "model-deepseek-v4-pro" ||
-        modelName === "model-deepseek-v4-pro-0813"))
+    (!selectedModelOverride && modelName === "model-deepseek-v4-pro-0813")
   ) {
     return PRO_AGENT_DEEPSEEK_VISION_MODEL;
   }
@@ -465,6 +464,11 @@ export type AgentStreamState = {
   responseModel: string | undefined;
   /** Set only when provider/retry state can identify fallback serving. */
   fallbackServed: boolean | undefined;
+  /**
+   * Usage-ledger fallback observed during this run. Unlike fallbackServed it
+   * is sticky: retries and usage resets keep it. Never read for routing.
+   */
+  usageModelFallback?: ObservedModelFallback;
   /** Original provider/AI SDK error captured from streamText.onError. */
   providerError: unknown;
   /** Attribution from the failing request only, never merged with prior steps. */
@@ -553,6 +557,20 @@ export const resetServedModelTelemetryForRetry = (
   state.fallbackServed = undefined;
 };
 
+/**
+ * Ask and Agent callers mark an explicit alternate stream route, including a
+ * different provider for the same model, before starting it. Reporting only.
+ */
+export const recordExplicitModelFallback = (
+  state: Pick<AgentStreamState, "usageModelFallback">,
+  requestedModelId: string,
+): void => {
+  state.usageModelFallback = recordRequestedModelFallback(
+    state.usageModelFallback,
+    requestedModelId,
+  );
+};
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null;
 
@@ -602,6 +620,24 @@ export const addOpenRouterFileAnnotationsToLastAssistantMessage = (
   } as ModelMessage;
   return nextMessages;
 };
+
+/** Shared by the rolling estimate and the actual provider request. */
+export const projectOpenRouterFileAnnotationsForRequest = ({
+  messages,
+  annotations,
+  routeAwareContext,
+  modelId,
+  rolling = false,
+}: {
+  messages: ModelMessage[];
+  annotations: unknown[] | undefined;
+  routeAwareContext: boolean;
+  modelId: string;
+  rolling?: boolean;
+}) =>
+  routeAwareContext && modelId === DEEPSEEK_1017_SLUG
+    ? projectWithoutOrphanedFileAnnotations(messages, annotations, rolling)
+    : { messages, annotations };
 
 const ESTIMATED_BYTES_PER_TOKEN = 4;
 
@@ -832,6 +868,8 @@ export type AgentStreamContext = {
   browserHandoffGoalObjective?: string;
   waitForBrowserHandoff?: (signal?: AbortSignal) => Promise<boolean>;
   getBrowserHandoffNotes?: () => Promise<Array<{ id: string; text: string }>>;
+  /** Follow-ups the user sent to this run, read before each model step. */
+  steerInbox?: AgentSteerInbox;
   cacheVisionDescription?: AuxiliaryVisionDescriptionCacheWriter;
   triggerRunId?: string;
   onAgentGuardrail?: (observation: AgentGuardrailObservation) => void;
@@ -840,7 +878,6 @@ export type AgentStreamContext = {
   abliteratedStepRouting?: {
     baselineModel: string;
     generationStepLimit?: AbliterationGenerationStepLimit;
-    inferenceCyberEnabled?: boolean;
   };
   trackedProvider: ReturnType<typeof createTrackedProvider>;
   currentSystemPrompt: string;
@@ -1158,7 +1195,6 @@ export async function createAgentStream(
   const routeAwareContext =
     ctx.mode === "agent" &&
     (ctx.agentModelContextEnabled === true || paidContext);
-  let activeModelInputTokens = 0;
   let lastPreparedInputEstimate = 0;
   // Failure diagnostics only: the compaction decision value actually compared
   // in the current prepareStep. Reset per step so a guard never reports a
@@ -1207,59 +1243,13 @@ export async function createAgentStream(
           stepIndex,
           activeStepRouting,
         ) ?? historyModel;
-      return recoverAbliterationMedia(
-        ctx.providerStreamTimeout
-          ? withProviderStreamTimeout(telemetryModel, ctx.providerStreamTimeout)
-          : telemetryModel,
-      );
+      return ctx.providerStreamTimeout
+        ? withProviderStreamTimeout(telemetryModel, ctx.providerStreamTimeout)
+        : telemetryModel;
     };
-    let recoveryModel = wrapAttempt(languageModel);
-    if (
-      typeof languageModel !== "string" &&
-      languageModel.specificationVersion === "v3" &&
-      isInferenceCyberModel(languageModel.modelId)
-    ) {
-      const fallback = wrapAttempt(
-        ctx.trackedProvider.languageModel(ABLITERATION_MODEL_KEY),
-      );
-      if (
-        typeof recoveryModel !== "string" &&
-        recoveryModel.specificationVersion === "v3" &&
-        typeof fallback !== "string" &&
-        fallback.specificationVersion === "v3"
-      ) {
-        recoveryModel = withInferenceFallback(recoveryModel, fallback, {
-          abortSignal,
-          // Ask has no size recovery and keeps the immediate fallback.
-          ...(ctx.mode === "agent" && {
-            deferPreStreamRejection: (error: unknown) =>
-              shouldDeferInferenceRejectionToSizeRecovery(
-                error,
-                state.requestSizeRecovery,
-              ),
-          }),
-          prepareFallbackPrompt: (prompt) =>
-            preprocessAbliterationImages(prompt),
-          onDiscardedUsage: (usage) => {
-            const inputTokens = usage.inputTokens.total ?? 0;
-            const outputTokens = usage.outputTokens.total ?? 0;
-            ctx.usageTracker.accumulateStep(
-              {
-                inputTokens,
-                outputTokens,
-                totalTokens: inputTokens + outputTokens,
-                inputTokenDetails: {
-                  cacheReadTokens: usage.inputTokens.cacheRead,
-                  cacheWriteTokens: usage.inputTokens.cacheWrite,
-                },
-                raw: usage.raw,
-              },
-              INFERENCE_CYBER_MODEL_KEY,
-            );
-          },
-        });
-      }
-    }
+    // An Inference failure reaches the caller's selected-model recovery,
+    // which carries the usual platform authorization context.
+    const recoveryModel = wrapAttempt(languageModel);
     const sizeRecoveryModel =
       ctx.mode === "agent"
         ? withProviderRequestSizeRecovery(recoveryModel, {
@@ -1360,6 +1350,12 @@ export async function createAgentStream(
         selectedModelOverride: ctx.selectedModelOverride,
       }),
     });
+    if (state.fallbackServed) {
+      state.usageModelFallback = observeServedModelFallback(
+        state.usageModelFallback,
+        { servedModel: state.responseModel, confirmedProviderFallback: true },
+      );
+    }
 
     const openRouterMetadata = lastStep
       ? extractOpenRouterMetadata({
@@ -1510,16 +1506,7 @@ export async function createAgentStream(
       ctx.directGlmVisionEnabled,
       ctx.subscription,
     );
-    // Preserve the expanded-context alias and its existing recovery policy.
-    // Both Abliteration aliases now execute the multimodal Large Flash model.
-    return expandedContextEnabled &&
-      effectiveModel === ABLITERATION_MODEL_KEY &&
-      activeModelInputTokens >
-        getSummarizationThresholdTokens(
-          getMaxTokensForSubscription(ctx.subscription),
-        )
-      ? ABLITERATION_LARGE_V2_MODEL_KEY
-      : effectiveModel;
+    return effectiveModel;
   };
   const getEffectiveModelInfo = (stepIndex = generationStepOffset) => {
     const effectiveModelName = getEffectiveModelName(stepIndex);
@@ -1527,7 +1514,7 @@ export async function createAgentStream(
     const preVisionModelName = getPreVisionModelName(stepIndex);
     activeStepRouting = {
       plannedBaselineContinuation:
-        isAbliterationModel(routeModelName) &&
+        isInferenceCyberModel(routeModelName) &&
         preVisionModelName !== routeModelName,
       visionRoute: preVisionModelName !== effectiveModelName,
       fallbackModels: getFallbackSlugs(effectiveModelName, ctx.mode, {
@@ -1536,12 +1523,7 @@ export async function createAgentStream(
       }),
     };
     ctx.onModelStepSelected?.(effectiveModelName);
-    const useInference =
-      ctx.abliteratedStepRouting?.inferenceCyberEnabled === true &&
-      isAbliterationModel(effectiveModelName);
-    const languageModel = ctx.trackedProvider.languageModel(
-      useInference ? INFERENCE_CYBER_MODEL_KEY : effectiveModelName,
-    );
+    const languageModel = ctx.trackedProvider.languageModel(effectiveModelName);
     lastRequestedSlug = languageModel.modelId;
     if (routeAwareContext) {
       activeContextBudget = getAgentContextBudget({
@@ -1566,10 +1548,7 @@ export async function createAgentStream(
     effectiveModelName = getEffectiveModelName(),
   ) => {
     const requestedModelSlug =
-      ctx.abliteratedStepRouting?.inferenceCyberEnabled &&
-      isAbliterationModel(effectiveModelName)
-        ? ctx.trackedProvider.languageModel(INFERENCE_CYBER_MODEL_KEY).modelId
-        : ctx.trackedProvider.languageModel(effectiveModelName).modelId;
+      ctx.trackedProvider.languageModel(effectiveModelName).modelId;
     const cacheSessionId = createOpenRouterCacheSessionId({
       chatId: ctx.chatId,
       mode: ctx.mode,
@@ -1615,10 +1594,6 @@ export async function createAgentStream(
       ctx.chatLogger?.getBuilder().addToolCost(cost);
     },
   });
-  const recoverAbliterationMedia = createAbliterationMediaRecovery(
-    preprocessAbliterationImages,
-    abortSignal,
-  );
   let latestToolCallBatchSplitCount = 0;
   let trustedHistoryPrefix: ModelMessage[] = [];
   const hasPlatformAnnotationContext = () =>
@@ -1631,17 +1606,14 @@ export async function createAgentStream(
     effectiveModelName = getEffectiveModelName(),
     enforceContextBudget = true,
   ): Promise<ModelMessage[]> => {
-    const toolCallRepair = isAbliterationModel(effectiveModelName)
+    const toolCallRepair = isInferenceCyberModel(effectiveModelName)
       ? splitProviderToolCallBatches(messages)
       : { messages, splitCount: 0 };
     latestToolCallBatchSplitCount = toolCallRepair.splitCount;
-    const visionMessages = isAbliterationModel(effectiveModelName)
+    // Describe images beyond Inference's native per-request budget.
+    const visionMessages = isInferenceCyberModel(effectiveModelName)
       ? await preprocessAbliterationImages(toolCallRepair.messages, {
-          // The logical route keeps its historical Abliteration alias; use
-          // the actual selected provider's native budget before conversion.
-          maxNativeImages: ctx.abliteratedStepRouting?.inferenceCyberEnabled
-            ? INFERENCE_MAX_IMAGES_PER_REQUEST
-            : undefined,
+          maxNativeImages: INFERENCE_MAX_IMAGES_PER_REQUEST,
         })
       : toolCallRepair.messages;
     const providerMessages = providerPdfAttachmentsDisabled
@@ -1677,13 +1649,23 @@ export async function createAgentStream(
           effectiveModelName,
         );
 
-    const attachedFileAnnotations = openRouterFileAnnotations;
+    const requestModelId =
+      ctx.trackedProvider.languageModel(effectiveModelName).modelId;
+    // Scan the request itself, after any provider PDF omission above.
+    // The original batch stays in `openRouterFileAnnotations` for later steps.
+    const annotationProjection = projectOpenRouterFileAnnotationsForRequest({
+      messages: messagesWithAuthorization,
+      annotations: openRouterFileAnnotations,
+      routeAwareContext,
+      modelId: requestModelId,
+    });
+    const attachedFileAnnotations = annotationProjection.annotations;
     const prepared = addPromptCacheBreakpoints(
       addOpenRouterFileAnnotationsToLastAssistantMessage(
-        messagesWithAuthorization,
+        annotationProjection.messages,
         attachedFileAnnotations,
       ),
-      ctx.trackedProvider.languageModel(effectiveModelName).modelId,
+      requestModelId,
     );
     let preparedMessageTokens: number | undefined;
     let preparedSystemTokens: number | undefined;
@@ -1828,7 +1810,10 @@ export async function createAgentStream(
     // This retry bypasses prepareStep and prepareProviderMessages. Re-read
     // private handoff instructions after lossy summarization, then apply the
     // same trusted annotation policy at the provider boundary.
-    const handoffNotes = (await ctx.getBrowserHandoffNotes?.()) ?? [];
+    const handoffNotes = [
+      ...((await ctx.getBrowserHandoffNotes?.()) ?? []),
+      ...(ctx.steerInbox?.delivered() ?? []),
+    ];
     rejectedRequestRecoveryMessages = projectHandoffNotes(
       [
         { role: "user", content: summaryText },
@@ -1987,7 +1972,7 @@ export async function createAgentStream(
   const initialSerializationStartedAt = Date.now();
   let initialSerializedMessages: ModelMessage[];
   try {
-    initialSerializedMessages = await convertToModelMessages(
+    initialSerializedMessages = await convertToModelMessagesWithSteers(
       state.finalMessages,
       {
         tools: promptSerializationTools,
@@ -2013,11 +1998,6 @@ export async function createAgentStream(
       : undefined;
   if (recoveredContext) initialSerializedMessages = recoveredContext;
   else state.providerRecoveryContext = undefined;
-  if (expandedContextEnabled) {
-    activeModelInputTokens =
-      estimateSummaryInputTokens(initialSerializedMessages) +
-      ctx.systemPromptTokens;
-  }
   const initialModelInfo = getEffectiveModelInfo();
   const historyRoute = initialModelInfo.languageModel.modelId ?? "";
   const runtimePrompt = async () =>
@@ -2106,7 +2086,7 @@ export async function createAgentStream(
         ),
         tools: schemas,
       });
-      sourceModelMessages = await convertToModelMessages(
+      sourceModelMessages = await convertToModelMessagesWithSteers(
         state.sourceUiMessages ?? state.finalMessages,
         { tools: promptSerializationTools },
       );
@@ -2245,6 +2225,27 @@ export async function createAgentStream(
     });
 
   const projectHandoffNotes = createBrowserHandoffNoteProjector();
+  // A stopped run leaves new steers unread so the client can queue them.
+  const readSteers = async (steps: unknown) => {
+    const inbox = ctx.steerInbox;
+    if (!inbox) return [];
+    if (!abortSignal.aborted) {
+      const claimed = await inbox.claim();
+      const lastStep = Array.isArray(steps) ? steps.at(-1) : undefined;
+      const afterToolCallId = (
+        lastStep as { toolCalls?: Array<{ toolCallId?: string }> } | undefined
+      )?.toolCalls?.at(-1)?.toolCallId;
+      for (const steer of claimed) {
+        ctx.summarizationTracker.recordSteer(steer, afterToolCallId);
+        try {
+          ctx.writer.write(createAgentSteerPart(steer));
+        } catch {
+          // The saved response still shows the steer if the live stream is gone.
+        }
+      }
+    }
+    return inbox.delivered();
+  };
   let preparedRuntimeCheckpoint = false;
   return streamText({
     // Step results outlive prompt compaction. Do not retain another serialized
@@ -2349,7 +2350,11 @@ export async function createAgentStream(
       await ctx.checkBudgetBeforeStep?.();
       // Saved handoff notes can change the user's instructions. If the read
       // fails, retry/fail this step rather than act with silently missing context.
-      const handoffNotes = (await ctx.getBrowserHandoffNotes?.()) ?? [];
+      // Steers are user messages too, replayed at the step where they were read.
+      const handoffNotes = [
+        ...((await ctx.getBrowserHandoffNotes?.()) ?? []),
+        ...(await readSteers(steps)),
+      ];
       const withHandoffNotes = (
         messages: ModelMessage[],
         compactedPrefixLength?: number,
@@ -2363,9 +2368,19 @@ export async function createAgentStream(
       // Its system override applies to this request only, so the one-shot notice
       // is neither replayed on every step nor stored in compacted chat history.
       const runtime = await runtimePrompt();
+      const localGenerationStepIndex =
+        Number.isInteger(stepNumber) && stepNumber >= 0
+          ? stepNumber
+          : steps.length;
+      const generationStepIndex =
+        generationStepOffset + localGenerationStepIndex;
       const checkpointNotice =
         ctx.mode === "agent" && !abortSignal.aborted
-          ? ctx.runtimeCheckpoint?.takeNotice()
+          ? ctx.runtimeCheckpoint?.takeNotice({
+              completedSteps: generationStepIndex,
+              maxSteps: configuredMaxSteps,
+              budgetUsedPercent: ctx.budgetMonitor?.getStopPressurePercent(),
+            })
           : undefined;
       preparedRuntimeCheckpoint = !!checkpointNotice;
       const nextRuntimeSection = runtime + (checkpointNotice ?? "");
@@ -2377,12 +2392,6 @@ export async function createAgentStream(
       runtimePromptTokens = safeCountTokens(runtimeSection);
       preparedToolCycleRecovery = undefined;
       preparedToolFailureRecovery = undefined;
-      const localGenerationStepIndex =
-        Number.isInteger(stepNumber) && stepNumber >= 0
-          ? stepNumber
-          : steps.length;
-      const generationStepIndex =
-        generationStepOffset + localGenerationStepIndex;
       contextBudgetStepIndex = generationStepIndex;
       const rawModelMessages = messages as ModelMessage[];
       if (
@@ -2404,12 +2413,6 @@ export async function createAgentStream(
         rollingModelMessages = limitModelImageToolResults(
           rollingModelMessages as Array<Record<string, unknown>>,
         ).messages as ModelMessage[];
-      if (expandedContextEnabled) {
-        activeModelInputTokens =
-          estimateSummaryInputTokens(rollingModelMessages) +
-          ctx.systemPromptTokens +
-          runtimePromptTokens;
-      }
       const lastStep = Array.isArray(steps) ? steps.at(-1) : undefined;
       const toolResults =
         (lastStep && (lastStep as { toolResults?: unknown[] }).toolResults) ||
@@ -2433,7 +2436,7 @@ export async function createAgentStream(
           if (ctx.mode === "agent") {
             const previousSourceDigests = initialSourceDigests;
             initialSourceDigests = sourceMessageDigests(
-              await convertToModelMessages(state.finalMessages, {
+              await convertToModelMessagesWithSteers(state.finalMessages, {
                 tools: promptSerializationTools,
               }),
             );
@@ -2495,10 +2498,19 @@ export async function createAgentStream(
           // The route-aware send guard counts parsed-file annotations attached
           // to the prepared request and the memoized tool schema estimate.
           // Count both here so compaction triggers before that guard fails.
+          const decisionProjection = projectOpenRouterFileAnnotationsForRequest(
+            {
+              messages: rollingModelMessages,
+              annotations: openRouterFileAnnotations,
+              routeAwareContext,
+              modelId: effectiveModelInfo.requestedSlug,
+              rolling: true,
+            },
+          );
           const decisionMessages = routeAwareContext
             ? addOpenRouterFileAnnotationsToLastAssistantMessage(
-                rollingModelMessages,
-                openRouterFileAnnotations,
+                decisionProjection.messages,
+                decisionProjection.annotations,
               )
             : rollingModelMessages;
           const inputTokens =
@@ -2585,7 +2597,7 @@ export async function createAgentStream(
               state.finalMessages = result.summarizedMessages;
               if (ctx.mode === "agent")
                 initialSourceDigests = sourceMessageDigests(
-                  await convertToModelMessages(state.finalMessages, {
+                  await convertToModelMessagesWithSteers(state.finalMessages, {
                     tools: promptSerializationTools,
                   }),
                 );
@@ -2612,10 +2624,11 @@ export async function createAgentStream(
               const summarySerializationStartedAt = Date.now();
               let summarizedModelMessages: ModelMessage[];
               try {
-                summarizedModelMessages = await convertToModelMessages(
-                  result.summarizedMessages,
-                  { tools: promptSerializationTools },
-                );
+                summarizedModelMessages =
+                  await convertToModelMessagesWithSteers(
+                    result.summarizedMessages,
+                    { tools: promptSerializationTools },
+                  );
               } finally {
                 ctx.onStartupPhaseDuration?.(
                   "message_serialization",
@@ -2643,7 +2656,7 @@ export async function createAgentStream(
               // checkpoint from the old source must no longer be replayed.
               state.providerRecoveryContext = undefined;
               if (historyEnabled) {
-                sourceModelMessages = await convertToModelMessages(
+                sourceModelMessages = await convertToModelMessagesWithSteers(
                   result.summarizedMessages,
                   { tools: promptSerializationTools },
                 );
@@ -3241,9 +3254,8 @@ export async function createAgentStream(
       // cannot activate this context. State survives retries within this run only.
       if (
         ctx.abliteratedStepRouting &&
-        isAbliterationModel(activeStepModelName) &&
-        (isAbliterationModel(response.modelId) ||
-          isInferenceCyberModel(response.modelId)) &&
+        isInferenceCyberModel(activeStepModelName) &&
+        isInferenceCyberModel(response.modelId) &&
         ["stop", "tool-calls", "length"].includes(finishReason) &&
         (Boolean(text?.trim()) ||
           toolCalls?.some(
@@ -3295,6 +3307,23 @@ export async function createAgentStream(
       }
       ctx.onModelStreamFinish?.();
       state.agentStepCount += 1;
+      // Ledger reporting only: a served model in this step's provider fallback
+      // chain is a confirmed fallback; any other served ID is normal routing.
+      state.usageModelFallback = observeServedModelFallback(
+        state.usageModelFallback,
+        {
+          servedModel: response?.modelId,
+          confirmedProviderFallback:
+            resolveFallbackServedTelemetry({
+              requestedModel: lastRequestedSlug,
+              responseModel: response?.modelId,
+              fallbackModels: getFallbackSlugs(activeStepModelName, ctx.mode, {
+                hasMultimodalToolResults: streamHasImageViewResults,
+                selectedModelOverride: ctx.selectedModelOverride,
+              }),
+            }) === true,
+        },
+      );
       const responsePdfParserEngine = getResponseHeader(
         response?.headers,
         PDF_PARSER_ENGINE_HEADER,
@@ -3640,6 +3669,12 @@ export async function createAgentStream(
         responseModel: state.responseModel,
         fallbackModels: fallbackSlugs,
       });
+      if (state.fallbackServed) {
+        state.usageModelFallback = observeServedModelFallback(
+          state.usageModelFallback,
+          { servedModel: state.responseModel, confirmedProviderFallback: true },
+        );
+      }
       if (state.fallbackServed && state.responseModel) {
         ctx.chatLogger?.recordModelFallback({
           requested: lastRequestedSlug,
@@ -3741,6 +3776,7 @@ export async function createAgentStream(
       }
       if (
         !isProviderContentBlockedFinishReasonError(error) &&
+        ctx.mode !== "agent" &&
         !ctx.usageTracker.hasUsage
       ) {
         await ctx.usageRefundTracker.refund();

@@ -5,6 +5,8 @@ import {
 import { userInputQuestionsValidator } from "./lib/userInputQuestions";
 import { userInputQuestionsSchema } from "../lib/chat/user-input-questions";
 import { syncGoalInputTiming } from "./lib/goalInputTiming";
+import { deleteAgentSteersForChat } from "./lib/agentSteers";
+import { deleteQueuedMessagesForChat } from "./lib/queuedMessages";
 import { goalTimingForState } from "../lib/goals/timing";
 import { scheduleFileDeletion } from "./lib/fileDeletion";
 import { deleteModelHistory } from "./modelHistory";
@@ -41,6 +43,7 @@ import {
 import { resolveBranchedFromTitle } from "./lib/branchedChatTitle";
 import { isUserDeletionFenced } from "./lib/userDeletionFence";
 import { getSidebarChatAttention } from "./lib/sidebarChatAttention";
+import { deleteScopeBatch } from "./lib/legacyEngagementScope";
 
 const DELETE_ALL_CHATS_MESSAGE_BATCH_SIZE = 10;
 const DELETE_ALL_CHATS_SUMMARY_BATCH_SIZE = 25;
@@ -416,6 +419,13 @@ async function deleteChatDocument(ctx: MutationCtx, chat: Doc<"chats">) {
     .withIndex("by_chatId", (q) => q.eq("chatId", chat.id))
     .unique();
   if (goal) await ctx.db.delete(goal._id);
+  if (
+    (await deleteAgentSteersForChat(ctx, chat.id)) ||
+    (await deleteQueuedMessagesForChat(ctx, chat.id))
+  ) {
+    await scheduleDeleteChatDocumentBatch(ctx, chat.id, chat.user_id);
+    return;
+  }
 
   if (
     (await deleteFindingHuntsForChatBatch(ctx, chat.user_id, chat.id)) ||
@@ -478,6 +488,11 @@ async function deleteChatDocument(ctx: MutationCtx, chat: Doc<"chats">) {
     return;
   }
 
+  if (await deleteScopeBatch(ctx, chat.id)) {
+    await scheduleDeleteChatDocumentBatch(ctx, chat.id, chat.user_id);
+    return;
+  }
+
   // Delete the chat itself
   await deleteChatHistoryAccess(ctx, chat.id);
   await ctx.db.delete(chat._id);
@@ -499,6 +514,13 @@ async function deleteNextUserChatBatch(ctx: MutationCtx, userId: string) {
     .withIndex("by_chatId", (q) => q.eq("chatId", chat.id))
     .unique();
   if (goal) await ctx.db.delete(goal._id);
+  if (
+    (await deleteAgentSteersForChat(ctx, chat.id)) ||
+    (await deleteQueuedMessagesForChat(ctx, chat.id))
+  ) {
+    await scheduleDeleteAllChatsBatch(ctx, userId);
+    return true;
+  }
 
   if (
     (await deleteFindingHuntsForChatBatch(ctx, chat.user_id, chat.id)) ||
@@ -541,6 +563,11 @@ async function deleteNextUserChatBatch(ctx: MutationCtx, userId: string) {
   }
 
   if (await deleteSubagentDataForChat(ctx, chat.id)) {
+    await scheduleDeleteAllChatsBatch(ctx, userId);
+    return true;
+  }
+
+  if (await deleteScopeBatch(ctx, chat.id)) {
     await scheduleDeleteAllChatsBatch(ctx, userId);
     return true;
   }

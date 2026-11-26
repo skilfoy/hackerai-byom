@@ -35,13 +35,31 @@ jest.mock("@/app/services/desktop-command-cancellation", () => ({
     mockCancelDesktopRunLocally(...args),
 }));
 
-const mockCancelStream = jest.fn(async () => null);
+const mockCancelStream = jest.fn<() => Promise<boolean | null>>(
+  async () => null,
+);
+const mockMarkUserStopped = jest.fn<
+  (args: {
+    chatId: string;
+    messageId: string;
+    role: "user" | "assistant";
+  }) => Promise<boolean>
+>(async () => false);
 const mockSaveAssistantMessage = jest.fn(async () => null);
 const mockDeleteLastAssistantMessage = jest.fn(async () => null);
 const mockRegenerateWithNewContent = jest.fn<
   () => Promise<null | { goalGeneration: number }>
 >(async () => null);
 const mockRemoveQueuedMessage = jest.fn();
+const mockCreateAgentSteer = jest.fn<
+  (args: {
+    chatId: string;
+    id: string;
+    text: string;
+    sentAt: number;
+  }) => Promise<string>
+>(async () => "pending");
+let mockAgentSteeringEnabled = false;
 const mockQueueMessage = jest.fn();
 const mockSendMessage = jest.fn(async () => undefined);
 const mockStop = jest.fn();
@@ -71,7 +89,11 @@ let mockCurrentTodos: unknown = todos;
 
 jest.mock("@/convex/_generated/api", () => ({
   api: {
-    chatStreams: { cancelStreamFromClient: "cancelStreamFromClient" },
+    chatStreams: {
+      cancelStreamFromClient: "cancelStreamFromClient",
+      markMessageUserStopped: "markMessageUserStopped",
+    },
+    agentSteers: { create: "createAgentSteer" },
     messages: {
       deleteLastAssistantMessage: "deleteLastAssistantMessage",
       regenerateWithNewContent: "regenerateWithNewContent",
@@ -85,12 +107,16 @@ jest.mock("convex/react", () => ({
     switch (mutation) {
       case "cancelStreamFromClient":
         return mockCancelStream;
+      case "markMessageUserStopped":
+        return mockMarkUserStopped;
       case "saveAssistantMessage":
         return mockSaveAssistantMessage;
       case "deleteLastAssistantMessage":
         return mockDeleteLastAssistantMessage;
       case "regenerateWithNewContent":
         return mockRegenerateWithNewContent;
+      case "createAgentSteer":
+        return mockCreateAgentSteer;
       default:
         throw new Error(`Unexpected mutation: ${mutation}`);
     }
@@ -116,6 +142,7 @@ jest.mock("@/app/contexts/GlobalState", () => ({
     })),
     removeQueuedMessage: mockRemoveQueuedMessage,
     queueBehavior: mockQueueBehavior,
+    agentSteeringEnabled: mockAgentSteeringEnabled,
     sandboxPreference: mockSandboxPreference,
     agentPermissionMode: mockAgentPermissionMode,
     selectedModel: "hackerai-standard",
@@ -179,6 +206,8 @@ describe("useChatHandlers steer todo handoff", () => {
     mockChatMode = "agent";
     mockAgentPermissionMode = "full_access";
     mockQueueBehavior = "queue";
+    mockAgentSteeringEnabled = false;
+    mockCreateAgentSteer.mockResolvedValue("pending");
     mockQueuedDeliveryStatus = undefined;
     mockMessageQueue = [
       { id: "queued-1", text: "Change direction", files: [], timestamp: 123 },
@@ -728,7 +757,197 @@ describe("useChatHandlers steer todo handoff", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
-  const renderSummarySteer = (isSummarizing = true) => {
+  describe("explicit Stop marker", () => {
+    const renderStop = ({
+      mode,
+      runId,
+      currentMessages = messages,
+    }: {
+      mode: "ask" | "agent";
+      runId?: string;
+      currentMessages?: ChatMessage[];
+    }) => {
+      mockChatMode = mode;
+      return renderHook(() =>
+        useChatHandlers({
+          chatId: "chat-1",
+          messages: currentMessages,
+          sendMessage: mockSendMessage,
+          stop: mockStop,
+          regenerate: jest.fn(),
+          setMessages: mockSetMessages,
+          isExistingChat: true,
+          status: "streaming",
+          isSendingNowRef: { current: false },
+          hasManuallyStoppedRef: { current: false },
+          activeTriggerRunRef: { current: runId },
+        }),
+      ).result;
+    };
+    const stop = async (
+      result: { current: ReturnType<typeof useChatHandlers> },
+      options?: Parameters<ReturnType<typeof useChatHandlers>["handleStop"]>[0],
+    ) => {
+      let stopped: boolean | undefined;
+      await act(async () => {
+        stopped = await result.current.handleStop(options);
+      });
+      return stopped;
+    };
+    const localMarkerUpdate = () =>
+      mockSetMessages.mock.calls
+        .map(([update]) => update)
+        .find(
+          (update): update is (prev: ChatMessage[]) => ChatMessage[] =>
+            typeof update === "function",
+        );
+
+    it("marks the partial Ask reply only after Convex confirms it stopped a running stream", async () => {
+      let finishCancel!: (wasRunning: boolean) => void;
+      mockCancelStream.mockImplementationOnce(
+        () => new Promise((resolve) => (finishCancel = resolve)),
+      );
+      mockMarkUserStopped.mockResolvedValueOnce(true);
+      const result = renderStop({ mode: "ask" });
+      let stopping!: Promise<boolean>;
+      act(() => {
+        stopping = result.current.handleStop();
+      });
+      await waitFor(() => expect(mockCancelStream).toHaveBeenCalled());
+      expect(mockMarkUserStopped).not.toHaveBeenCalled();
+      await act(async () => {
+        finishCancel(true);
+        expect(await stopping).toBe(true);
+      });
+      expect(mockMarkUserStopped).toHaveBeenCalledWith({
+        chatId: "chat-1",
+        messageId: "assistant-1",
+        role: "assistant",
+      });
+      expect(localMarkerUpdate()?.(messages)).toEqual([
+        messages[0],
+        { ...messages[1], metadata: { userStopped: true } },
+      ]);
+    });
+
+    it("anchors a Stop before any reply to the user's request", async () => {
+      mockCancelStream.mockResolvedValueOnce(true);
+      mockMarkUserStopped.mockResolvedValueOnce(true);
+      const result = renderStop({
+        mode: "ask",
+        currentMessages: [messages[0]],
+      });
+      expect(await stop(result)).toBe(true);
+      expect(mockMarkUserStopped).toHaveBeenCalledWith({
+        chatId: "chat-1",
+        messageId: "user-1",
+        role: "user",
+      });
+    });
+
+    it.each([
+      { label: "already finished", cancel: () => Promise.resolve(false) },
+      {
+        label: "failed",
+        cancel: () => Promise.reject(new Error("Synthetic cancel failure")),
+      },
+    ])("leaves no marker when Ask cancellation $label", async ({ cancel }) => {
+      const log = jest.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        mockCancelStream.mockImplementationOnce(cancel);
+        const result = renderStop({ mode: "ask" });
+        await stop(result);
+        expect(mockMarkUserStopped).not.toHaveBeenCalled();
+        expect(localMarkerUpdate()).toBeUndefined();
+      } finally {
+        log.mockRestore();
+      }
+    });
+
+    it("marks the reply after the exact Agent run is canceled", async () => {
+      mockMarkUserStopped.mockResolvedValueOnce(true);
+      const result = renderStop({ mode: "agent", runId: "run-1" });
+      expect(await stop(result)).toBe(true);
+      expect(fetch).toHaveBeenCalledWith(
+        "/api/agent/cancel",
+        expect.objectContaining({
+          body: JSON.stringify({
+            chatId: "chat-1",
+            expectedTriggerRunId: "run-1",
+          }),
+        }),
+      );
+      expect(mockMarkUserStopped).toHaveBeenCalledWith({
+        chatId: "chat-1",
+        messageId: "assistant-1",
+        role: "assistant",
+      });
+    });
+
+    it.each([
+      {
+        label: "stale",
+        response: {
+          ok: false,
+          status: 409,
+          json: async () => ({ reason: "stale_run", activeTriggerRunId: null }),
+        },
+      },
+      {
+        label: "rejected",
+        response: { ok: false, status: 400, json: async () => ({}) },
+      },
+    ])(
+      "leaves no marker when the Agent cancellation is $label",
+      async ({ response }) => {
+        const log = jest.spyOn(console, "error").mockImplementation(() => {});
+        try {
+          jest.mocked(global.fetch).mockResolvedValue(response as Response);
+          const result = renderStop({ mode: "agent", runId: "run-1" });
+          expect(await stop(result)).toBe(false);
+          expect(mockMarkUserStopped).not.toHaveBeenCalled();
+        } finally {
+          log.mockRestore();
+        }
+      },
+    );
+
+    it("leaves goal controls unmarked even when their run is canceled", async () => {
+      const result = renderStop({ mode: "agent", runId: "run-1" });
+      expect(
+        await stop(result, {
+          requireSavedResponse: true,
+          expectedTriggerRunId: "run-1",
+        }),
+      ).toBe(true);
+      expect(mockMarkUserStopped).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      { label: "refused", mark: () => Promise.resolve(false) },
+      {
+        label: "failed",
+        mark: () => Promise.reject(new Error("Synthetic marker failure")),
+      },
+    ])(
+      "keeps a successful Stop when the marker is $label",
+      async ({ mark }) => {
+        const log = jest.spyOn(console, "error").mockImplementation(() => {});
+        try {
+          mockCancelStream.mockResolvedValueOnce(true);
+          mockMarkUserStopped.mockImplementationOnce(mark);
+          const result = renderStop({ mode: "ask" });
+          expect(await stop(result)).toBe(true);
+          expect(mockMarkUserStopped).toHaveBeenCalledTimes(1);
+          expect(localMarkerUpdate()).toBeUndefined();
+        } finally {
+          log.mockRestore();
+        }
+      },
+    );
+  });
+
+  const renderSummarySteer = (isSummarizing = true, runId = "run-1") => {
     const isSendingNowRef = { current: false };
     const hasManuallyStoppedRef = { current: false };
     const hook = renderHook(
@@ -745,7 +964,7 @@ describe("useChatHandlers steer todo handoff", () => {
           isSummarizing,
           isSendingNowRef,
           hasManuallyStoppedRef,
-          activeTriggerRunRef: { current: "run-1" },
+          activeTriggerRunRef: { current: runId },
         }),
       {
         initialProps: {
@@ -800,6 +1019,43 @@ describe("useChatHandlers steer todo handoff", () => {
       currentMessages: completedMessages,
     });
     expect(mockSendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a deferred Send now until the server's queued message has a run", async () => {
+    const { result, rerender } = renderSummarySteer();
+    await act(async () => result.current.handleSendNow("queued-1"));
+    expect(result.current.hasPendingSummarySteer).toBe(true);
+    // The server claims an earlier row before the summary settles.
+    mockMessageQueue = [
+      {
+        id: "queued-0",
+        text: "Sent by the server",
+        files: [],
+        timestamp: 1,
+        dispatching: true,
+      },
+      ...mockMessageQueue,
+    ];
+    await act(async () => {
+      rerender({
+        isSummarizing: false,
+        chatId: "chat-1",
+        currentMessages: messages,
+      });
+    });
+    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(result.current.hasPendingSummarySteer).toBe(true);
+    // Its run is attached and the row is gone: the deferred send proceeds.
+    mockMessageQueue = mockMessageQueue.slice(1);
+    await act(async () => {
+      rerender({
+        isSummarizing: false,
+        chatId: "chat-1",
+        currentMessages: messages,
+      });
+    });
+    expect(mockSendMessage).toHaveBeenCalledTimes(1);
+    expect(result.current.hasPendingSummarySteer).toBe(false);
   });
 
   it.each(["submission", "Send now"])(
@@ -899,6 +1155,315 @@ describe("useChatHandlers steer todo handoff", () => {
       );
     },
   );
+
+  describe("mid-run steering", () => {
+    beforeEach(() => {
+      mockAgentSteeringEnabled = true;
+      mockQueueBehavior = "steer";
+      mockInput = "Use the staging host";
+      mockMessageQueue = [];
+    });
+
+    const submit = async (
+      result: { current: ReturnType<typeof useChatHandlers> },
+      event: Record<string, unknown> = {},
+    ) => {
+      let accepted: boolean | undefined;
+      await act(async () => {
+        accepted = await result.current.handleSubmit({
+          preventDefault: jest.fn(),
+          ...event,
+        } as any);
+      });
+      return accepted;
+    };
+
+    it("sends Enter into the running Agent without stopping or queueing", async () => {
+      const { result } = renderSummarySteer(false);
+      expect(await submit(result)).toBe(true);
+      expect(mockCreateAgentSteer).toHaveBeenCalledWith({
+        chatId: "chat-1",
+        id: expect.any(String),
+        text: "Use the staging host",
+        sentAt: expect.any(Number),
+        settings: {
+          agentPermissionMode: "full_access",
+          sandboxPreference: "e2b",
+          selectedModel: "hackerai-standard",
+        },
+      });
+      expect(mockQueueMessage).not.toHaveBeenCalled();
+      expect(mockStop).not.toHaveBeenCalled();
+      expect(fetch).not.toHaveBeenCalled();
+      expect(mockSendMessage).not.toHaveBeenCalled();
+      expect(mockClearInput).toHaveBeenCalledTimes(1);
+    });
+
+    it("records the approval mode a steer was sent under", async () => {
+      // If the run ends unread, the steer is queued and must not later start
+      // with more permission than the user chose.
+      mockAgentPermissionMode = "ask_approval";
+      const { result } = renderSummarySteer(false);
+      expect(await submit(result)).toBe(true);
+      expect(mockCreateAgentSteer).toHaveBeenCalledWith(
+        expect.objectContaining({
+          settings: expect.objectContaining({
+            agentPermissionMode: "ask_approval",
+          }),
+        }),
+      );
+    });
+
+    it("queues with Cmd/Ctrl+Enter instead of steering", async () => {
+      const { result } = renderSummarySteer(false);
+      expect(await submit(result, { metaKey: true })).toBe(true);
+      expect(mockCreateAgentSteer).not.toHaveBeenCalled();
+      expect(mockQueueMessage).toHaveBeenCalledWith("Use the staging host", []);
+    });
+
+    it("queues the message when the run ended before it could steer", async () => {
+      mockCreateAgentSteer.mockResolvedValueOnce("no_active_run");
+      const { result } = renderSummarySteer(false);
+      expect(await submit(result)).toBe(true);
+      expect(mockQueueMessage).toHaveBeenCalledWith("Use the staging host", []);
+      expect(mockStop).not.toHaveBeenCalled();
+    });
+
+    it("moves a queued message into the running Agent from its Steer button", async () => {
+      mockMessageQueue = [
+        { id: "queued-1", text: "Change direction", files: [], timestamp: 1 },
+      ];
+      const { result, isSendingNowRef } = renderSummarySteer(false);
+      await act(async () => result.current.handleSendNow("queued-1"));
+      // A steer that is never read returns to its original queue position.
+      expect(mockCreateAgentSteer).toHaveBeenCalledWith(
+        expect.objectContaining({ text: "Change direction", sentAt: 1 }),
+      );
+      expect(mockRemoveQueuedMessage).toHaveBeenCalledWith("queued-1");
+      expect(mockStop).not.toHaveBeenCalled();
+      expect(mockSendMessage).not.toHaveBeenCalled();
+      expect(isSendingNowRef.current).toBe(false);
+    });
+
+    it("queues a follow-up with attachments instead of stopping the run", async () => {
+      mockUploadedFiles = [
+        {
+          file: new File(["scan"], "scan.txt"),
+          uploaded: true,
+          fileId: "scan-file",
+        },
+      ];
+      const { result } = renderSummarySteer(false);
+      expect(await submit(result)).toBe(true);
+      expect(mockCreateAgentSteer).not.toHaveBeenCalled();
+      expect(mockQueueMessage).toHaveBeenCalledWith("Use the staging host", [
+        expect.objectContaining({ fileId: "scan-file" }),
+      ]);
+      expect(mockStop).not.toHaveBeenCalled();
+      expect(fetch).not.toHaveBeenCalled();
+    });
+
+    it("only queues attachments sent during summarization", async () => {
+      mockUploadedFiles = [
+        {
+          file: new File(["scan"], "scan.txt"),
+          uploaded: true,
+          fileId: "scan-file",
+        },
+      ];
+      const { result, rerender } = renderSummarySteer(true);
+      expect(await submit(result)).toBe(true);
+      expect(mockQueueMessage).toHaveBeenCalledTimes(1);
+      expect(result.current.hasPendingSummarySteer).toBe(false);
+      await act(async () => {
+        rerender({
+          isSummarizing: false,
+          chatId: "chat-1",
+          currentMessages: messages,
+        });
+      });
+      expect(mockStop).not.toHaveBeenCalled();
+      expect(fetch).not.toHaveBeenCalled();
+      expect(mockSendMessage).not.toHaveBeenCalled();
+    });
+
+    it("only queues a Cmd/Ctrl+Enter follow-up sent during summarization", async () => {
+      const { result, rerender } = renderSummarySteer(true);
+      expect(await submit(result, { metaKey: true })).toBe(true);
+      expect(mockQueueMessage).toHaveBeenCalledWith("Use the staging host", []);
+      expect(result.current.hasPendingSummarySteer).toBe(false);
+      await act(async () => {
+        rerender({
+          isSummarizing: false,
+          chatId: "chat-1",
+          currentMessages: messages,
+        });
+      });
+      expect(mockCreateAgentSteer).not.toHaveBeenCalled();
+      expect(mockStop).not.toHaveBeenCalled();
+    });
+
+    it("still stops the run for a Stop & send deferred by summarization", async () => {
+      mockQueueBehavior = "stop-and-send";
+      mockQueueMessage.mockImplementationOnce(() => {
+        mockMessageQueue = [
+          { id: "queued-1", text: mockInput, files: [], timestamp: 123 },
+        ];
+        return "queued-1";
+      });
+      const { result, rerender } = renderSummarySteer(true);
+      expect(await submit(result)).toBe(true);
+      expect(result.current.hasPendingSummarySteer).toBe(true);
+      await act(async () => {
+        rerender({
+          isSummarizing: false,
+          chatId: "chat-1",
+          currentMessages: messages,
+        });
+      });
+      expect(mockCreateAgentSteer).not.toHaveBeenCalled();
+      expect(mockStop).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps a queued message edited while its steer was pending", async () => {
+      mockMessageQueue = [
+        { id: "queued-1", text: "Change direction", files: [], timestamp: 1 },
+      ];
+      let accept!: (outcome: string) => void;
+      mockCreateAgentSteer.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            accept = resolve;
+          }),
+      );
+      const { result, rerender } = renderSummarySteer(false);
+      let sending!: Promise<void>;
+      act(() => {
+        sending = result.current.handleSendNow("queued-1");
+      });
+      mockMessageQueue = [
+        { id: "queued-1", text: "Edited meanwhile", files: [], timestamp: 1 },
+      ];
+      rerender({
+        isSummarizing: false,
+        chatId: "chat-1",
+        currentMessages: messages,
+      });
+      await act(async () => {
+        accept("pending");
+        await sending;
+      });
+      expect(mockRemoveQueuedMessage).not.toHaveBeenCalled();
+    });
+
+    it("marks the run Stop cancels so its unread steers come back held", async () => {
+      const { wasRunStopped } = jest.requireActual<
+        typeof import("@/app/hooks/useUnreadSteerRequeue")
+      >("@/app/hooks/useUnreadSteerRequeue");
+      const { result } = renderSummarySteer(false, "run-stop-check");
+      expect(wasRunStopped("run-stop-check")).toBe(false);
+      await act(async () => {
+        await result.current.handleStop();
+      });
+      expect(wasRunStopped("run-stop-check")).toBe(true);
+    });
+
+    it("keeps a queued message queued when the run refuses the steer", async () => {
+      mockCreateAgentSteer.mockResolvedValueOnce("no_active_run");
+      mockMessageQueue = [
+        { id: "queued-1", text: "Change direction", files: [], timestamp: 1 },
+      ];
+      const { result } = renderSummarySteer(false);
+      const releaseVersion = result.current.sendNowReleaseVersion;
+      await act(async () => result.current.handleSendNow("queued-1"));
+      // Automatic delivery rechecks once the hold is released.
+      expect(result.current.sendNowReleaseVersion).toBeGreaterThan(
+        releaseVersion,
+      );
+      expect(mockRemoveQueuedMessage).not.toHaveBeenCalled();
+      expect(mockStop).not.toHaveBeenCalled();
+      expect(fetch).not.toHaveBeenCalled();
+      expect(mockSendMessage).not.toHaveBeenCalled();
+    });
+
+    it("never starts a queued message while the server is sending an earlier one", async () => {
+      mockMessageQueue = [
+        {
+          id: "queued-1",
+          text: "Sent by the server",
+          files: [],
+          timestamp: 1,
+          dispatching: true,
+        },
+        { id: "queued-2", text: "Next", files: [], timestamp: 2 },
+      ];
+      const { result } = renderSummarySteer(false);
+      for (const id of ["queued-1", "queued-2"])
+        await act(async () => result.current.handleSendNow(id));
+      expect(mockCreateAgentSteer).not.toHaveBeenCalled();
+      expect(mockSendMessage).not.toHaveBeenCalled();
+      expect(mockStop).not.toHaveBeenCalled();
+      expect(mockRemoveQueuedMessage).not.toHaveBeenCalled();
+    });
+
+    it("queues a new message behind one the server is sending", async () => {
+      mockMessageQueue = [
+        {
+          id: "queued-1",
+          text: "Sent by the server",
+          files: [],
+          timestamp: 1,
+          dispatching: true,
+        },
+      ];
+      // No run is active yet: the server has not attached its run.
+      const { result } = renderHook(() =>
+        useChatHandlers({
+          chatId: "chat-1",
+          messages,
+          sendMessage: mockSendMessage,
+          stop: mockStop,
+          regenerate: jest.fn(),
+          setMessages: mockSetMessages,
+          isExistingChat: true,
+          status: "ready",
+          isSummarizing: false,
+          isSendingNowRef: { current: false },
+          hasManuallyStoppedRef: { current: false },
+          activeTriggerRunRef: { current: null },
+        }),
+      );
+      expect(await submit(result)).toBe(true);
+      expect(mockQueueMessage).toHaveBeenCalledWith("Use the staging host", []);
+      expect(mockSendMessage).not.toHaveBeenCalled();
+      expect(mockCreateAgentSteer).not.toHaveBeenCalled();
+    });
+
+    it("leaves Ask mode's Send Now on its existing path", async () => {
+      const toastError = jest.spyOn(toast, "error");
+      mockChatMode = "ask";
+      mockMessageQueue = [
+        { id: "queued-1", text: "Change direction", files: [], timestamp: 1 },
+      ];
+      const { result } = renderSummarySteer(false);
+      await act(async () => result.current.handleSendNow("queued-1"));
+      expect(mockCreateAgentSteer).not.toHaveBeenCalled();
+      expect(toastError).not.toHaveBeenCalledWith(
+        "Could not steer the Agent run",
+        expect.anything(),
+      );
+      toastError.mockRestore();
+    });
+
+    it("never steers when the rollout is off, even with Cmd/Ctrl+Enter", async () => {
+      mockAgentSteeringEnabled = false;
+      mockQueueBehavior = "queue";
+      const { result } = renderSummarySteer(false);
+      expect(await submit(result, { metaKey: true })).toBe(true);
+      expect(mockCreateAgentSteer).not.toHaveBeenCalled();
+      expect(mockQueueMessage).toHaveBeenCalledWith("Use the staging host", []);
+    });
+  });
 
   it("keeps the draft when queue admission fails after rendering available capacity", async () => {
     mockInput = "Keep my draft";

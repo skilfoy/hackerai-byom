@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, realpathSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { CentrifugoSandbox } from "@/lib/ai/tools/utils/centrifugo-sandbox";
 import { accessLocalWorkspaceFiles } from "../local-workspace-files";
 import { workspaceRequest } from "../workspace-files";
 const query = jest.fn();
@@ -89,6 +90,28 @@ it("releases the relay on failures and preserves a file-change error", async () 
   expect(close).toHaveBeenCalled();
 });
 
+it.each([
+  ["lookup", () => query.mockReset().mockRejectedValue(new Error("relay"))],
+  ["run_reader", () => run.mockRejectedValue(new Error("relay"))],
+  ["decode", () => run.mockResolvedValue({ exitCode: 0, stdout: "partial" })],
+] as const)(
+  "records %s as the last step of an unclassified relay failure",
+  async (step, inject) => {
+    inject();
+    const progress = {};
+    await expect(
+      accessLocalWorkspaceFiles(
+        "owner",
+        "environment:machine",
+        input(),
+        undefined,
+        progress,
+      ),
+    ).rejects.not.toHaveProperty("code");
+    expect(progress).toEqual({ step });
+  },
+);
+
 it.each(["status", "resume"])(
   "returns a real root listing for Local %s without a path",
   async (action) => {
@@ -122,6 +145,91 @@ it.each(["status", "resume"])(
     }
   },
 );
+
+it("labels an unreadable Local list root as the local reader only for list", async () => {
+  const fixture = realpathSync(
+    mkdtempSync(join(tmpdir(), "local-workspace-unreadable-")),
+  );
+  const root = join(fixture, "project.txt");
+  try {
+    writeFileSync(root, "not a folder");
+    run.mockImplementation(async (command: string) => ({
+      exitCode: 0,
+      stdout: execFileSync("sh", ["-c", command], {
+        encoding: "utf8",
+        cwd: fixture,
+      }),
+    }));
+    const failure = (action: string) =>
+      accessLocalWorkspaceFiles(
+        "owner",
+        "environment:machine",
+        input({ action, sandboxId: "session" }),
+        root,
+      ).catch((error) => error);
+    expect(await failure("list")).toMatchObject({
+      code: "unreadable_path",
+      status: 400,
+      diagnostics: {
+        reader: "local",
+        reader_phase: "root",
+        os_error_category: "not_directory_or_symlink",
+      },
+    });
+    query
+      .mockResolvedValueOnce("desktop-environment:machine")
+      .mockResolvedValueOnce([
+        {
+          connectionId: "session",
+          environmentId: "machine",
+          isDesktop: true,
+          name: "Test Mac",
+          osInfo: { platform: "darwin" },
+        },
+      ]);
+    const status = await failure("status");
+    expect(status).toMatchObject({ code: "unreadable_path", status: 400 });
+    expect(status.diagnostics).toBeUndefined();
+    expect(close).toHaveBeenCalledTimes(2);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+it("lets the reader diagnose a moved linked folder instead of using it as the relay cwd", async () => {
+  const fixture = realpathSync(
+    mkdtempSync(join(tmpdir(), "local-workspace-moved-")),
+  );
+  try {
+    // Like the relay, spawn in the sandbox working directory when one is set;
+    // a missing folder there fails before Python can run.
+    run.mockImplementation(async (command: string) => ({
+      exitCode: 0,
+      stdout: execFileSync("sh", ["-c", command], {
+        encoding: "utf8",
+        cwd: jest.mocked(CentrifugoSandbox).mock.calls[0][3] ?? fixture,
+      }),
+    }));
+    const error = await accessLocalWorkspaceFiles(
+      "owner",
+      "environment:machine",
+      input({ sandboxId: "session" }),
+      join(fixture, "moved-project"),
+    ).catch((failure) => failure);
+    expect(error).toMatchObject({
+      code: "not_found",
+      status: 400,
+      diagnostics: {
+        reader: "local",
+        reader_phase: "root",
+        os_error_category: "missing",
+      },
+    });
+    expect(close).toHaveBeenCalled();
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
 
 it.each(["list", "status", "resume", "preview", "download"])(
   "rejects incomplete %s results instead of reporting an empty workspace",

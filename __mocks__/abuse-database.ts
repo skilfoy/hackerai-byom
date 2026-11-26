@@ -8,16 +8,23 @@ export function database() {
       tables[table] ??= [];
       let predicates: Array<(row: any) => boolean> = [];
       let descending = false;
+      let orderField = "_creationTime";
       const results = () =>
         tables[table]
           .filter((row) => predicates.every((p) => p(row)))
-          .sort((a, b) =>
-            descending
-              ? b._creationTime - a._creationTime
-              : a._creationTime - b._creationTime,
-          );
+          .sort((a, b) => {
+            const delta =
+              a[orderField] - b[orderField] ||
+              a._creationTime - b._creationTime;
+            return descending ? -delta : delta;
+          });
       const chain = {
-        withIndex(_index: string, callback: (query: any) => unknown) {
+        async *[Symbol.asyncIterator]() {
+          yield* results();
+        },
+        withIndex(index: string, callback: (query: any) => unknown) {
+          if (table === "chats" && index === "by_user_and_updated")
+            orderField = "update_time";
           const query = {
             eq(field: string, value: unknown) {
               predicates.push((row) => row[field] === value);
@@ -25,6 +32,10 @@ export function database() {
             },
             gt(field: string, value: any) {
               predicates.push((row) => row[field] > value);
+              return query;
+            },
+            gte(field: string, value: any) {
+              predicates.push((row) => row[field] >= value);
               return query;
             },
             lte(field: string, value: any) {
@@ -76,7 +87,12 @@ export function database() {
     },
     async insert(table: string, row: any) {
       const id = `${table}-${++sequence}`;
-      (tables[table] ??= []).push({ ...row, _id: id, _creationTime: sequence });
+      // A row may set its own creation time to exercise time-ranged reads.
+      (tables[table] ??= []).push({
+        ...row,
+        _id: id,
+        _creationTime: row._creationTime ?? sequence,
+      });
       return id;
     },
     async get(id: string) {
@@ -93,6 +109,14 @@ export function database() {
         if (value === undefined) delete row[key];
         else row[key] = value;
       }
+    },
+    async replace(id: string, value: Record<string, unknown>) {
+      const row = await db.get(id);
+      if (!row) throw new Error("missing");
+      for (const key of Object.keys(row)) {
+        if (key !== "_id" && key !== "_creationTime") delete row[key];
+      }
+      Object.assign(row, value);
     },
     async delete(id: string) {
       for (const rows of Object.values(tables)) {

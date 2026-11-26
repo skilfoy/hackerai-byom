@@ -308,63 +308,84 @@ Production only. It is off until the Agent worker sets
 `E2B_EGRESS_BURST_ALERTS_ENABLED=true`, `E2B_EGRESS_BURST_THRESHOLD`, the
 number of accepted attributed connections from one owner's workspaces in one
 region and minute that counts as high volume. There is no default threshold.
-Choose it from observed telemetry before enabling. Leave
-`E2B_EGRESS_BURST_NOTIFICATION_URL` unset or empty for warnings in Trigger
-only. Set it to an operators' private Slack-compatible webhook for delivery.
-When enabled, an invalid toggle, a missing, zero or fractional threshold, or
-a nonempty notification URL that is invalid, uses a protocol other than HTTPS,
-or has embedded credentials or a fragment fails the run.
+Choose it from observed telemetry before enabling. An invalid toggle or a
+missing, zero or fractional threshold fails the run.
 
 Each run reads the five most recent settled minutes for both regions, so a
-briefly late upload is still evaluated. High volume is when an owner's total
-across its workspaces, or the connections beyond the collector's identity
-bound, reach the threshold. It is not a monitoring failure: the run logs a
-`High connection volume` warning, sends a message if configured and succeeds. The
-warning adds the registered user ID and the sandbox IDs verified for that
-owner. The message is titled `High connection volume`, with one line per
-candidate giving the region, UTC minute, opaque owner reference or
-`unattributed`, observed count and threshold; it never contains user or
-sandbox IDs.
+briefly late upload is still evaluated. The run logs a `High connection volume`
+warning in Trigger when an owner's total across its workspaces, or the
+connections beyond the collector's identity bound, reaches the threshold. The
+warning includes the region, minute, observed count and threshold. For
+attributed traffic, it also includes the opaque owner reference, registered
+user ID and verified sandbox IDs. Review warnings in the Trigger run logs.
 
-A run fails, and is visible to the environment's existing Trigger error
-alerts, only when the monitor itself is broken:
+A run fails and reaches the environment's existing Trigger error alerts when:
 
-- its configuration is missing or invalid;
-- a region has uploaded nothing in those five minutes (missing heartbeat);
-- a collector reported dropped events or batches, which can hide high volume;
+- its configuration is missing or invalid
+- a region has uploaded nothing in the five most recent settled minutes
+- a collector reported an incomplete minute, dropped events or dropped batches
 - telemetry or the registry cannot be read, or a warning cannot be written or
-  recorded;
-- the webhook does not accept the message: a network error, a timeout after
-  five seconds, a redirect, which is never followed, or any non-2xx response;
-- an abuse review cannot be queued or dispatched, or a queued review expired
-  before dispatch.
+  recorded
+- an abuse review cannot be queued or dispatched, or expires before dispatch
 
-Warnings without a webhook are deduplicated per region, minute and owner
-independently of webhook delivery. Notification is at least once and uses
-the same dimensions for deduplication.
-Each run warns about and sends at most 20 candidates not yet notified, largest
-first, in a single delivery attempt; the next run handles the rest. Candidates
-are recorded as notified only after the webhook accepts them, so a failed
-delivery or uncertain record is retried by the next scheduled run while the
-minute is in the window, and concurrent runs can send a candidate twice. A
-retry can repeat the warning. Delivery failures use a fixed error message.
-The URL stays out of HTTP traces, and the response body is discarded.
-Incomplete minutes fail the run, because a failed journal stream cannot
-quantify missing events. This includes the first partial minute after initial
-installation; wait for it to leave the evaluation window before expecting a
-clean run.
+Warnings are deduplicated per region, minute and owner. Each run logs up to
+20 new warnings, largest first. Later runs can log the rest while their minute
+is still in the evaluation window. A failed log or write of the deduplication
+mark can be retried in the next run. An uncertain write can repeat the warning.
 
-Treat the webhook URL as a secret. Point it at a private operator channel,
-never a customer-visible destination, and never paste it into logs, issues or
-pull requests. Before deploying a version that requires it in an environment
-where the monitor is enabled, set that environment's own URL in its Agent
-worker; otherwise every run fails with a configuration error. Verify a new
-destination in Preview first with synthetic telemetry, such as a low
-threshold on a Preview pilot workspace. The schedule runs only in Production,
-so in Preview trigger `egress-burst-alerts` manually in the Preview
-environment, with a `timestamp` two minutes after the synthetic minute so
-that minute is settled and evaluated. Confirm that the webhook message
-arrives and the run succeeds.
+Incomplete minutes include the first partial minute after initial installation.
+Wait for it to leave the evaluation window before expecting a clean run.
+
+#### Missing heartbeat
+
+A `<region> collector heartbeat missing` failure says only that no upload for
+that region was stored for any minute in the window. Compare the window from
+three places before naming a cause:
+
+1. The failed run logs `Egress collector heartbeat missing` with the region and
+   the exact settled UTC window, `windowStart` (inclusive) to `windowEnd`
+   (exclusive).
+2. In the web server's Production logs, find `egress_telemetry_received` for
+   the region. Each receipt gives the batch `minute`, its `outcome` and
+   `delayAfterMinuteEndS`. A receipt for a window minute with a large delay
+   means the batch arrived late. With no receipt, look for
+   `egress_telemetry_rejected`, `egress_telemetry_store_failed` and
+   `egress_telemetry_misconfigured`. Unparseable or oversized bodies are
+   answered without a log line.
+3. On the region's proxy host, read the collector's journal for a few minutes
+   around the window, in UTC:
+
+   ```sh
+   journalctl --utc -o short-iso -u hackerai-egress-collector.service \
+     --since '<windowStart minus 5 min, with UTC suffix>' \
+     --until '<windowEnd plus 5 min, with UTC suffix>'
+   ```
+
+   - `started` marks a new process with its saved backlog: `pending`,
+     `oldest_minute` and `oldest_age_s`. After a restart, `last_success` is
+     `unavailable`, since it is not persisted.
+   - `upload deferred` gives the HTTP status, or `status=unknown` with a
+     coarse `transport` (`timeout`, `tls`, `dns`, `refused`, `connection`,
+     `network`, `invalid`), the attempt number, the oldest pending minute and age, and
+     the last success.
+   - `upload recovered` appears once per outage, with the number of deferred
+     attempts, the outage length and the age of the batch delivered first.
+   - `journal stream ended` means the journal reader was restarted.
+
+   `systemctl status hackerai-egress-collector.service` shows restarts and
+   exit codes.
+
+Compare HTTP failures with route rejections, store failures, and edge logs.
+A transport outcome without matching receipts points to the path between
+the host and the web server. If both logs are empty, check retention and the
+collector's service state before inferring a stop. The SOCKS health monitor
+probes the traffic path independently of telemetry collection.
+These logs carry no keys, payloads, identities, addresses or destinations.
+
+To verify the monitor in Preview, upload synthetic telemetry above the Preview
+threshold, then trigger `egress-burst-alerts` manually in Preview with a
+`timestamp` two minutes after the synthetic minute. Confirm that the run
+succeeds and logs the expected warning.
 
 Counts are accepted authenticated SOCKS connections, not HTTP requests: one
 connection can carry many requests, and exact request counts are not
@@ -387,18 +408,23 @@ same idempotency key. Entries over 30 minutes old are removed and reported as
 expired when no dispatch mark exists. Queue and dispatch failures surface as
 errors. Disabling review pauses the queue. Entries still eligible can resume
 when review is enabled again. An idle queue expires two hours after its last
-addition.
+addition. Before queuing a new case, the monitor skips a routine spike from an
+account under a review cooldown; see
+[Account cooldown](abuse-response.md#automated-egress-burst-review).
 
 While the toggle is on, every successful cloud acquisition with a server chat
 and Trigger run also records a short-lived link from the verified workspace to
 that chat, run and time, after ownership and network verification. The write is
 best effort and not awaited, so a store outage cannot delay or fail an
-acquisition. Each acquisition is a separate record. The review selects each
-run's latest acquisition before the burst ended and checks the run's
-persisted timing for overlap. It uses up to 16 records per workspace from
-the last six hours. Additional records signal incomplete coverage and route
-the case to manual review. The older per-run format expires on its original
-six-hour schedule. These links are separate from attribution credentials.
+acquisition. The review selects each run's latest acquisition before the
+burst ended and checks the run's persisted timing for overlap. It uses up to
+16 records per workspace from the six hours before the burst. Additional
+records signal incomplete coverage and route the case to manual review. A
+run's repeated reconnects are coalesced atomically without losing the record
+that places it before a burst; see
+[Acquisition links](abuse-response.md#automated-egress-burst-review). The
+older per-run format expires on its original six-hour schedule. These links
+are separate from attribution credentials.
 
 ### Coverage and delivery
 

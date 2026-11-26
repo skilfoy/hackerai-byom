@@ -1,4 +1,4 @@
-import { authkit } from "@workos-inc/authkit-nextjs";
+import { authkit, type AuthkitOptions } from "@workos-inc/authkit-nextjs";
 import { NextResponse, type NextRequest } from "next/server";
 import { isRateLimitError } from "@/lib/api/response";
 import {
@@ -63,6 +63,21 @@ const AUTH_REFRESH_STAGES = new Set<unknown>([
   "refresh_request",
   "after_refresh_response",
 ]);
+type AuthKitSessionPhase = Parameters<
+  NonNullable<AuthkitOptions["onSessionPhase"]>
+>[0];
+// Closed labels from the patched AuthKit session observer.
+const AUTHKIT_SESSION_PHASES = new Set<unknown>([
+  "read_cookie",
+  "prepare_anonymous_response",
+  "verify_access_token",
+  "refresh_request",
+  "finish_refresh",
+  "prepare_refresh_fallback",
+] satisfies AuthKitSessionPhase[]);
+// The platform deadline can end the request before AuthKit settles, so the
+// settlement and throw logs never run. Warn once while it is still pending.
+const AUTHKIT_PENDING_WARNING_MS = 10_000;
 
 const UNAUTHENTICATED_PATHS = new Set([
   ...AUTHKIT_BYPASS_PATHS,
@@ -95,12 +110,18 @@ const UNAUTHENTICATED_PATHS = new Set([
 function getRedirectUri(request: NextRequest): string | undefined {
   if (process.env.VERCEL_ENV === "preview" && process.env.VERCEL_URL) {
     // Keep the branch origin's auth cookie usable by its allowlisted relay.
-    // Never derive a callback from an arbitrary request/forwarded Host value.
+    // Never derive a callback from an arbitrary request/forwarded Host value:
+    // only the branch host, or the one QA alias (PREVIEW_QA_HOST) that the
+    // team points at a Preview deployment, may receive its own callback.
     const branchHost = process.env.VERCEL_BRANCH_URL;
+    const qaHost = process.env.PREVIEW_QA_HOST;
+    const requestHost = request.nextUrl.host;
     const host =
-      branchHost && request.nextUrl.host === branchHost
+      branchHost && requestHost === branchHost
         ? branchHost
-        : process.env.VERCEL_URL;
+        : qaHost && requestHost === qaHost
+          ? qaHost
+          : process.env.VERCEL_URL;
     return `https://${host}/callback`;
   }
   return undefined;
@@ -308,6 +329,87 @@ function recordDesktopAuthRedirect(
   }
 }
 
+/** Record when the proxy has built a pass-through response for Desktop sign-in. */
+function recordDesktopSignInProxyHandoff(
+  request: NextRequest,
+  branch: "authkit_pass_through" | "ended_session" | "anonymous_context_retry",
+): void {
+  try {
+    const pathname = request.nextUrl.pathname;
+    if (
+      request.method !== "GET" ||
+      (pathname !== "/desktop-login" &&
+        pathname !== "/api/auth/desktop-callback")
+    ) {
+      return;
+    }
+
+    const requestId = request.headers.get("x-vercel-id");
+    if (!requestId || !VERCEL_REQUEST_ID_PATTERN.test(requestId)) return;
+
+    const build = process.env.VERCEL_GIT_COMMIT_SHA;
+    console.info(
+      JSON.stringify({
+        event: "desktop_sign_in_proxy_handoff",
+        diagnostic_version: 1,
+        boundary: "proxy",
+        route_kind:
+          pathname === "/desktop-login"
+            ? "desktop_login"
+            : "desktop_oauth_callback",
+        branch,
+        vercel_request_id: requestId,
+        ...(build && WEB_BUILD_COMMIT_PATTERN.test(build)
+          ? { web_build_commit: build.toLowerCase() }
+          : {}),
+      }),
+    );
+  } catch {
+    // Diagnostics must never change authentication responses.
+  }
+}
+
+/** Categorical request context for proxy AuthKit diagnostics; omits malformed correlation values. */
+function getProxyAuthkitRequestContext(request: NextRequest) {
+  const pathname = request.nextUrl.pathname;
+  const requestId = request.headers.get("x-vercel-id");
+  const build = process.env.VERCEL_GIT_COMMIT_SHA;
+  const environment = process.env.VERCEL_ENV;
+  return {
+    request_method: [
+      "GET",
+      "HEAD",
+      "POST",
+      "PUT",
+      "PATCH",
+      "DELETE",
+      "OPTIONS",
+    ].includes(request.method)
+      ? request.method
+      : "OTHER",
+    route_kind: ROOT_PAGE_PATHS.has(pathname)
+      ? "root"
+      : pathname === "/login"
+        ? "login"
+        : pathname.startsWith("/c/")
+          ? "chat_page"
+          : pathname.startsWith("/api/")
+            ? "api"
+            : "other_page",
+    ...(requestId && VERCEL_REQUEST_ID_PATTERN.test(requestId)
+      ? { vercel_request_id: requestId }
+      : {}),
+    ...(build && WEB_BUILD_COMMIT_PATTERN.test(build)
+      ? { web_build_commit: build.toLowerCase() }
+      : {}),
+    environment: ["production", "preview", "development"].includes(
+      environment ?? "",
+    )
+      ? environment
+      : "unknown",
+  };
+}
+
 /** Observe only unexpected AuthKit throws, without retaining request or error contents. */
 function recordProxyAuthkitFailure(
   request: NextRequest,
@@ -315,53 +417,59 @@ function recordProxyAuthkitFailure(
   phase: "unexpected_initial_authkit" | "anonymous_context_retry",
 ): void {
   try {
-    const pathname = request.nextUrl.pathname;
-    const requestId = request.headers.get("x-vercel-id");
-    const build = process.env.VERCEL_GIT_COMMIT_SHA;
-    const environment = process.env.VERCEL_ENV;
     console.warn(
       JSON.stringify({
         event: "proxy_authkit_failure_context",
         diagnostic_version: 1,
         boundary: "proxy",
         phase,
-        request_method: [
-          "GET",
-          "HEAD",
-          "POST",
-          "PUT",
-          "PATCH",
-          "DELETE",
-          "OPTIONS",
-        ].includes(request.method)
-          ? request.method
-          : "OTHER",
-        route_kind: ROOT_PAGE_PATHS.has(pathname)
-          ? "root"
-          : pathname === "/login"
-            ? "login"
-            : pathname.startsWith("/c/")
-              ? "chat_page"
-              : pathname.startsWith("/api/")
-                ? "api"
-                : "other_page",
-        ...(requestId && VERCEL_REQUEST_ID_PATTERN.test(requestId)
-          ? { vercel_request_id: requestId }
-          : {}),
-        ...(build && WEB_BUILD_COMMIT_PATTERN.test(build)
-          ? { web_build_commit: build.toLowerCase() }
-          : {}),
-        environment: ["production", "preview", "development"].includes(
-          environment ?? "",
-        )
-          ? environment
-          : "unknown",
+        ...getProxyAuthkitRequestContext(request),
         ...getRefreshFailureDiagnostics(error),
       }),
     );
   } catch {
     // Telemetry must never replace the original error or participate in auth decisions.
   }
+}
+
+/**
+ * Arm one warning for a session-cookie AuthKit call that is still pending at
+ * the threshold. Returns the cleanup to run as soon as that call settles.
+ */
+function startProxyAuthkitPendingWarning(
+  request: NextRequest,
+  getSessionPhase: () => AuthKitSessionPhase | undefined,
+): () => void {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const startedAt = Date.now();
+    timer = setTimeout(() => {
+      try {
+        const elapsedMs = Date.now() - startedAt;
+        console.warn(
+          JSON.stringify({
+            event: "proxy_authkit_pending",
+            diagnostic_version: 1,
+            boundary: "proxy",
+            authkit_session_phase: getSessionPhase() ?? "not_observed",
+            elapsed_ms: elapsedMs,
+            warning_threshold_ms: AUTHKIT_PENDING_WARNING_MS,
+            timer_lateness_ms: Math.max(
+              0,
+              elapsedMs - AUTHKIT_PENDING_WARNING_MS,
+            ),
+            ...getProxyAuthkitRequestContext(request),
+          }),
+        );
+      } catch {
+        // Telemetry must never change the pending authentication result.
+      }
+    }, AUTHKIT_PENDING_WARNING_MS);
+    timer.unref?.();
+  } catch {
+    // Telemetry must never prevent the AuthKit call.
+  }
+  return () => clearTimeout(timer);
 }
 
 /**
@@ -430,9 +538,11 @@ function buildEndedSessionResponse(
   }
 
   if (isUnauthenticatedPath(pathname)) {
-    return withSessionCookieCleared(
+    const response = withSessionCookieCleared(
       withAttributionCookies(request, NextResponse.next()),
     );
+    recordDesktopSignInProxyHandoff(request, "ended_session");
+    return response;
   }
 
   if (!isBrowserRequest(request)) {
@@ -530,14 +640,26 @@ export default async function proxy(request: NextRequest) {
   }
 
   let refreshHitRateLimit = false;
+  // WorkOS timed out, failed at the network, or returned a 5xx after the
+  // bounded SDK retry. AuthKit keeps the session cookie for these.
+  let refreshFailedTransiently = false;
   let refreshEndedSession = false;
   const hadSessionCookie = request.cookies.has("wos-session");
+
+  let authkitSessionPhase: AuthKitSessionPhase | undefined;
+  // Anonymous requests and the malformed-cookie retry below are not timed.
+  const stopAuthkitPendingWarning = hadSessionCookie
+    ? startProxyAuthkitPendingWarning(request, () => authkitSessionPhase)
+    : () => {};
 
   let authkitResult: Awaited<ReturnType<typeof authkit>>;
   try {
     authkitResult = await authkit(request, {
       redirectUri: getRedirectUri(request),
       eagerAuth: true,
+      onSessionPhase: (phase) => {
+        if (AUTHKIT_SESSION_PHASES.has(phase)) authkitSessionPhase = phase;
+      },
       onSessionRefreshError: ({ error, isTransient, refreshStage }) => {
         if (isInvalidRefreshTokenError(error)) {
           refreshEndedSession = true;
@@ -581,6 +703,7 @@ export default async function proxy(request: NextRequest) {
           return;
         }
 
+        refreshFailedTransiently = isTransient;
         console.warn(
           JSON.stringify({
             timestamp: new Date().toISOString(),
@@ -602,6 +725,8 @@ export default async function proxy(request: NextRequest) {
       },
     });
   } catch (error) {
+    // Settled: clear before any recovery path, including the anonymous retry.
+    stopAuthkitPendingWarning();
     if (
       hadSessionCookie &&
       error instanceof Error &&
@@ -641,7 +766,7 @@ export default async function proxy(request: NextRequest) {
         throw recoveryError;
       }
       const { headers } = anonymousResult;
-      return withSessionCookieCleared(
+      const response = withSessionCookieCleared(
         withAttributionCookies(
           request,
           NextResponse.next({
@@ -650,6 +775,8 @@ export default async function proxy(request: NextRequest) {
           }),
         ),
       );
+      recordDesktopSignInProxyHandoff(request, "anonymous_context_retry");
+      return response;
     }
     if (isInvalidRefreshTokenError(error)) {
       console.warn(
@@ -666,6 +793,7 @@ export default async function proxy(request: NextRequest) {
     recordProxyAuthkitFailure(request, error, "unexpected_initial_authkit");
     throw error;
   }
+  stopAuthkitPendingWarning();
 
   const { session, headers, authorizationUrl } = authkitResult;
 
@@ -692,12 +820,15 @@ export default async function proxy(request: NextRequest) {
       headers,
       hadSessionCookie,
     );
+    recordDesktopSignInProxyHandoff(request, "authkit_pass_through");
     return response;
   }
 
-  // If rate-limited (not a real session expiry), don't redirect to login
-  if (hadSessionCookie && refreshHitRateLimit) {
-    if (!isBrowserRequest(request)) {
+  // A rate limit or unavailable WorkOS is not a session expiry: don't redirect
+  // to login or answer 401, which some clients treat as a sign-out.
+  if (hadSessionCookie && (refreshHitRateLimit || refreshFailedTransiently)) {
+    // An API handler reached without a session answers 401, whatever its Accept.
+    if (!isBrowserRequest(request) || pathname.startsWith("/api/")) {
       const rateLimitHeaders = new Headers(responseHeaders);
       rateLimitHeaders.set("Retry-After", "5");
       return withAttributionCookies(
@@ -708,7 +839,10 @@ export default async function proxy(request: NextRequest) {
         ),
       );
     }
-    // For browser requests, let through rather than forcing a confusing login redirect
+    // For browser requests, let through rather than forcing a confusing login
+    // redirect. AuthKit projected no session here, so any session header is the
+    // caller's own and must not reach withAuth(), which skips expiry checks.
+    requestHeaders.delete(SESSION_HEADER);
     return withAttributionCookies(
       request,
       NextResponse.next({

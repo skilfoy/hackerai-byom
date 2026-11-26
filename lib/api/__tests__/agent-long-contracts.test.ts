@@ -94,10 +94,12 @@ const agentApprovalClientSrc = fs.readFileSync(
   "utf8",
 );
 
-const routeSrc = fs.readFileSync(
-  path.resolve(__dirname, "../agent-trigger-route.ts"),
-  "utf8",
-);
+// The route's run-start helpers live in agent-run-start.ts, shared with the
+// server-side queued follow-up dispatch.
+const routeSrc = [
+  fs.readFileSync(path.resolve(__dirname, "../agent-trigger-route.ts"), "utf8"),
+  fs.readFileSync(path.resolve(__dirname, "../agent-run-start.ts"), "utf8"),
+].join("\n");
 
 const agentRouteSrc = fs.readFileSync(
   path.resolve(__dirname, "../../../app/api/agent/route.ts"),
@@ -1742,7 +1744,7 @@ describe("agent-long task — Trigger.dev dashboard error visibility", () => {
 
   test("content-filter finishes retry once on a different model and remain terminal on fallback", () => {
     expect(agentStreamRunnerSrc).toMatch(
-      /const telemetryModel =\s*ctx\.abliteratedTelemetry\?\.wrap\(\s*historyModel,\s*stepIndex,\s*activeStepRouting,?\s*\) \?\? historyModel;\s*return recoverAbliterationMedia\(\s*ctx\.providerStreamTimeout\s*\?\s*withProviderStreamTimeout\(telemetryModel, ctx\.providerStreamTimeout\)\s*:\s*telemetryModel,?\s*\);[\s\S]*?withInferenceFallback\(recoveryModel, fallback,[\s\S]*?const sizeRecoveryModel =\s*ctx\.mode === "agent"\s*\? withProviderRequestSizeRecovery\(recoveryModel, \{[\s\S]*?\}\)\s*: recoveryModel;\s*const guardedModel = guardLanguageModelProviderResponse\(sizeRecoveryModel/,
+      /const telemetryModel =\s*ctx\.abliteratedTelemetry\?\.wrap\(\s*historyModel,\s*stepIndex,\s*activeStepRouting,?\s*\) \?\? historyModel;\s*return ctx\.providerStreamTimeout\s*\?\s*withProviderStreamTimeout\(telemetryModel, ctx\.providerStreamTimeout\)\s*:\s*telemetryModel;[\s\S]*?const recoveryModel = wrapAttempt\(languageModel\);\s*const sizeRecoveryModel =\s*ctx\.mode === "agent"\s*\? withProviderRequestSizeRecovery\(recoveryModel, \{[\s\S]*?\}\)\s*: recoveryModel;\s*const guardedModel = guardLanguageModelProviderResponse\(sizeRecoveryModel/,
     );
     expect(agentStreamRunnerSrc).toMatch(
       /isProviderContentBlockedFinishReasonError\(error\)/,
@@ -1806,10 +1808,22 @@ describe("agent-long task — Trigger.dev dashboard error visibility", () => {
       /hasCandidate:\s*!isTrustedBrowserHandoffReadFailure\(\s*streamError,\s*state\.providerError,\s*\) &&\s*!confirmedFailureLoop &&\s*!uncertainToolOutcome &&/,
     );
     expect(taskSrc).toMatch(
-      /const nextContinuation\s*=\s*!isTrustedBrowserHandoffReadFailure\(\s*streamError,\s*state\.providerError,\s*\) &&\s*isTerminalProviderStreamError\(state\)[\s\S]{0,350}!hasUncertainProviderToolOutcome\(\s*normalizedRetryMessages\.findLast/,
+      /const retryAssistantParts\s*=\s*normalizedRetryMessages\.findLast\(/,
+    );
+    // Only a retriable disconnect or a failed Max Bedrock leg continues.
+    expect(taskSrc).toMatch(
+      /const nextContinuation\s*=\s*!isTrustedBrowserHandoffReadFailure\(\s*streamError,\s*state\.providerError,\s*\) &&\s*\(\(isTerminalProviderStreamError\(state\) &&[\s\S]{0,200}\|\|\s*bedrockRecoveryFailed\) &&\s*!hasUncertainProviderToolOutcome\(\s*retryAssistantParts/,
     );
     expect(taskSrc).toMatch(
       /isRetriableProviderStreamDisconnectError\(\s*state\.providerError/,
+    );
+    // Only the refused Bedrock leg is unbilled before DeepSeek continues;
+    // earlier legs and disconnects keep the usage they incurred.
+    expect(taskSrc).toMatch(
+      /usageTracker\.beginModelLeg\(\);\s*if \(userStopSignal\.signal\.aborted\) \{\s*isAborted = true;\s*break primaryProviderRecovery;\s*\}\s*const retryResult = await createStream\(/,
+    );
+    expect(taskSrc).toMatch(
+      /if \(retryContentBlocked\) \{\s*usageTracker\.discardModelLeg\(\);\s*\}\s*streamError = undefined;\s*resetAgentStreamStateForRetry\(state\);/,
     );
     expect(taskSrc).toMatch(
       /decideProviderRecovery\(\{[\s\S]{0,400}alreadyRetried: isRetryWithFallback/,

@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import {
+  chmodSync,
   mkdtempSync,
   realpathSync,
   mkdirSync,
@@ -10,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  filesystemListDiagnostics,
   WORKSPACE_READER_PYTHON,
   workspaceReaderCommand,
   workspaceRequest,
@@ -68,6 +70,60 @@ describe("workspace reader filesystem boundary", () => {
     });
   });
 
+  it("opens the filesystem root and roots written with repeated separators", () => {
+    mkdirSync(join(root, "reports"));
+    writeFileSync(join(root, "reports", "report.txt"), "fixture");
+    const request = workspaceRequest.parse({
+      chatId: "chat",
+      action: "list",
+      search: "tmp",
+    });
+    const fromSlash = JSON.parse(
+      execFileSync("sh", ["-c", workspaceReaderCommand(request, null)], {
+        cwd: "/",
+        encoding: "utf8",
+      }),
+    );
+    const rootListing = {
+      root: "/",
+      entries: expect.arrayContaining([
+        expect.objectContaining({ name: "tmp" }),
+      ]),
+    };
+    expect(fromSlash).toMatchObject(rootListing);
+    root = "/";
+    expect(read({ search: "tmp" })).toMatchObject(rootListing);
+    root = `/${fixture}//workspace/`;
+    expect(read({ path: "reports" }).entries).toEqual([
+      expect.objectContaining({ name: "report.txt", kind: "file", size: 7 }),
+    ]);
+  });
+
+  it("labels a missing root separately from a missing nested folder", () => {
+    const missing = { error: "not_found", category: "missing" };
+    expect(read({ path: "gone" })).toEqual({ ...missing, phase: "directory" });
+    // Non-list actions keep the original reader body.
+    expect(read({ action: "download", path: "gone/report.txt" })).toEqual({
+      error: "not_found",
+    });
+    root = join(fixture, "moved");
+    expect(read({})).toEqual({ ...missing, phase: "root" });
+  });
+
+  it("reports a deleted current directory as a missing root", () => {
+    const request = workspaceRequest.parse({ chatId: "chat", action: "list" });
+    const output = execFileSync(
+      "sh",
+      ["-c", `rmdir "$PWD" && ${workspaceReaderCommand(request, null)}`],
+      { cwd: root, encoding: "utf8" },
+    );
+    expect(JSON.parse(output)).toEqual({
+      error: "not_found",
+      phase: "root",
+      category: "missing",
+    });
+  });
+
   it("lists actual nested files with metadata and reads exact binary bytes", () => {
     mkdirSync(join(root, "reports"));
     const bytes = Buffer.from([0, 255, 128, 34, 10]);
@@ -107,8 +163,118 @@ describe("workspace reader filesystem boundary", () => {
     const linked = join(fixture, "linked");
     symlinkSync(root, linked);
     root = linked;
-    expect(read({})).toEqual({ error: "unreadable_path" });
+    expect(read({})).toEqual({
+      error: "unreadable_path",
+      phase: "root",
+      category: "not_directory_or_symlink",
+    });
   });
+
+  it("labels the list phase that hit a file where a directory was expected", () => {
+    writeFileSync(join(root, "report.txt"), "fixture");
+    const notDirectory = {
+      error: "unreadable_path",
+      category: "not_directory_or_symlink",
+    };
+    expect(read({ path: "report.txt" })).toEqual({
+      ...notDirectory,
+      phase: "directory",
+    });
+    // Non-list actions keep the original reader body.
+    expect(read({ action: "download", path: "report.txt/x" })).toEqual({
+      error: "unreadable_path",
+    });
+    root = join(root, "report.txt");
+    expect(read({})).toEqual({ ...notDirectory, phase: "root" });
+  });
+
+  // Root bypasses directory search permission, so this cannot fail there.
+  (process.getuid?.() === 0 ? it.skip : it)(
+    "labels a per-entry stat permission failure separately from opening the folder",
+    () => {
+      mkdirSync(join(root, "locked"));
+      writeFileSync(join(root, "locked", "report.txt"), "fixture");
+      chmodSync(join(root, "locked"), 0o444);
+      try {
+        expect(read({ path: "locked" })).toEqual({
+          error: "unreadable_path",
+          phase: "entry_stat",
+          category: "permission",
+        });
+      } finally {
+        chmodSync(join(root, "locked"), 0o755);
+      }
+    },
+  );
+
+  it.each([
+    [
+      "allow-listed reader labels",
+      "list",
+      {
+        error: "unreadable_path",
+        phase: "enumerate",
+        category: "io",
+      },
+      { reader: "local", reader_phase: "enumerate", os_error_category: "io" },
+    ],
+    [
+      "an older reader without labels",
+      "list",
+      { error: "unreadable_path" },
+      { reader: "local" },
+    ],
+    [
+      "unexpected label values and fields",
+      "list",
+      {
+        error: "unreadable_path",
+        phase: "/home/user/private",
+        category: 13,
+        errno: 13,
+        message: "Permission denied: '/home/user/private'",
+      },
+      { reader: "local" },
+    ],
+    [
+      "a missing list folder",
+      "list",
+      { error: "not_found", phase: "root", category: "missing" },
+      { reader: "local", reader_phase: "root", os_error_category: "missing" },
+    ],
+    [
+      "another error code",
+      "list",
+      { error: "file_changed", phase: "root", category: "missing" },
+      undefined,
+    ],
+    [
+      "a malformed error code",
+      "list",
+      { error: { toString: "not_found" }, phase: "root", category: "missing" },
+      undefined,
+    ],
+    [
+      "a status request listed by the reader",
+      "status",
+      { error: "unreadable_path", phase: "root", category: "permission" },
+      undefined,
+    ],
+    [
+      "a missing file preview",
+      "preview",
+      { error: "not_found", phase: "directory", category: "missing" },
+      undefined,
+    ],
+    ["non-object output", "list", "unreadable_path", undefined],
+  ] as const)(
+    "keeps only closed list diagnostics for %s",
+    (_case, action, output, expected) => {
+      expect(filesystemListDiagnostics("local", action, output)).toEqual(
+        expected,
+      );
+    },
+  );
 
   it("downloads larger files in revision-pinned chunks and rejects changes between chunks", () => {
     const bytes = Buffer.alloc(3 * 1024 * 1024, 42);

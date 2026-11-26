@@ -7,7 +7,14 @@ import {
 import { useQuestionAnswers } from "./useQuestionAnswers";
 import { UserInputQuestionPanel } from "./UserInputQuestionPanel";
 
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useNextActions } from "@/app/hooks/useNextActions";
 import { useLatestRef } from "@/app/hooks/useLatestRef";
 import type { CompletedPredictionTurn } from "@/lib/chat/next-actions/contracts";
@@ -133,7 +140,6 @@ interface ChatInputProps {
   topNotice?: React.ReactNode;
 }
 
-const COMPOSER_TAP_CLICK_FALLBACK_MS = 500;
 // Prose-only waits use the same isolated draft without displaying a question panel.
 const PLAIN_REPLY_QUESTIONS: UserInputQuestion[] = [
   { id: "reply", header: "Reply", question: "Your reply", options: [] },
@@ -150,7 +156,7 @@ const ChatInputLoadingState = ({
     role="status"
   >
     <div className="mx-auto w-full min-w-0 max-w-full sm:max-w-[768px]">
-      <div className="max-h-[calc(100dvh-11rem)] overflow-y-auto md:bg-background">
+      <div className="max-h-[calc(100dvh-11rem)] overflow-y-auto">
         {topNotice}
       </div>
       <div
@@ -351,6 +357,7 @@ const ChatInputContent = ({
     removeQueuedMessage,
     queueBehavior,
     setQueueBehavior,
+    agentSteeringEnabled,
     sandboxPreference,
     setSandboxPreference,
     subscription,
@@ -411,23 +418,13 @@ const ChatInputContent = ({
     string | null
   >(null);
   const [isReconnecting, setIsReconnecting] = useState(false);
-  const [composerFocused, setComposerFocused] = useState(false);
   const isMobile = useIsMobile();
   // Tab suggestions need a large viewport and a fine pointer (including hybrid
   // touch devices with a mouse or trackpad). Unsupported queries never match.
   const predictionCapable = useMediaQuery(
     "(min-width: 768px) and (any-pointer: fine)",
   );
-  const sandboxInactive = !isEmptyNewChat && !composerFocused;
-  const mobileSandboxHidden = isMobile === true && sandboxInactive;
-  const chatInputContainerRef = useRef<HTMLDivElement>(null);
   const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
-  const composerPointerDownRef = useRef(false);
-  const composerPointerReleaseTimerRef = useRef<number | undefined>(undefined);
-  const holdComposerFocusForPointer = () => {
-    window.clearTimeout(composerPointerReleaseTimerRef.current);
-    composerPointerDownRef.current = true;
-  };
 
   const showAgentApprovalPrompt =
     !!user && !!approvalRequest && !isStoppingAgent;
@@ -509,39 +506,6 @@ const ChatInputContent = ({
       : "attached";
 
   useEffect(() => {
-    const releasePointer = (delay: number) => {
-      if (!composerPointerDownRef.current) return;
-      window.clearTimeout(composerPointerReleaseTimerRef.current);
-      composerPointerReleaseTimerRef.current = window.setTimeout(() => {
-        composerPointerDownRef.current = false;
-        const activeElement = document.activeElement;
-        const focusInComposer =
-          activeElement instanceof Node &&
-          chatInputContainerRef.current?.contains(activeElement);
-        const agentMenuOpen = document.querySelector(
-          "[data-chat-input-agent-menu]",
-        );
-        if (!focusInComposer && !agentMenuOpen) setComposerFocused(false);
-      }, delay);
-    };
-    // Touch compatibility mouse events can blur the input after pointerup.
-    // Keep the selector interactive until click opens its menu. Release a
-    // canceled gesture immediately, or a gesture with no click after a fallback.
-    const releaseAfterClick = () => releasePointer(0);
-    const releaseWithoutClick = () =>
-      releasePointer(COMPOSER_TAP_CLICK_FALLBACK_MS);
-    document.addEventListener("pointerup", releaseWithoutClick);
-    document.addEventListener("pointercancel", releaseAfterClick);
-    document.addEventListener("click", releaseAfterClick);
-    return () => {
-      document.removeEventListener("pointerup", releaseWithoutClick);
-      document.removeEventListener("pointercancel", releaseAfterClick);
-      document.removeEventListener("click", releaseAfterClick);
-      window.clearTimeout(composerPointerReleaseTimerRef.current);
-    };
-  }, []);
-
-  useEffect(() => {
     if (
       !isGenerating &&
       !isWaitingForReply &&
@@ -556,28 +520,6 @@ const ChatInputContent = ({
     isWaitingForReply,
     storedApprovalRequest,
   ]);
-
-  useEffect(() => {
-    if (!composerFocused) return;
-    const dismissOutsideComposer = (event: Event) => {
-      const target = event.target;
-      if (!(target instanceof Node)) return;
-      if (chatInputContainerRef.current?.contains(target)) return;
-      if (
-        target instanceof Element &&
-        target.closest("[data-chat-input-agent-menu]")
-      )
-        return;
-      composerPointerDownRef.current = false;
-      setComposerFocused(false);
-    };
-    document.addEventListener("pointerdown", dismissOutsideComposer);
-    document.addEventListener("focusin", dismissOutsideComposer);
-    return () => {
-      document.removeEventListener("pointerdown", dismissOutsideComposer);
-      document.removeEventListener("focusin", dismissOutsideComposer);
-    };
-  }, [composerFocused]);
 
   const handleAgentStop = async () => {
     setIsStoppingAgent(true);
@@ -1066,6 +1008,19 @@ const ChatInputContent = ({
         ? "Goal mode is unavailable. Exit goal mode to send a normal message."
         : "Checking goal availability…"
       : undefined;
+  const attachmentFailureDescriptionId = useId();
+  const attachmentFailureMessage =
+    !isWaitingForReply && uploadedFiles.some((file) => file.error)
+      ? uploadedFiles.some(
+          (file) =>
+            file.error &&
+            file.retryable &&
+            !file.generatedTextAttachment &&
+            !file.generatedSource,
+        )
+        ? "Retry or remove failed attachments to send."
+        : "Remove failed attachments to send."
+      : undefined;
   const effectiveSendDisabledReason =
     (submissionPending ? "Sending message…" : undefined) ??
     (uploadedFiles.some((file) => file.removing)
@@ -1084,7 +1039,8 @@ const ChatInputContent = ({
       : undefined) ??
     (user && !pendingUserWait
       ? (freeDesktopSandboxUnavailableReason ?? computerSendDisabledReason)
-      : undefined);
+      : undefined) ??
+    attachmentFailureMessage;
 
   useEffect(() => {
     // A no-op setter after every edit leaves synchronous work pending during
@@ -1472,7 +1428,6 @@ const ChatInputContent = ({
       className={`relative flex max-h-[calc(100dvh-4rem)] min-h-0 min-w-0 flex-col px-4 ${isCentered ? "" : "pb-3"}`}
     >
       <div
-        ref={chatInputContainerRef}
         className="mx-auto flex min-h-0 w-full min-w-0 max-w-full flex-1 flex-col sm:max-w-[768px]"
         data-testid="chat-input-container"
       >
@@ -1485,9 +1440,10 @@ const ChatInputContent = ({
           />
         )}
         {/* Panels keep their content height and scroll as a stack instead of
-            shrinking beneath the next panel. Reserve the input or approval card. */}
+            shrinking beneath the next panel. Reserve the input or approval card.
+            No fill here: each panel paints its own, so inset gutters stay clear. */}
         <div
-          className={`flex min-h-0 shrink flex-col overflow-y-auto md:bg-background [&>*]:shrink-0 ${showAgentApprovalPrompt ? "max-h-[25dvh]" : "max-h-[calc(100dvh-11rem)]"} ${hasJoinedComposerPanels && !isWaitingForReply && !hasFilePreviews ? "-mb-5 md:mb-0" : ""}`}
+          className={`flex min-h-0 shrink flex-col overflow-y-auto [&>*]:shrink-0 ${showAgentApprovalPrompt ? "max-h-[25dvh]" : "max-h-[calc(100dvh-11rem)]"} ${hasJoinedComposerPanels && !isWaitingForReply && !hasFilePreviews ? "-mb-5 md:mb-0" : ""}`}
         >
           {topNotice}
           {workspaceRecovery?.scope === workspaceRecoveryScope && (
@@ -1573,18 +1529,16 @@ const ChatInputContent = ({
             />
           )}
 
-          {/* Hidden selectors take no space; the bottom-anchored composer stays
-              in place while the panels above it use the available height. */}
+          {/* The environment is chosen when a chat starts. Afterwards only the
+              disconnected-computer notice offers a switch. */}
           {user &&
             isAgent &&
+            isEmptyNewChat &&
             !showAgentApprovalPrompt &&
             !isWaitingForReply && (
               <div
-                className={`relative z-0 mb-1 min-w-0 shrink-0 touch-manipulation items-center justify-end px-2 md:hidden ${sandboxInactive ? "hidden" : "flex"}`}
+                className="relative z-0 mb-1 flex min-w-0 shrink-0 touch-manipulation items-center justify-end px-2 md:hidden"
                 data-testid="chat-input-agent-context"
-                aria-hidden={mobileSandboxHidden || undefined}
-                inert={mobileSandboxHidden || undefined}
-                onPointerDownCapture={holdComposerFocusForPointer}
               >
                 <div
                   className="min-w-0 max-w-full"
@@ -1593,7 +1547,6 @@ const ChatInputContent = ({
                   <SandboxSelector
                     value={sandboxPreference}
                     onChange={setSandboxPreference}
-                    confirmEnvironmentChange={!isNewChat && hasMessages}
                     compact
                     size="sm"
                     menuAlign="end"
@@ -1612,6 +1565,7 @@ const ChatInputContent = ({
               {messageQueue.length > 0 && !isWaitingForReply && (
                 <QueuedMessagesPanel
                   messages={messageQueue}
+                  agentSteeringEnabled={agentSteeringEnabled}
                   onSendNow={onSendNow}
                   onEdit={updateQueuedMessage}
                   onEditingMessageChange={setEditingQueuedMessageId}
@@ -1728,10 +1682,9 @@ const ChatInputContent = ({
             className={`chat-input-glass-surface relative z-10 order-2 flex shrink-0 max-h-[min(300px,50dvh)] min-w-0 touch-manipulation flex-col gap-3 overflow-hidden border border-black/8 py-3 transition-colors dark:border-border ${landingAppearance ? "min-h-[130px] shadow-[0_18px_55px_rgba(0,0,0,0.24)]" : "min-h-[96px] shadow-[0px_12px_32px_0px_rgba(0,0,0,0.02)]"} ${hasQuestionPanel ? "rounded-b-[22px]" : uploadedFiles && uploadedFiles.length > 0 ? "rounded-b-[22px] border-t-0" : "rounded-[22px]"}`}
             data-testid="chat-input-surface"
             data-panels-joined={hasJoinedComposerPanels || undefined}
-            onPointerDownCapture={holdComposerFocusForPointer}
             onClick={(event) => {
-              // Reveal controls only after focus, not during touch start. Focus
-              // padding taps inside the click gesture so mobile opens the keyboard.
+              // Focus padding taps inside the click gesture so mobile opens the
+              // keyboard.
               const target = event.target;
               if (
                 !(target instanceof Element) ||
@@ -1789,7 +1742,9 @@ const ChatInputContent = ({
               describedBy={
                 isWaitingForReply && !hasQuestionPanel
                   ? WAITING_FOR_REPLY_DESCRIPTION_ID
-                  : undefined
+                  : attachmentFailureMessage
+                    ? attachmentFailureDescriptionId
+                    : undefined
               }
               isReplyingToAgent={isWaitingForReply}
               onCommandKeyDown={(e) => {
@@ -1805,20 +1760,19 @@ const ChatInputContent = ({
                 }
               }}
               autoFocus={autoFocus}
-              onFocus={() => setComposerFocused(true)}
-              onBlur={(event) => {
-                if (composerPointerDownRef.current) return;
-                const next = event.relatedTarget;
-                if (
-                  next instanceof Node &&
-                  (chatInputContainerRef.current?.contains(next) ||
-                    (next instanceof Element &&
-                      next.closest("[data-chat-input-agent-menu]")))
-                )
-                  return;
-                setComposerFocused(false);
-              }}
             />
+            <p
+              id={attachmentFailureDescriptionId}
+              aria-live="polite"
+              aria-atomic="true"
+              className={
+                attachmentFailureMessage
+                  ? "px-4 text-xs text-destructive"
+                  : "sr-only"
+              }
+            >
+              {attachmentFailureMessage}
+            </p>
             <ChatInputToolbar
               contextMeter={
                 // A composer mid-transition must not show another chat's data.
@@ -1826,7 +1780,7 @@ const ChatInputContent = ({
                   ? contextMeter
                   : undefined
               }
-              confirmEnvironmentChange={!isNewChat && hasMessages}
+              showSandboxSelector={isEmptyNewChat}
               replyActionLabel={
                 isWaitingForReply
                   ? questionAnswers.index < answerQuestions.length - 1

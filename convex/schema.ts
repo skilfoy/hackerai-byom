@@ -1,5 +1,7 @@
 import { userInputQuestionsValidator } from "./lib/userInputQuestions";
+import { queuedMessageSettingsValidator } from "./lib/queuedMessageSettings";
 import { nextActionsStateValidator } from "./lib/nextActionsState";
+import { usageModelSelectionValidator } from "./lib/usageModelSelection";
 import {
   settlementIdentityFields,
   walletActionResult,
@@ -7,6 +9,7 @@ import {
 } from "./lib/settlementReceiptValidators";
 import { goalFields } from "./lib/goalValidators";
 import { networkPolicy } from "./cloudNetworkValidators";
+import { scopePolicy, scopeRule } from "./engagementScopeValidators";
 import {
   findingRevisionValidator,
   findingFeedbackValidator,
@@ -24,6 +27,8 @@ import {
   abuseCaseFields,
   abuseEventFields,
   abuseResponseFields,
+  blockNoticeFields,
+  egressReviewReceiptFields,
 } from "./lib/abuseValidators";
 import { taskOutcomeFields } from "./taskOutcomeValidators";
 import { retainedTailValidator } from "./lib/retainedTail";
@@ -258,6 +263,19 @@ export default defineSchema({
   abuse_responses: defineTable(abuseResponseFields).index("by_caseId", [
     "caseId",
   ]),
+  // One fixed account notice per automated block; never a recipient address.
+  abuse_block_notices: defineTable(blockNoticeFields)
+    .index("by_caseId", ["caseId"])
+    .index("by_status_and_nextAttemptAt", ["status", "nextAttemptAt"])
+    .index("by_userId_and_status", ["userId", "status"])
+    .index("by_status_and_updatedAt", ["status", "updatedAt"])
+    .index("by_createdAt", ["createdAt"]),
+  // Sanitized enums per automated egress review, for owner summaries.
+  egress_review_receipts: defineTable(egressReviewReceiptFields)
+    .index("by_digest", ["digest"])
+    .index("by_createdAt", ["createdAt"])
+    .index("by_decision_and_createdAt", ["decision", "createdAt"])
+    .index("by_expiresAt", ["expiresAt"]),
   abuse_rate_limits: defineTable({
     bucket: v.string(),
     count: v.number(),
@@ -323,6 +341,35 @@ export default defineSchema({
     .index("by_user_and_pinned", ["user_id", "pinned_at"]),
 
   agent_goals: defineTable(goalFields).index("by_chatId", ["chatId"]),
+
+  // Deprecated scope data remains schema-compatible until all historical
+  // rows have been removed through normal chat/account deletion.
+  engagement_scopes: defineTable({
+    chat_id: v.string(),
+    user_id: v.string(),
+    active: v.boolean(),
+    revision: v.number(),
+    rules: v.array(scopeRule),
+    restrictions: v.array(v.string()),
+    status: v.union(
+      v.literal("ready"),
+      v.literal("processing"),
+      v.literal("unavailable"),
+      v.literal("ambiguous"),
+    ),
+    clarification: v.string(),
+    clarificationRequested: v.boolean(),
+    source_id: v.string(),
+  }).index("by_chat_id", ["chat_id"]),
+  engagement_scope_events: defineTable({
+    chat_id: v.string(),
+    source_id: v.string(),
+    source_text: v.string(),
+    source_kind: v.union(v.literal("user_message"), v.literal("user_edit")),
+    status: v.union(v.literal("pending"), v.literal("applied")),
+    revision: v.number(),
+    policy: v.optional(scopePolicy),
+  }).index("by_chat_source", ["chat_id", "source_id"]),
 
   chat_history_access: defineTable({
     chat_id: v.string(),
@@ -539,6 +586,9 @@ export default defineSchema({
     is_hidden: v.optional(v.boolean()),
     // Private takeover context is retained in model history, never client history.
     is_browser_handoff: v.optional(v.boolean()),
+    // Set only after an explicit Stop was acknowledged; anchors the transcript
+    // divider to the stopped assistant turn, or its request if none was saved.
+    user_stopped: v.optional(v.boolean()),
   })
     .index("by_message_id", ["id"])
     .index("by_chat_id", ["chat_id"])
@@ -1798,6 +1848,8 @@ export default defineSchema({
     ),
     max_mode: v.optional(v.boolean()),
     byok: v.optional(v.boolean()),
+    // Absent on historical rows and older writers; never backfilled.
+    model_selection: v.optional(usageModelSelectionValidator),
   })
     .index("by_usage_settlement_id", ["usage_settlement_id"])
     .index("by_user", ["user_id"])
@@ -2319,6 +2371,71 @@ export default defineSchema({
     .index("by_parent_run", ["parent_trigger_run_id"]),
 
   // Webhook idempotency (prevents double-crediting on Stripe retries)
+  // Follow-ups sent while an Agent run is working, waiting for that run's next
+  // model step. Saving a response that shows a steer settles it as saved;
+  // after the run, the client withdraws any open row back to its queue.
+  // Settled rows are short-lived tombstones, removed with the chat too.
+  agent_steers: defineTable({
+    id: v.string(),
+    chat_id: v.string(),
+    user_id: v.string(),
+    run_id: v.string(),
+    text: v.string(),
+    created_at: v.number(),
+    /** Browser send time; orders a restored steer among queued messages. */
+    sent_at: v.optional(v.number()),
+    /** Set when the run reads it. */
+    claimed_at: v.optional(v.number()),
+    /** Settled: a saved response shows it. Kept briefly as a tombstone. */
+    saved_at: v.optional(v.number()),
+    /** Settled: returned to the client's queue; later saves drop it. */
+    withdrawn_at: v.optional(v.number()),
+    /** Set with either settlement; open steers have none, so indexes find
+     * them directly instead of filtering past tombstones. */
+    settled_at: v.optional(v.number()),
+  })
+    .index("by_steer_id", ["id"])
+    .index("by_chat_id", ["chat_id"])
+    .index("by_chat_and_settled", ["chat_id", "settled_at"])
+    .index("by_run_and_settled", ["run_id", "settled_at"]),
+
+  /**
+   * Follow-ups waiting for an Agent run to finish, for accounts with mid-run
+   * steering. Kept on the server so a reload or another device still shows
+   * them. The browser that queued a message sends it; saving the user message
+   * with the same ID deletes the row in that transaction.
+   */
+  queued_messages: defineTable({
+    /** Client-generated; becomes the user message ID when sent. */
+    id: v.string(),
+    chat_id: v.string(),
+    user_id: v.string(),
+    text: v.string(),
+    /** File parts without URLs or local paths. */
+    files: v.optional(v.array(v.any())),
+    /** Browser time it was first sent or queued; orders the queue. */
+    sent_at: v.number(),
+    /** A steer the Agent never read, returned here after its run ended. */
+    from_steer: v.optional(v.boolean()),
+    created_at: v.number(),
+    /** Set while the server sends it after the run that claimed it. */
+    dispatch_claimed_at: v.optional(v.number()),
+    dispatch_run_id: v.optional(v.string()),
+  })
+    .index("by_queued_id", ["id"])
+    .index("by_chat_and_sent", ["chat_id", "sent_at"]),
+
+  /**
+   * The Agent settings a user last chose while queuing, steering or changing
+   * them. A server send of a queued message runs with these, never with the
+   * finished run's, and only when they allow unattended work.
+   */
+  agent_queue_settings: defineTable({
+    user_id: v.string(),
+    settings: queuedMessageSettingsValidator,
+    updated_at: v.number(),
+  }).index("by_user_id", ["user_id"]),
+
   processed_webhooks: defineTable({
     event_id: v.string(),
     // Fraud source IDs let support resolution fence an in-flight delivery.

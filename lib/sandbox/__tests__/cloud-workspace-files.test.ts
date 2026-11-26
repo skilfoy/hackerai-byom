@@ -43,7 +43,7 @@ it("rejects a foreign sandbox before connecting", async () => {
       "us-east-1",
       input({ sandboxId: "foreign" }),
     ),
-  ).rejects.toMatchObject({ code: "not_found" });
+  ).rejects.toMatchObject({ code: "not_found", diagnostics: undefined });
   expect(Sandbox.connect).not.toHaveBeenCalled();
 });
 it("does not resume paused workspaces until explicitly requested", async () => {
@@ -98,6 +98,81 @@ it("withholds bytes if recovery or deletion fences the workspace during the read
     ),
   ).rejects.toThrow("fenced");
 });
+it("labels unreadable cloud list failures with the cloud reader only for list", async () => {
+  run.mockResolvedValue({
+    exitCode: 0,
+    stdout: JSON.stringify({
+      error: "unreadable_path",
+      phase: "directory",
+      category: "permission",
+    }),
+  });
+  const failure = (action: string) =>
+    accessCloudWorkspaceFiles(
+      "owner",
+      "us-east-1",
+      input({ action, sandboxId: "sandbox" }),
+    ).catch((error) => error);
+  expect(await failure("list")).toMatchObject({
+    code: "unreadable_path",
+    status: 400,
+    diagnostics: {
+      reader: "cloud",
+      reader_phase: "directory",
+      os_error_category: "permission",
+    },
+  });
+  const resume = await failure("resume");
+  expect(resume).toMatchObject({ code: "unreadable_path", status: 400 });
+  expect(resume.diagnostics).toBeUndefined();
+});
+it("labels a missing cloud list folder without changing its public status", async () => {
+  run.mockResolvedValue({
+    exitCode: 0,
+    stdout: JSON.stringify({
+      error: "not_found",
+      phase: "directory",
+      category: "missing",
+    }),
+  });
+  await expect(
+    accessCloudWorkspaceFiles(
+      "owner",
+      "us-east-1",
+      input({ sandboxId: "sandbox", path: "reports" }),
+    ),
+  ).rejects.toMatchObject({
+    code: "not_found",
+    status: 404,
+    diagnostics: {
+      reader: "cloud",
+      reader_phase: "directory",
+      os_error_category: "missing",
+    },
+  });
+});
+it.each([
+  ["lookup", () => jest.mocked(Sandbox.getInfo)],
+  ["fence", () => jest.mocked(assertCloudWorkspaceAvailable)],
+  ["connect", () => jest.mocked(Sandbox.connect)],
+  ["run_reader", () => run],
+] as const)(
+  "records %s as the last step of an unclassified provider failure",
+  async (step, target) => {
+    const failure = new Error("provider detail");
+    target().mockRejectedValueOnce(failure);
+    const progress = {};
+    await expect(
+      accessCloudWorkspaceFiles(
+        "owner",
+        "us-east-1",
+        input({ sandboxId: "sandbox" }),
+        progress,
+      ),
+    ).rejects.toBe(failure);
+    expect(progress).toEqual({ step });
+  },
+);
 it("reads without changing a running Agent's sandbox timeout", async () => {
   await accessCloudWorkspaceFiles(
     "owner",

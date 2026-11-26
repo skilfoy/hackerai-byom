@@ -37,6 +37,8 @@ import {
   type DesktopBridgeStatus,
 } from "@/app/hooks/useSandboxPreference";
 import { isTauriEnvironment } from "@/app/hooks/useTauri";
+import { useFollowUpBehavior } from "@/app/hooks/useFollowUpBehavior";
+import { useServerMessageQueue } from "@/app/hooks/useServerMessageQueue";
 import { resolveSubscriptionTier } from "@/lib/auth/entitlements";
 import { clearSharedToken, setSharedToken } from "@/lib/auth/shared-token";
 import { chatSidebarStorage } from "@/lib/utils/sidebar-storage";
@@ -144,9 +146,11 @@ interface GlobalStateType {
   ) => void;
   clearQueue: () => void;
 
-  // Queue behavior preference
+  // What sending does while an Agent run is working
   queueBehavior: QueueBehavior;
   setQueueBehavior: (behavior: QueueBehavior) => void;
+  /** Mid-run steering rollout; off keeps queue and stop-and-send only. */
+  agentSteeringEnabled: boolean;
 
   // Sandbox preference (for Agent mode)
   sandboxPreference: SandboxPreference;
@@ -505,7 +509,7 @@ const GlobalStateProviderInner: React.FC<GlobalStateProviderProps> = ({
   const queueKey = JSON.stringify([user?.id ?? null, queueChatId]);
   const queuesRef = useRef(new Map<string, QueuedMessage[]>());
   const [, refreshQueues] = useState(0);
-  const messageQueue = queuesRef.current.get(queueKey) ?? [];
+  const localMessageQueue = queuesRef.current.get(queueKey) ?? [];
   const setMessageQueue = useCallback(
     (
       update: QueuedMessage[] | ((queue: QueuedMessage[]) => QueuedMessage[]),
@@ -527,15 +531,8 @@ const GlobalStateProviderInner: React.FC<GlobalStateProviderProps> = ({
     setEditingQueuedMessageId(null);
   }, []);
 
-  // Queue behavior preference (persisted to localStorage)
-  const [queueBehavior, setQueueBehaviorState] = useState<QueueBehavior>(() => {
-    if (typeof window === "undefined") return "queue";
-    const saved = localStorage.getItem("queue-behavior");
-    if (saved === "queue" || saved === "stop-and-send") {
-      return saved;
-    }
-    return "queue"; // Default: queue after current message completes
-  });
+  const { queueBehavior, setQueueBehavior, agentSteeringEnabled } =
+    useFollowUpBehavior(user?.id);
 
   // Tauri detection + sandbox preference (co-located in a custom hook)
   const {
@@ -546,7 +543,7 @@ const GlobalStateProviderInner: React.FC<GlobalStateProviderProps> = ({
     desktopBridgeStatus,
     desktopEnvironmentId,
     retryDesktopBridge,
-  } = useSandboxPreference(!!user);
+  } = useSandboxPreference(!!user, user?.id);
 
   const [agentPermissionMode, setAgentPermissionMode] =
     useState<AgentPermissionMode>(() => readAgentPermissionMode());
@@ -606,13 +603,6 @@ const GlobalStateProviderInner: React.FC<GlobalStateProviderProps> = ({
     (!automaticEntitlementRefreshNeeded ||
       entitlementApiResolvedUserId === user?.id ||
       tokenFreeAutomaticRefreshExhausted);
-
-  // Persist queue behavior to localStorage
-  useEffect(() => {
-    if (typeof window !== "undefined") {
-      localStorage.setItem("queue-behavior", queueBehavior);
-    }
-  }, [queueBehavior]);
 
   // Paid Agent tier ids are resolved to providers server-side.
   const [selectedModel, setSelectedModelRaw] = useState<SelectedModel>(() => {
@@ -1163,7 +1153,7 @@ const GlobalStateProviderInner: React.FC<GlobalStateProviderProps> = ({
   );
 
   // Message queue handlers
-  const queueMessage = useCallback(
+  const localQueueMessage = useCallback(
     (text: string, files?: FileMessagePart[]) => {
       if ((queuesRef.current.get(queueKey)?.length ?? 0) >= 10) {
         toast.error("Queue is full", {
@@ -1185,7 +1175,7 @@ const GlobalStateProviderInner: React.FC<GlobalStateProviderProps> = ({
     [queueKey, setMessageQueue],
   );
 
-  const removeQueuedMessage = useCallback(
+  const localRemoveQueuedMessage = useCallback(
     (id: string) => {
       setMessageQueue((prev) => prev.filter((msg) => msg.id !== id));
       setEditingQueuedMessageId((currentId) =>
@@ -1195,7 +1185,7 @@ const GlobalStateProviderInner: React.FC<GlobalStateProviderProps> = ({
     [setMessageQueue],
   );
 
-  const setQueuedMessageDelivery = useCallback(
+  const localSetQueuedMessageDelivery = useCallback(
     (
       id: string,
       deliveryStatus: NonNullable<QueuedMessage["deliveryStatus"]>,
@@ -1212,7 +1202,7 @@ const GlobalStateProviderInner: React.FC<GlobalStateProviderProps> = ({
     [setMessageQueue],
   );
 
-  const updateQueuedMessage = useCallback(
+  const localUpdateQueuedMessage = useCallback(
     (id: string, text: string) => {
       setMessageQueue((prev) =>
         prev.map((message) =>
@@ -1225,10 +1215,74 @@ const GlobalStateProviderInner: React.FC<GlobalStateProviderProps> = ({
     [setMessageQueue],
   );
 
-  const clearQueue = useCallback(() => {
+  const localClearQueue = useCallback(() => {
     setMessageQueue([]);
     setEditingQueuedMessageId(null);
   }, [setMessageQueue]);
+
+  // With mid-run steering, the queue lives on the server so it survives a
+  // reload and appears on every device; otherwise it stays in this session.
+  // The settings a queued message would be sent with right now, matching
+  // what chat.tsx sends: they travel with it so a server send uses them.
+  const queueSettingsModel = toConnectionModel(selectedModel);
+  const queueSettings = useMemo(
+    () => ({
+      agentPermissionMode,
+      sandboxPreference,
+      ...(queueSettingsModel ? { selectedModel: queueSettingsModel } : {}),
+    }),
+    [agentPermissionMode, sandboxPreference, queueSettingsModel],
+  );
+  const serverQueue = useServerMessageQueue({
+    userId: user?.id,
+    chatId: queueChatId,
+    enabled: agentSteeringEnabled,
+    settings: queueSettings,
+  });
+  // Messages queued while the rollout was still loading move to the server
+  // queue once steering turns on, so none are dropped by the switch.
+  const adoptLocalMessages = serverQueue.adoptLocalMessages;
+  useEffect(() => {
+    if (!agentSteeringEnabled || !user?.id) return;
+    let moved = false;
+    for (const [queueKey, queue] of queuesRef.current) {
+      const [ownerId, chatId] = JSON.parse(queueKey) as [
+        string | null,
+        string | null,
+      ];
+      if (ownerId !== user.id || !chatId) continue;
+      adoptLocalMessages(chatId, queue);
+      queuesRef.current.delete(queueKey);
+      moved = true;
+    }
+    if (moved) refreshQueues((version) => version + 1);
+  }, [adoptLocalMessages, agentSteeringEnabled, user?.id]);
+  const localQueue = {
+    messageQueue: localMessageQueue,
+    queueMessage: localQueueMessage,
+    updateQueuedMessage: localUpdateQueuedMessage,
+    removeQueuedMessage: localRemoveQueuedMessage,
+    setQueuedMessageDelivery: localSetQueuedMessageDelivery,
+    clearQueue: localClearQueue,
+  };
+  const {
+    messageQueue,
+    queueMessage,
+    updateQueuedMessage,
+    setQueuedMessageDelivery,
+    clearQueue,
+  } = agentSteeringEnabled ? serverQueue : localQueue;
+  const removeFromServerQueue = serverQueue.removeQueuedMessage;
+  const removeQueuedMessage = useCallback(
+    (id: string) => {
+      if (!agentSteeringEnabled) return localRemoveQueuedMessage(id);
+      removeFromServerQueue(id);
+      setEditingQueuedMessageId((currentId) =>
+        currentId === id ? null : currentId,
+      );
+    },
+    [agentSteeringEnabled, localRemoveQueuedMessage, removeFromServerQueue],
+  );
 
   const markChatNavigationStarted = useCallback(() => {
     chatNavigationRevisionRef.current += 1;
@@ -1443,7 +1497,8 @@ const GlobalStateProviderInner: React.FC<GlobalStateProviderProps> = ({
     clearQueue,
 
     queueBehavior,
-    setQueueBehavior: setQueueBehaviorState,
+    setQueueBehavior,
+    agentSteeringEnabled,
 
     sandboxPreference,
     setSandboxPreference,

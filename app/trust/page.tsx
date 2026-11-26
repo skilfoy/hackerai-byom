@@ -62,12 +62,6 @@ const subprocessors: Subprocessor[] = [
     dataCategories: MODEL_REQUEST_DATA,
   },
   {
-    name: "Abliteration.ai",
-    purpose:
-      "Serves abliterated models directly, without OpenRouter, and handles some fallback requests",
-    dataCategories: MODEL_REQUEST_DATA,
-  },
-  {
     name: "OpenAI",
     purpose: "Content moderation",
     dataCategories: "Message content",
@@ -145,7 +139,7 @@ const subprocessors: Subprocessor[] = [
 
 const contents = [
   ["data-we-process", "Data we process"],
-  ["ai-model-providers", "AI model providers"],
+  ["ai-model-providers", "AI models and zero data retention"],
   ["model-training", "Model training and data licensing"],
   ["execution-environments", "Execution environments"],
   ["account-security", "Account security"],
@@ -168,8 +162,11 @@ const InlineLink = ({
 }) => (
   <a
     href={href}
-    target="_blank"
-    rel="noopener noreferrer"
+    // In-page section links stay in the current tab.
+    {...(!href.startsWith("#") && {
+      target: "_blank",
+      rel: "noopener noreferrer",
+    })}
     className="font-medium text-foreground underline underline-offset-4 hover:text-foreground/80"
   >
     {children}
@@ -206,7 +203,8 @@ function TrustContent() {
           <p className="max-w-[420px] text-base leading-7 text-muted-foreground">
             HackerAI is an AI agent for penetration testing and security work.
             This page describes the data we process, where agent code runs, and
-            the services we rely on to operate.
+            the services we rely on to operate. AI model providers are
+            restricted to zero data retention.
           </p>
         </header>
 
@@ -272,9 +270,19 @@ function TrustContent() {
             <Section
               id="ai-model-providers"
               number="02"
-              title="AI model providers"
+              title="AI models and zero data retention"
               initiallyOpen
             >
+              <p>
+                <strong className="font-semibold text-foreground">
+                  Zero data retention.
+                </strong>{" "}
+                The companies that generate model responses for HackerAI may not
+                retain your prompts or responses. Requests through OpenRouter
+                may use only endpoints on its zero data retention list, and
+                Inference.net has confirmed this in writing for our account. The
+                limits of this commitment are described below.
+              </p>
               <p>
                 HackerAI sends your prompt, relevant conversation context, file
                 content, images, and tool results to the company serving the
@@ -293,36 +301,32 @@ function TrustContent() {
               </p>
               <p>
                 Some security-tuned models are served directly by Inference.net,
-                and abliterated models are served directly by Abliteration.ai,
                 without passing through OpenRouter. See the{" "}
                 <InlineLink href="https://inference.net/privacy-policy/">
                   Inference.net privacy policy
-                </InlineLink>{" "}
-                and{" "}
-                <InlineLink href="https://abliteration.ai/privacy-policy">
-                  Abliteration.ai privacy policy
                 </InlineLink>
                 .
               </p>
               <p>
                 More than one provider can process a request. If a model fails
                 or is unavailable, HackerAI may use a fallback on a different
-                route; for example, Inference.net can fall back to
-                Abliteration.ai. Uploaded images and browser screenshots may
-                also be processed by a separate image model. The selected model
-                does not identify every company that may receive relevant task
-                content.
+                route. Uploaded images and browser screenshots may also be
+                processed by a separate image model. The selected model does not
+                identify every company that may receive relevant task content.
               </p>
               <p>
                 When the agent searches the web or opens a URL, Perplexity
                 processes search queries and Jina AI retrieves page content.
-                OpenAI screens message content for moderation.
+                OpenAI screens message content for moderation. PDF attachments
+                may be converted to text by a document parser, such as Mistral
+                OCR or Cloudflare, through OpenRouter.
               </p>
               <p>
-                Each provider processes data under its own terms. Retention and
-                model training policies vary by provider, so we do not make a
-                blanket no-training or zero-retention guarantee. Refer to the
-                provider policies linked above.
+                Zero data retention covers the AI model providers only: web
+                search, page retrieval, moderation, and document parsing follow
+                those providers&apos; own terms, and HackerAI stores your chats
+                so you can return to them. Refer to the provider policies linked
+                above.
               </p>
             </Section>
 
@@ -342,6 +346,14 @@ function TrustContent() {
                 </InlineLink>{" "}
                 for the notice and consent requirements that would apply before
                 any collection.
+              </p>
+              <p>
+                AI model providers are restricted to zero data retention and may
+                not keep your prompts or responses; see{" "}
+                <InlineLink href="#ai-model-providers">
+                  AI models and zero data retention
+                </InlineLink>
+                .
               </p>
             </Section>
 

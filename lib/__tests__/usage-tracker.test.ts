@@ -1,5 +1,9 @@
 import { describe, it, expect, jest, beforeEach } from "@jest/globals";
-import { UsageTracker } from "../usage-tracker";
+import { UsageTracker, createUsageModelSelection } from "../usage-tracker";
+import {
+  observeServedModelFallback,
+  recordRequestedModelFallback,
+} from "@/convex/lib/usageModelSelection";
 import { BudgetMonitor } from "@/lib/chat/budget-monitor";
 import {
   billableCostDollarsToPoints,
@@ -18,62 +22,71 @@ describe("UsageTracker", () => {
     jest.clearAllMocks();
   });
 
-  it("keeps recorded primary work billable and budgeted after loop recovery", () => {
-    tracker.accumulateStep(
-      { inputTokens: 100, outputTokens: 20, raw: { cost: 0.6 } },
-      "primary",
-    );
-    tracker.nonModelCost = 0.1;
-    tracker.prepareModelRetry({ isLoopRecovery: true });
-    tracker.accumulateStep(
-      { inputTokens: 50, outputTokens: 10, raw: { cost: 0.4 } },
-      "fallback",
-    );
+  it.each([
+    { label: "loop recovery", retry: { isLoopRecovery: true } },
+    {
+      label: "a non-durable output-limit fallback",
+      retry: { preserveIncurredUsage: true },
+    },
+  ])(
+    "keeps recorded primary work billable and budgeted after $label",
+    ({ retry }) => {
+      tracker.accumulateStep(
+        { inputTokens: 100, outputTokens: 20, raw: { cost: 0.6 } },
+        "primary",
+      );
+      tracker.nonModelCost = 0.1;
+      tracker.prepareModelRetry(retry);
+      tracker.accumulateStep(
+        { inputTokens: 50, outputTokens: 10, raw: { cost: 0.4 } },
+        "fallback",
+      );
 
-    const cost = tracker.computeCostDollars("fallback");
-    expect(cost).toBeCloseTo(1.1);
-    expect(tracker.inputTokens).toBe(150);
-    expect(tracker.outputTokens).toBe(30);
-    expect(tracker.measurementProperties("fallback")).toMatchObject({
-      usage_discarded_retry_cost_dollars: 0,
-      usage_retry_resets: 0,
-    });
+      const cost = tracker.computeCostDollars("fallback");
+      expect(cost).toBeCloseTo(1.1);
+      expect(tracker.inputTokens).toBe(150);
+      expect(tracker.outputTokens).toBe(30);
+      expect(tracker.measurementProperties("fallback")).toMatchObject({
+        usage_discarded_retry_cost_dollars: 0,
+        usage_retry_resets: 0,
+      });
 
-    const rateLimitInfo = {
-      remaining: 0.4 * POINTS_PER_DOLLAR,
-      resetTime: new Date(),
-      limit: POINTS_PER_DOLLAR,
-      pointsDeducted: billableCostDollarsToPoints(0.6),
-    };
-    const usage = tracker.createUsageCostRecord({
-      selectedModel: "primary",
-      accountingModel: "fallback",
-      rateLimitInfo,
-    });
-    expect(usage.modelCostDollars).toBeCloseTo(1);
-    expect(usage.costDollars).toBeCloseTo(cost);
-    expect(
-      getUnsettledUsagePoints(
-        createUsageSettlementState(rateLimitInfo),
-        usage.costDollars,
-      ),
-    ).toBeCloseTo(billableCostDollarsToPoints(0.5));
+      const rateLimitInfo = {
+        remaining: 0.4 * POINTS_PER_DOLLAR,
+        resetTime: new Date(),
+        limit: POINTS_PER_DOLLAR,
+        pointsDeducted: billableCostDollarsToPoints(0.6),
+      };
+      const usage = tracker.createUsageCostRecord({
+        selectedModel: "primary",
+        accountingModel: "fallback",
+        rateLimitInfo,
+      });
+      expect(usage.modelCostDollars).toBeCloseTo(1);
+      expect(usage.costDollars).toBeCloseTo(cost);
+      expect(
+        getUnsettledUsagePoints(
+          createUsageSettlementState(rateLimitInfo),
+          usage.costDollars,
+        ),
+      ).toBeCloseTo(billableCostDollarsToPoints(0.5));
 
-    const monitor = new BudgetMonitor(
-      {
-        monthlyLimitPoints: POINTS_PER_DOLLAR,
-        monthlyRemainingAtStart: POINTS_PER_DOLLAR,
-        monthlyResetTime: new Date(),
-        extraUsageEnabledAtStart: false,
-        extraUsageHasBalanceAtStart: false,
-        extraUsageBalanceAtStart: 0,
-        extraUsageAutoReload: false,
-      },
-      { write: jest.fn() } as any,
-      "pro",
-    );
-    expect(monitor.checkAfterStep(cost).type).toBe("abort");
-  });
+      const monitor = new BudgetMonitor(
+        {
+          monthlyLimitPoints: POINTS_PER_DOLLAR,
+          monthlyRemainingAtStart: POINTS_PER_DOLLAR,
+          monthlyResetTime: new Date(),
+          extraUsageEnabledAtStart: false,
+          extraUsageHasBalanceAtStart: false,
+          extraUsageBalanceAtStart: 0,
+          extraUsageAutoReload: false,
+        },
+        { write: jest.fn() } as any,
+        "pro",
+      );
+      expect(monitor.checkAfterStep(cost).type).toBe("abort");
+    },
+  );
 
   it("retains primary token estimates when loop recovery changes models", () => {
     tracker.accumulateStep(
@@ -671,12 +684,15 @@ describe("UsageTracker", () => {
           outputTokens: 100_000,
           inputTokenDetails: { cacheReadTokens: 900_000 },
         },
-        "model-deepseek-v4-pro",
+        "model-deepseek-v4-pro-0813",
       );
 
       // 100k uncached input + 900k cache reads + 100k output.
       expect(
-        tracker.computeCostDollars("model-deepseek-v4-pro", "model-grok-4.6"),
+        tracker.computeCostDollars(
+          "model-deepseek-v4-pro-0813",
+          "model-grok-4.6",
+        ),
       ).toBeCloseTo(0.1337625);
     });
 
@@ -985,7 +1001,120 @@ describe("UsageTracker", () => {
         modelCostDollars: 0.01,
         nonModelCostDollars: 0,
         costSource: "provider",
+        // An absent override is a normal Auto write without a fallback.
+        modelSelection: { selected: "auto", initial_model: "model-config" },
       });
+    });
+
+    it("stores the accepted mode and the runner's fallback without changing the billed model", () => {
+      const localMockLog = jest.fn();
+      let IsolatedTracker: typeof UsageTracker;
+      jest.isolateModules(() => {
+        jest.doMock("@/lib/db/actions", () => ({
+          logUsageRecord: localMockLog,
+        }));
+        IsolatedTracker = require("../usage-tracker").UsageTracker;
+      });
+      const t = new IsolatedTracker!();
+      t.accumulateStep({ inputTokens: 10, outputTokens: 5, raw: { cost: 1 } });
+
+      t.log({
+        userId: "user-123",
+        selectedModel: "agent-model-max",
+        selectedModelOverride: "hackerai-max",
+        responseModel: "x-ai/grok-4.1-fast",
+        configuredModelId: "x-ai/grok-4.6",
+        rateLimitInfo: { remaining: 0, resetTime: new Date(), limit: 0 },
+        modelFallback: {
+          model: "x-ai/grok-4.1-fast",
+          awaitingServedModel: false,
+        },
+      });
+
+      expect(localMockLog).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model: "x-ai/grok-4.1-fast",
+          modelSelection: {
+            selected: "hackerai-max",
+            initial_model: "x-ai/grok-4.6",
+            fallback_model: "x-ai/grok-4.1-fast",
+          },
+        }),
+      );
+    });
+
+    it("omits a selection it cannot validate instead of guessing one", () => {
+      expect(
+        createUsageModelSelection({
+          selectedModelOverride: "model-custom",
+          initialModel: "model-config",
+        }),
+      ).toBeUndefined();
+      expect(
+        createUsageModelSelection({
+          selectedModelOverride: null,
+          initialModel: "model-config",
+        }),
+      ).toEqual({ selected: "auto", initial_model: "model-config" });
+    });
+
+    it("does not report normal Auto routing to another model as a fallback", () => {
+      let observed = observeServedModelFallback(undefined, {
+        servedModel: "deepseek/deepseek-v4-flash",
+        confirmedProviderFallback: false,
+      });
+      observed = observeServedModelFallback(observed, {
+        servedModel: "z-ai/glm-5.3",
+        confirmedProviderFallback: false,
+      });
+
+      expect(observed).toBeUndefined();
+      expect(
+        createUsageModelSelection({
+          selectedModelOverride: undefined,
+          initialModel: "deepseek/deepseek-v4-flash",
+          fallbackModel: observed?.model,
+        }),
+      ).not.toHaveProperty("fallback_model");
+    });
+
+    it("records an explicit alternate request and refines it with the served model", () => {
+      const requested = "x-ai/grok-4.1-fast";
+      let observed = recordRequestedModelFallback(undefined, requested);
+      expect(observed).toEqual({ model: requested, awaitingServedModel: true });
+
+      // A step with no served ID keeps the requested route.
+      observed = observeServedModelFallback(observed, {
+        confirmedProviderFallback: false,
+      });
+      expect(observed?.model).toBe(requested);
+
+      observed = observeServedModelFallback(observed, {
+        servedModel: "x-ai/grok-4.1-fast-20261101",
+        confirmedProviderFallback: false,
+      });
+      // Later normal steps on the fallback route keep the record.
+      observed = observeServedModelFallback(observed, {
+        servedModel: "x-ai/grok-4.1-fast-20261102",
+        confirmedProviderFallback: false,
+      });
+      expect(observed).toEqual({
+        model: "x-ai/grok-4.1-fast-20261101",
+        awaitingServedModel: false,
+      });
+    });
+
+    it("keeps a confirmed provider fallback after later primary steps", () => {
+      let observed = observeServedModelFallback(undefined, {
+        servedModel: "x-ai/grok-4.1-fast",
+        confirmedProviderFallback: true,
+      });
+      observed = observeServedModelFallback(observed, {
+        servedModel: "x-ai/grok-4.6",
+        confirmedProviderFallback: false,
+      });
+
+      expect(observed?.model).toBe("x-ai/grok-4.1-fast");
     });
 
     it("resolves only after the ledger write and returns its failure status", async () => {
@@ -1116,6 +1245,49 @@ describe("UsageTracker", () => {
       expect(usage.modelCostDollars).toBe(0.00016);
       expect(usage.costDollars).toBe(0.00016);
       expect(usage.costSource).toBe("provider");
+    });
+
+    it("discards only a refused recovery leg, keeping the disconnected leg before it billed", () => {
+      // xAI streamed work, then disconnected; its usage continues on Bedrock.
+      // Its reported total differs from input + output and must survive.
+      tracker.accumulateStep({
+        inputTokens: 1_000,
+        outputTokens: 200,
+        totalTokens: 1_250,
+        raw: { cost: 0.02 },
+      });
+      tracker.providerCost += 0.05;
+      tracker.nonModelCost = 0.05;
+      tracker.beginModelLeg();
+      // Bedrock compacted, ran one step (corrected later), then was refused.
+      tracker.accumulateSummarization({
+        inputTokens: 300,
+        outputTokens: 30,
+        cost: 0.003,
+      });
+      const bedrockStep = tracker.accumulateStep({
+        inputTokens: 2_000,
+        outputTokens: 0,
+        inputTokenDetails: { cacheReadTokens: 500 },
+        raw: { cost: 0.01 },
+      });
+      tracker.setAuthoritativeModelCostForStep(bedrockStep, 0.04);
+      tracker.discardModelLeg();
+      // DeepSeek completes the response.
+      tracker.accumulateStep({
+        inputTokens: 1_500,
+        outputTokens: 100,
+        raw: { cost: 0.001 },
+      });
+
+      expect(tracker.inputTokens).toBe(1_000 + 300 + 1_500);
+      expect(tracker.outputTokens).toBe(200 + 30 + 100);
+      expect(tracker.totalTokens).toBe(1_250 + 330 + 1_600);
+      expect(tracker.cacheReadTokens).toBe(0);
+      expect(tracker.modelProviderCost).toBeCloseTo(0.021);
+      expect(tracker.computeCostDollars("model-default")).toBeCloseTo(
+        0.02 + 0.003 + 0.001 + 0.05,
+      );
     });
 
     it("keeps non-model spend after fallback reset and bills fallback authoritative metadata cost", () => {

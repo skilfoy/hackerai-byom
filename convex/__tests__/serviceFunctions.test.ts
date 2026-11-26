@@ -50,7 +50,21 @@ const context = (name: string, type = "mutation", componentPath = "") => ({
   },
 });
 
-const unauthorized = /^Unauthorized: Invalid service request$/;
+// The guard's exact rejection: an unchanged first line and one fixed
+// observation line, which native exception reporting retains without logs.
+const rejectedMessage = (observation: string) =>
+  "Unauthorized: Invalid service request\n" +
+  `service_proof_rejected diagnostic_version=1 public_input_observation=${observation}`;
+const unauthorized = new RegExp(
+  `^${rejectedMessage(
+    "(credential_not_string|proof_malformed|proof_expired|proof_future|verification_failed)",
+  )}$`,
+);
+const messageOf = (pending: Promise<unknown>) =>
+  pending.then(
+    () => "accepted",
+    (error: Error) => error.message,
+  );
 let warn: jest.SpyInstance;
 beforeEach(() => {
   warn = jest.spyOn(console, "warn").mockImplementation(() => {});
@@ -168,6 +182,78 @@ describe("service registration boundary", () => {
     );
   });
 
+  it("extends the burst review key to exactly one reassessment action", async () => {
+    const registered = (action as any)({
+      args: { serviceKey: v.string() },
+      returns: v.null(),
+      handler: async () => null,
+    });
+    const invoke = async (name: string, serviceKey: string) => {
+      const signed = await signServiceArgs(
+        { deployment, name, type: "action" },
+        { serviceKey },
+      );
+      return registered.handler(context(name, "action"), signed);
+    };
+    const reassess = "egressAbuseReassessmentActions:readCaseEvidence";
+    await expect(invoke(reassess, egressReviewSecret)).resolves.toBeNull();
+    await expect(invoke(reassess, secret)).rejects.toThrow(unauthorized);
+    for (const name of [
+      "egressAbuseReassessmentActions:other",
+      "egressAbuseReassessment:openCase",
+      "abuseCases:read",
+    ])
+      await expect(invoke(name, egressReviewSecret)).rejects.toThrow(
+        unauthorized,
+      );
+  });
+
+  it("limits the enforcement and notice dispatcher keys to their own modules", async () => {
+    const enforcementSecret = "synthetic-enforcement-credential";
+    const dispatchSecret = "synthetic-dispatch-credential";
+    process.env.CONVEX_EGRESS_ABUSE_ENFORCEMENT_SERVICE_KEY = enforcementSecret;
+    process.env.CONVEX_ABUSE_NOTICE_DISPATCH_SERVICE_KEY = dispatchSecret;
+    const registered = (mutation as any)({
+      args: { serviceKey: v.string() },
+      returns: v.null(),
+      handler: async () => null,
+    });
+    const invoke = async (name: string, serviceKey: string) => {
+      const signed = await signServiceArgs(
+        { deployment, name, type: "mutation" },
+        { serviceKey },
+      );
+      return registered.handler(context(name), signed);
+    };
+    const block = "egressAbuseEnforcement:applyBlock";
+    const claim = "abuseBlockNotices:claim";
+    await expect(invoke(block, enforcementSecret)).resolves.toBeNull();
+    await expect(invoke(claim, dispatchSecret)).resolves.toBeNull();
+    for (const [name, wrong] of [
+      [block, egressReviewSecret],
+      [block, dispatchSecret],
+      [block, secret],
+      [claim, enforcementSecret],
+      [claim, secret],
+      ["abuseResponse:apply", enforcementSecret],
+      ["abuseCases:resolve", dispatchSecret],
+      ["egressAbuseReview:recordCase", enforcementSecret],
+    ])
+      await expect(invoke(name, wrong)).rejects.toThrow(unauthorized);
+    // A proof for one deployment is refused by another.
+    const elsewhere = await signServiceArgs(
+      {
+        deployment: "https://other.convex.cloud",
+        name: claim,
+        type: "mutation",
+      },
+      { serviceKey: dispatchSecret },
+    );
+    await expect(registered.handler(context(claim), elsewhere)).rejects.toThrow(
+      unauthorized,
+    );
+  });
+
   it("signs internal child calls again for their own destination and arguments", async () => {
     const runMutation = jest.fn(async () => null);
     const ctx = serviceContext({ runMutation } as any);
@@ -266,14 +352,16 @@ describe("service proof rejection observation", () => {
       expect(registered.args).toBe(args);
       expect(registered.returns).toBe(returns);
       await expect(
-        registered.handler(context(name, type), { serviceKey: "hmac1.bad" }),
-      ).rejects.toThrow(unauthorized);
+        messageOf(
+          registered.handler(context(name, type), { serviceKey: "hmac1.bad" }),
+        ),
+      ).resolves.toBe(rejectedMessage("proof_malformed"));
       expect(handler).not.toHaveBeenCalled();
       expect(warnings()).toEqual([rejection("proof_malformed")]);
     },
   );
 
-  it("emits the same observation whether or not the service key is configured", async () => {
+  it("rejects with the same observation whatever the key, scope or arguments", async () => {
     const { registered, handler } = register();
     const issued = Date.now();
     const cases: Array<[Record<string, unknown>, string]> = [
@@ -287,19 +375,37 @@ describe("service proof rejection observation", () => {
         "verification_failed",
       ],
     ];
-    for (const [args, expected] of cases) {
-      for (const configured of [true, false]) {
-        if (configured) process.env.CONVEX_SERVICE_ROLE_KEY = secret;
-        else delete process.env.CONVEX_SERVICE_ROLE_KEY;
-        warn.mockClear();
-        await expect(registered.handler(context(name), args)).rejects.toThrow(
-          unauthorized,
-        );
-        expect({ configured, args, warnings: warnings() }).toEqual({
-          configured,
-          args,
-          warnings: [rejection(expected)],
-        });
+    // The signed scope, another function with its own key, and another type.
+    const scopes = [
+      [name, "mutation"],
+      ["userResearch:createAnalysis", "mutation"],
+      [name, "query"],
+    ] as const;
+    for (const [base, expected] of cases) {
+      for (const args of [base, { ...base, id: "other-argument" }]) {
+        for (const [scopeName, type] of scopes) {
+          for (const configured of [true, false]) {
+            if (configured) {
+              process.env.CONVEX_SERVICE_ROLE_KEY = secret;
+              process.env.CONVEX_USER_RESEARCH_SERVICE_KEY = researchSecret;
+            } else {
+              delete process.env.CONVEX_SERVICE_ROLE_KEY;
+              delete process.env.CONVEX_USER_RESEARCH_SERVICE_KEY;
+            }
+            warn.mockClear();
+            const error = await messageOf(
+              registered.handler(context(scopeName, type), args),
+            );
+            expect({ scopeName, type, configured, args, error }).toEqual({
+              scopeName,
+              type,
+              configured,
+              args,
+              error: rejectedMessage(expected),
+            });
+            expect(warnings()).toEqual([rejection(expected)]);
+          }
+        }
       }
     }
     expect(handler).not.toHaveBeenCalled();
@@ -330,7 +436,7 @@ describe("service proof rejection observation", () => {
     expect(outcomes).toHaveLength(12);
     for (const outcome of outcomes) {
       expect(outcome).toEqual({
-        error: "Unauthorized: Invalid service request",
+        error: rejectedMessage("proof_malformed"),
         warnings: [rejection("proof_malformed")],
       });
     }
@@ -349,7 +455,11 @@ describe("service proof rejection observation", () => {
       registered.handler(context(name), { serviceKey: secret }),
     ).resolves.toBeNull();
     await expect(registered.handler({}, { id: "id-1" })).resolves.toBeNull();
-    expect(handler).toHaveBeenCalledTimes(3);
+    expect(handler.mock.calls).toEqual([
+      [expect.anything(), { serviceKey: secret, id: "id-1" }],
+      [expect.anything(), { serviceKey: secret }],
+      [expect.anything(), { id: "id-1" }],
+    ]);
     await expect(
       registered.handler(context(name, "mutation", "child"), {
         serviceKey: "garbage",
@@ -388,24 +498,25 @@ describe("service proof rejection observation", () => {
     });
     const error = jest.spyOn(console, "error").mockImplementation(() => {});
     await expect(
-      registered.handler(context(name), { serviceKey: "garbage" }),
-    ).rejects.toThrow(unauthorized);
+      messageOf(registered.handler(context(name), { serviceKey: "garbage" })),
+    ).resolves.toBe(rejectedMessage("proof_malformed"));
     expect(warn).toHaveBeenCalledTimes(1);
     expect(handler).not.toHaveBeenCalled();
     expect(error).not.toHaveBeenCalled();
   });
 
-  it("logs no proof, key, scope or argument values", async () => {
+  it("logs and throws no proof, key, scope or argument values", async () => {
     const { registered } = register();
     const issued = Date.now();
     const forged = `hmac1.${issued}.${"c".repeat(64)}`;
-    await expect(
+    const error = await messageOf(
       registered.handler(context(name), {
         serviceKey: forged,
         id: "canary-argument-value",
       }),
-    ).rejects.toThrow(unauthorized);
-    const logged = JSON.stringify(warn.mock.calls);
+    );
+    expect(error).toBe(rejectedMessage("verification_failed"));
+    const logged = JSON.stringify([warn.mock.calls, error]);
     for (const canary of [
       secret,
       researchSecret,

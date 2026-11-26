@@ -9,6 +9,7 @@ import {
 import {
   BROWSER_HANDOFF_ABANDONED_FINISH_REASON,
   requiresManualAgentResume,
+  stoppedComputerReconnected,
 } from "@/lib/chat/manual-agent-resume";
 
 import { useChat, type UseChatHelpers } from "@ai-sdk/react";
@@ -48,6 +49,7 @@ import ChatHeader from "./ChatHeader";
 import Footer from "./Footer";
 import { useMessageScroll } from "../hooks/useMessageScroll";
 import { useQueuedMessageDelivery } from "@/app/hooks/useQueuedMessageDelivery";
+import { useUnreadSteerRequeue } from "@/app/hooks/useUnreadSteerRequeue";
 import { useChatHandlers } from "../hooks/useChatHandlers";
 import type { ActiveAgentUserWait } from "@/lib/chat/agent-user-wait";
 import { userInputQuestionsSchema } from "@/lib/chat/user-input-questions";
@@ -123,6 +125,7 @@ import {
   type Todo,
   type ChatMessage,
 } from "@/types";
+import type { QueuedMessage } from "@/types/chat";
 import {
   getAgentToolApprovalPromptDetail,
   getAgentToolApprovalPromptKind,
@@ -567,6 +570,9 @@ function ForkAutoSendEffect({
   return null;
 }
 
+/** How long a tab waits for the server to send a stored queued message. */
+const SERVER_QUEUE_DISPATCH_GRACE_MS = 10_000;
+
 export const Chat = ({ autoResume }: { autoResume: boolean }) => {
   return (
     <ConvexErrorBoundary diagnosticScope="chat_content">
@@ -639,6 +645,7 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
     setSelectedModel,
     subscription,
     activeProjectId,
+    agentSteeringEnabled,
   } = useGlobalState();
   const [hasOpenedComputerSidebar, setHasOpenedComputerSidebar] =
     useState(false);
@@ -2792,6 +2799,7 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
     handleSendNow,
     handleContinue,
     hasPendingSummarySteer,
+    sendNowReleaseVersion,
   } = useChatHandlers({
     chatId,
     messages,
@@ -2831,6 +2839,92 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
     computerTabsEnabled,
   });
 
+  const agentRunActive =
+    !!activeTriggerRunId ||
+    !!agentLongRunId ||
+    status === "streaming" ||
+    status === "submitted";
+  // After a run ends, the server gets the first chance to send a stored
+  // queued message (trigger/agent-queue-dispatch.ts). This tab sends it only
+  // if the server did not claim it in time, for example after a stop or for
+  // a run that needs approvals, so the two never race on one message.
+  const [agentIdleSince, setAgentIdleSince] = useState<number | null>(null);
+  const [serverGraceTick, setServerGraceTick] = useState(0);
+  useEffect(() => {
+    setAgentIdleSince(agentRunActive ? null : Date.now());
+  }, [agentRunActive]);
+  const headWaitsForServer =
+    agentSteeringEnabled &&
+    !!messageQueue[0]?.onServer &&
+    !messageQueue[0].files?.some((file) => file.storage === "local-desktop") &&
+    (agentIdleSince === null ||
+      Date.now() - agentIdleSince < SERVER_QUEUE_DISPATCH_GRACE_MS);
+  useEffect(() => {
+    if (!headWaitsForServer || agentIdleSince === null) return;
+    const timer = setTimeout(
+      () => setServerGraceTick((tick) => tick + 1),
+      Math.max(0, agentIdleSince + SERVER_QUEUE_DISPATCH_GRACE_MS - Date.now()),
+    );
+    return () => clearTimeout(timer);
+  }, [agentIdleSince, headWaitsForServer]);
+  const { pendingSteers, recovering: recoveringUnreadSteers } =
+    useUnreadSteerRequeue({
+      chatId,
+      enabled: agentSteeringEnabled && isConvexAuthenticated,
+      // Until the chat loads, an active run is unknown; never withdraw early.
+      runActive: !hasLoadedCurrentChat || agentRunActive,
+    });
+
+  // The server sends the next queued message after a run finishes. Show that
+  // message here and attach to the run it starts, as a reload would, so the
+  // reply streams in this tab too.
+  const serverDispatchRef = useRef<QueuedMessage | null>(null);
+  const attachedServerRunRef = useRef<string | null>(null);
+  const serverDispatch = messageQueue.find((message) => message.dispatching);
+  useEffect(() => {
+    if (serverDispatch) serverDispatchRef.current = serverDispatch;
+  }, [serverDispatch]);
+  useEffect(() => {
+    const dispatched = serverDispatchRef.current;
+    if (
+      !agentSteeringEnabled ||
+      !dispatched ||
+      !activeTriggerRunId ||
+      agentLongRunId ||
+      status !== "ready" ||
+      attachedServerRunRef.current === activeTriggerRunId
+    )
+      return;
+    serverDispatchRef.current = null;
+    attachedServerRunRef.current = activeTriggerRunId;
+    setMessages((current) =>
+      current.some((message) => message.id === dispatched.id)
+        ? current
+        : [
+            ...current,
+            {
+              id: dispatched.id,
+              role: "user",
+              parts: [
+                ...(dispatched.files ?? []),
+                ...(dispatched.text
+                  ? [{ type: "text" as const, text: dispatched.text }]
+                  : []),
+              ] as ChatMessage["parts"],
+              metadata: { createdAt: dispatched.timestamp },
+            } as ChatMessage,
+          ],
+    );
+    void resumeStream();
+  }, [
+    activeTriggerRunId,
+    agentLongRunId,
+    agentSteeringEnabled,
+    resumeStream,
+    setMessages,
+    status,
+  ]);
+
   // Automatic queue processing - send next queued message when ready
   useEffect(() => {
     if (
@@ -2855,10 +2949,15 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
       !computerSendDisabledReason &&
       messageQueue.length > 0 &&
       !messageQueue[0].deliveryStatus &&
+      !messageQueue[0].held &&
+      // The server is sending a queued message: wait for its run.
+      !messageQueue.some((message) => message.dispatching) &&
+      !headWaitsForServer &&
       editingQueuedMessageId === null &&
       !isProcessingQueue &&
       !isSendingNowRef.current &&
-      !hasManuallyStoppedRef.current
+      !hasManuallyStoppedRef.current &&
+      !recoveringUnreadSteers
     ) {
       setIsProcessingQueue(true);
       const nextMessage = messageQueue[0];
@@ -2897,6 +2996,10 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
     }
   }, [
     status,
+    recoveringUnreadSteers,
+    headWaitsForServer,
+    serverGraceTick,
+    sendNowReleaseVersion,
     hasPendingSummarySteer,
     hasPendingUserWait,
     persistedGoal?.state,
@@ -3256,6 +3359,7 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
                     <Messages
                       key={chatId}
                       chatId={chatId}
+                      pendingSteers={agentRunActive ? pendingSteers : undefined}
                       scrollRef={scrollRef}
                       contentRef={contentRef}
                       messages={messages}
@@ -3276,6 +3380,12 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
                       tempChatFileDetails={tempChatFileDetails}
                       finishReason={chatDataForCurrentChat?.finish_reason}
                       continueDisabledReason={computerSendDisabledReason}
+                      stoppedComputerReconnected={stoppedComputerReconnected({
+                        finishReason: chatDataForCurrentChat?.finish_reason,
+                        savedSandboxPreference: storedSandboxType,
+                        sandboxPreference,
+                        computerUnavailableReason: computerSendDisabledReason,
+                      })}
                       agentRunSpendCapWarning={agentRunSpendCapWarning}
                       uploadStatus={uploadStatus}
                       summarizationStatus={summarizationStatus}

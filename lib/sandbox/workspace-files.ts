@@ -62,10 +62,66 @@ export type WorkspaceStatus = {
   environmentLabel?: string;
 };
 
+const readerPhase = z.enum(["root", "directory", "enumerate", "entry_stat"]);
+const osErrorCategory = z.enum([
+  "missing",
+  "permission",
+  "not_directory_or_symlink",
+  "io",
+  "other",
+]);
+
+/** Closed-vocabulary log fields. Never add paths, names, IDs or error text. */
+type WorkspaceListDiagnostics = {
+  readonly reader: "local" | "cloud";
+  readonly reader_phase?: z.infer<typeof readerPhase>;
+  readonly os_error_category?: z.infer<typeof osErrorCategory>;
+};
+
+/** Reader stdout is untrusted: keep only allow-listed values, and only for an
+ * original list request that the reader failed with a filesystem error. */
+export function filesystemListDiagnostics(
+  reader: WorkspaceListDiagnostics["reader"],
+  action: WorkspaceRequest["action"],
+  output: unknown,
+): WorkspaceListDiagnostics | undefined {
+  if (action !== "list" || typeof output !== "object" || output === null)
+    return undefined;
+  const { error, phase, category } = output as {
+    error?: unknown;
+    phase?: unknown;
+    category?: unknown;
+  };
+  if (error !== "not_found" && error !== "unreadable_path") return undefined;
+  const parsedPhase = readerPhase.safeParse(phase);
+  const parsedCategory = osErrorCategory.safeParse(category);
+  return {
+    reader,
+    ...(parsedPhase.success ? { reader_phase: parsedPhase.data } : {}),
+    ...(parsedCategory.success
+      ? { os_error_category: parsedCategory.data }
+      : {}),
+  };
+}
+
+/** Last workspace-access step entered. Adapters only record it; callers may
+ * log it for an otherwise unclassified failure. Fixed labels, never values. */
+export const WORKSPACE_ACCESS_STEPS = [
+  "lookup",
+  "fence",
+  "connect",
+  "run_reader",
+  "decode",
+] as const;
+export type WorkspaceAccessProgress = {
+  step?: (typeof WORKSPACE_ACCESS_STEPS)[number];
+};
+
 export class WorkspaceFileError extends Error {
   constructor(
     public readonly code: string,
     public readonly status = 400,
+    public readonly diagnostics?: WorkspaceListDiagnostics,
   ) {
     super(code);
   }
@@ -76,28 +132,47 @@ export class WorkspaceFileError extends Error {
  * No shell commands, file content, or filenames are interpolated as Python.
  */
 export const WORKSPACE_READER_PYTHON = String.raw`
-import os, sys, json, base64, stat, hashlib
+import os, sys, json, base64, stat, hashlib, errno
 request = json.loads(base64.b64decode(sys.argv[1]))
-root = sys.argv[2] if len(sys.argv) > 2 else os.getcwd()
+root = sys.argv[2] if len(sys.argv) > 2 else None
 fds = []
+phase = None
 def open_dir(name, parent=None):
     fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
     fds.append(fd)
     return fd
+def os_error_category(error):
+    if error.errno == errno.ENOENT:
+        return 'missing'
+    if error.errno in (errno.EACCES, errno.EPERM):
+        return 'permission'
+    if error.errno in (errno.ENOTDIR, errno.ELOOP):
+        return 'not_directory_or_symlink'
+    if error.errno == errno.EIO:
+        return 'io'
+    return None if error.errno is None else 'other'
 try:
     path = request['path']
     parts = path.split('/') if path else []
     if any(p in ('', '.', '..') or '\\' in p or any(ord(c) < 32 or ord(c) == 127 for c in p) for p in parts):
         raise ValueError('invalid_path')
-    directory = open_dir('/')
-    for part in root.strip('/').split('/'):
-        directory = open_dir(part, directory)
     listing = request['action'] == 'list'
+    phase = 'root'
+    # Resolve here so a deleted current directory reports a labelled root failure.
+    if root is None:
+        root = os.getcwd()
+    directory = open_dir('/')
+    # '/' itself and repeated separators have no component to open.
+    for part in root.split('/'):
+        if part:
+            directory = open_dir(part, directory)
+    phase = 'directory'
     for part in (parts if listing else parts[:-1]):
         directory = open_dir(part, directory)
     if listing:
         entries = []
         count = 0
+        phase = 'enumerate'
         with os.scandir(directory) as iterator:
             for entry in iterator:
                 count += 1
@@ -107,12 +182,16 @@ try:
                     continue
                 if any(ord(c) < 32 or ord(c) == 127 for c in entry.name) or '\\' in entry.name:
                     continue
+                phase = 'entry_stat'
                 try:
                     info = entry.stat(follow_symlinks=False)
                 except FileNotFoundError:
+                    phase = 'enumerate'
                     continue
+                phase = 'enumerate'
                 kind = 'symlink' if stat.S_ISLNK(info.st_mode) else 'directory' if stat.S_ISDIR(info.st_mode) else 'file' if stat.S_ISREG(info.st_mode) else 'other'
                 entries.append(dict(name=entry.name, kind=kind, size=info.st_size, modified=int(info.st_mtime * 1000)))
+        phase = None
         entries.sort(key=lambda e: (e['kind'] != 'directory', e['name']))
         offset = request['offset']
         print(json.dumps(dict(root=root, entries=entries[offset:offset+100], total=len(entries), nextOffset=offset+100 if offset+100 < len(entries) else None)))
@@ -153,10 +232,15 @@ try:
         print(json.dumps(dict(root=root, data=base64.b64encode(data).decode('ascii'), size=info.st_size, revision=revision, nextByteOffset=next_offset if next_offset < info.st_size else None)))
 except ValueError as error:
     print(json.dumps(dict(error=str(error))))
-except FileNotFoundError:
-    print(json.dumps(dict(error='not_found')))
-except OSError:
-    print(json.dumps(dict(error='unreadable_path')))
+except OSError as error:
+    # List diagnostics use fixed labels only: no errno numbers, messages or names.
+    failure = dict(error='not_found' if isinstance(error, FileNotFoundError) else 'unreadable_path')
+    if phase and listing:
+        failure['phase'] = phase
+        category = os_error_category(error)
+        if category:
+            failure['category'] = category
+    print(json.dumps(failure))
 finally:
     for fd in reversed(fds):
         os.close(fd)

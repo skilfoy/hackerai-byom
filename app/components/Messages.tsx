@@ -19,6 +19,7 @@ import {
 import dynamic from "next/dynamic";
 import { LegendList, type LegendListRef } from "@legendapp/list/react";
 import { BrainIcon } from "lucide-react";
+import { SteerMessageBubble } from "./SteerMessageBubble";
 import { MessageItem } from "./MessageItem";
 import { AgentActivityRow } from "./AgentActivityRow";
 import { AgentToolGroupRow } from "./AgentToolGroupRow";
@@ -226,6 +227,8 @@ interface MessagesProps {
   tempChatFileDetails?: Map<string, FileDetails[]>;
   finishReason?: string;
   continueDisabledReason?: string;
+  /** The stopped run's own computer is connected again. */
+  stoppedComputerReconnected?: boolean;
   uploadStatus?: { message: string; isUploading: boolean } | null;
   summarizationStatus?: {
     status: "started" | "completed";
@@ -242,7 +245,11 @@ interface MessagesProps {
   branchedFromChatTitle?: string;
   anchorMessageId?: string | null;
   contentInsetEndAdjustment?: number;
+  /** Steers sent to the running Agent that it has not read yet. */
+  pendingSteers?: Array<{ id: string; text: string }>;
 }
+
+const EMPTY_PENDING_STEERS: Array<{ id: string; text: string }> = [];
 
 export const Messages = ({
   chatId,
@@ -264,6 +271,7 @@ export const Messages = ({
   tempChatFileDetails,
   finishReason,
   continueDisabledReason,
+  stoppedComputerReconnected,
   uploadStatus,
   summarizationStatus,
   mode,
@@ -273,6 +281,7 @@ export const Messages = ({
   branchedFromChatTitle,
   anchorMessageId = null,
   contentInsetEndAdjustment = 0,
+  pendingSteers = EMPTY_PENDING_STEERS,
 }: MessagesProps) => {
   const { isAutoResuming } = useDataStreamState();
   // Prefetch and cache image URLs for better performance
@@ -741,6 +750,7 @@ export const Messages = ({
       status,
       finishReason,
       continueDisabledReason,
+      stoppedComputerReconnected,
       onContinue,
     }),
     [
@@ -748,6 +758,7 @@ export const Messages = ({
       status,
       finishReason,
       continueDisabledReason,
+      stoppedComputerReconnected,
       onContinue,
     ],
   );
@@ -840,6 +851,7 @@ export const Messages = ({
               tempChatFileDetails={tempChatFileDetails}
               finishReason={finishReason}
               continueDisabledReason={continueDisabledReason}
+              stoppedComputerReconnected={stoppedComputerReconnected}
               mode={mode}
               agentRunSpendCapWarning={agentRunSpendCapWarning}
               branchedFromChatId={branchedFromChatId}
@@ -918,6 +930,7 @@ export const Messages = ({
       feedbackInputMessageId,
       finishReason,
       continueDisabledReason,
+      stoppedComputerReconnected,
       captureScrollPosition,
       getCachedUrl,
       handleBranchMessage,
@@ -961,6 +974,7 @@ export const Messages = ({
     status !== "streaming" &&
     (lastAssistantMessageIndex ?? -1) <= (lastUserMessageIndex ?? -1);
   const timelineFooter =
+    pendingSteers.length > 0 ||
     showManualResumeWithoutAssistant ||
     showSummarizationSeparately ||
     uploadStatus?.isUploading ||
@@ -977,6 +991,7 @@ export const Messages = ({
             mode={mode}
             status={status}
             continueDisabledReason={continueDisabledReason}
+            stoppedComputerReconnected={stoppedComputerReconnected}
             onContinue={onContinue}
           />
         )}
@@ -991,6 +1006,9 @@ export const Messages = ({
         {uploadStatus?.isUploading && (
           <Shimmer className="text-sm">{`${uploadStatus.message}...`}</Shimmer>
         )}
+        {pendingSteers.map((steer) => (
+          <SteerMessageBubble key={steer.id} text={steer.text} pending />
+        ))}
         {shouldShowLoadingDots ? (
           showPendingAgentReasoning ? (
             <PendingAgentReasoning />

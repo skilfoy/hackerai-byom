@@ -8,18 +8,9 @@ import {
   DEEPSEEK_1017_SLUG,
   DEEPSEEK_1017_CANONICAL_SLUG,
 } from "@/lib/experiments/paid-deepseek-1017";
-import {
-  ABLITERATION_MODEL_ID,
-  ABLITERATION_MODEL_KEY,
-  ABLITERATION_BASE_PRICING,
-  ABLITERATION_LARGE_V2_MODEL_ID,
-  ABLITERATION_LARGE_V2_MODEL_KEY,
-  ABLITERATION_LARGE_V2_PRICING,
-  ABLITERATION_LARGE_FLASH_MODEL_ID,
-  ABLITERATION_LARGE_FLASH_PRICING,
-} from "@/lib/ai/abliteration";
 import { isByomBillingModel } from "@/lib/ai/byom";
 import { randomUUID } from "node:crypto";
+import { GROK_4_6_BEDROCK_MODEL_KEY } from "@/lib/ai/grok-bedrock";
 import { limitPaidBucket } from "./paid-bucket";
 import { ChatSDKError } from "@/lib/errors";
 import type {
@@ -160,19 +151,12 @@ const MODEL_PRICING_MAP: Record<string, ModelPricing> = {
   [DEEPSEEK_1017_CANONICAL_SLUG]: DEEPSEEK_V4_1_FLASH_PRICING,
   [INFERENCE_CYBER_MODEL_ID]: INFERENCE_CYBER_PRICING,
   [INFERENCE_CYBER_MODEL_KEY]: INFERENCE_CYBER_PRICING,
-  [ABLITERATION_MODEL_KEY]: ABLITERATION_LARGE_FLASH_PRICING,
-  [ABLITERATION_MODEL_ID]: ABLITERATION_BASE_PRICING,
-  [ABLITERATION_LARGE_V2_MODEL_KEY]: ABLITERATION_LARGE_FLASH_PRICING,
-  [ABLITERATION_LARGE_V2_MODEL_ID]: ABLITERATION_LARGE_V2_PRICING,
-  [ABLITERATION_LARGE_FLASH_MODEL_ID]: ABLITERATION_LARGE_FLASH_PRICING,
   // Grok 4.6 shares the $2/$6 base rate, with a 2x tier from 200k prompt
   // tokens handled by getModelPricing when the input size is available.
   "model-grok-4.6": GROK_4_6_BASE_PRICING,
-  "model-grok-4.6-pro": GROK_4_6_BASE_PRICING,
+  [GROK_4_6_BEDROCK_MODEL_KEY]: GROK_4_6_BASE_PRICING,
   "model-grok-4.5": GROK_4_6_BASE_PRICING,
   "model-grok-4.5-pro": GROK_4_6_BASE_PRICING,
-  "ask-model": GROK_4_6_BASE_PRICING,
-  "agent-model": GROK_4_6_BASE_PRICING,
   "fallback-agent-model": GROK_4_6_BASE_PRICING,
   "fallback-ask-model": GROK_4_6_BASE_PRICING,
   // Ask allowance rescue and free Agent use V4.1. Historical provider
@@ -181,16 +165,10 @@ const MODEL_PRICING_MAP: Record<string, ModelPricing> = {
   "ask-model-free-glm": GLM_5_3_FLASH_PRICING,
   "ask-model-free-deepseek-v41": DEEPSEEK_V4_1_FLASH_PRICING,
   "agent-model-free": DEEPSEEK_V4_1_FLASH_PRICING,
-  // Persisted registry alias now executes V4.1, including without response metadata.
-  "model-deepseek-v4-flash-0731": DEEPSEEK_V4_1_FLASH_PRICING,
-  "model-deepseek-v4-pro": DEEPSEEK_V4_PRO_PRICING,
   "model-deepseek-v4-pro-0813": DEEPSEEK_V4_PRO_PRICING,
   "model-deepseek-v4-flash-vision": DEEPSEEK_V4_1_FLASH_PRICING,
   "model-deepseek-v4-flash-vision-pro": DEEPSEEK_V4_1_FLASH_PRICING,
-  // Persisted Max compatibility key; the active provider route is Kimi K3.
-  "model-opus-4.6": KIMI_K3_PRICING,
   // Baseline OpenRouter rates: $0.76 in / $2.42 out per 1M tokens.
-  "model-glm-5.2": GLM_5_2_PRICING,
   // OpenRouter rates: $1.40 in / $4.40 out / $0.26 cached input per 1M tokens.
   "model-glm-5.3": GLM_5_3_PRICING,
   "model-glm-5.3-flash": GLM_5_3_FLASH_PRICING,
@@ -224,9 +202,7 @@ const MODEL_PRICING_MAP: Record<string, ModelPricing> = {
 
 const GROK_4_6_MODEL_IDS = new Set([
   "model-grok-4.6",
-  "model-grok-4.6-pro",
-  "ask-model",
-  "agent-model",
+  GROK_4_6_BEDROCK_MODEL_KEY,
   "fallback-agent-model",
   "fallback-ask-model",
   "x-ai/grok-4.6",

@@ -610,6 +610,8 @@ export type MessageMetadata = {
   generationStartedAt?: number;
   generationTimeMs?: number;
   recoverySourceMessageId?: string;
+  /** Saved after an explicit Stop ended this turn; never inferred locally. */
+  userStopped?: boolean;
 };
 
 export type ChatMessage = UIMessage<MessageMetadata> & {
@@ -654,6 +656,14 @@ export interface ExtraUsageConfig {
 
 export interface QueuedMessage {
   deliveryStatus?: "sending" | "failed" | "active";
+  /** A steer the Agent never read, returned after its run ended. */
+  fromSteer?: boolean;
+  /** The server is sending it as the next turn after the run that finished. */
+  dispatching?: boolean;
+  /** Stored on the server, where a finished run can send it. */
+  onServer?: boolean;
+  /** Waits for the user to send it; automatic delivery stops at it. */
+  held?: boolean;
   firstAttemptAt?: number;
   id: string;
   text: string;
@@ -661,7 +671,8 @@ export interface QueuedMessage {
   timestamp: number;
 }
 
-export type QueueBehavior = "queue" | "stop-and-send";
+/** What sending does while an Agent run is working. */
+export type QueueBehavior = "steer" | "queue" | "stop-and-send";
 
 /**
  * Persisted sandbox selection: legacy `e2b` means any managed cloud sandbox,
